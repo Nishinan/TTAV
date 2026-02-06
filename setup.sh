@@ -31,26 +31,6 @@ conda init
 conda activate "$ENV_NAME"
 
 
-OS=$(uname -s)
-# Install PyTorch, torchvision, torchaudio based on OS and CUDA availability
-install_dependencies() {
-  if [[ "$OS" == "Darwin" ]]; then
-    echo "Detected macOS. Installing PyTorch and torchvision for macOS..."
-    conda run -n "$ENV_NAME" pip install torch==1.11.0 torchvision==0.12.0 torchaudio==0.11.0
-  else
-    # Check for NVIDIA GPU by looking for 'nvcc' or 'nvidia-smi'
-    if command -v nvcc > /dev/null 2>&1 || command -v nvidia-smi > /dev/null 2>&1; then
-      echo "CUDA detected. Installing GPU-supported PyTorch and torchvision..."
-      conda run -n "$ENV_NAME" pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url "https://download.pytorch.org/whl/cu113"
-    else
-      echo "No CUDA detected. Installing CPU-only PyTorch and torchvision..."
-      conda run -n "$ENV_NAME" pip install torch==1.11.0+cpu torchvision==0.12.0+cpu torchaudio==0.11.0 --extra-index-url "https://download.pytorch.org/whl/cpu"
-    fi
-  fi
-}
-install_dependencies
-
-
 # Install additional Python dependencies from requirements.txt
 if [ -f "requirements.txt" ]; then
   echo "Installing additional Python dependencies from requirements.txt..."

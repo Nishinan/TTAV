@@ -46,7 +46,8 @@ def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vi
         config['vis_config']['encoder_dims'] = encoder_dims
         config['vis_config']['decoder_dims'] = decoder_dims
         
-        resolution_str = config['vis_config']['resolution']
+        resolution_str = config['vis_config'].get('resolution', '1024,1024')
+
         r = resolution_str.split(",")
         config['vis_config']['resolution'] = [int(i) for i in r]
     

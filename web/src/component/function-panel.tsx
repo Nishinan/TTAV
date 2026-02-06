@@ -1,8 +1,9 @@
 import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider } from 'antd';
-import { useDefaultStore } from '../state/state.unified';
+import { useDefaultStore, FocusMode } from '../state/state.unified';
 import { useEffect, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
+import axios from 'axios';
 
 type SampleTag = {
     num: number;
@@ -107,7 +108,8 @@ export function FunctionPanel() {
         useDefaultStore(["revealOriginalNeighbors", "revealProjectionNeighbors", "setRevealOriginalNeighbors", "setRevealProjectionNeighbors"]);
     const { showIndex, showLabel, showBackground, showTrail, setShowIndex, setShowLabel, setShowBackground, setShowTrail } =
         useDefaultStore(["showIndex","showLabel","showBackground","showTrail","setShowIndex","setShowLabel","setShowBackground","setShowTrail"]);
-
+    const { focusMode, setFocusMode } = useDefaultStore(['focusMode', 'setFocusMode']);
+    
     useEffect(() => {
         if (pointSize < 1) {
             setPointSize(1);
@@ -118,7 +120,21 @@ export function FunctionPanel() {
 
     const pointSizeMarks: Record<number, string> = { 1: '1', 2: '2', 3: '3', 4: '4', 5: '5' };
     const pointSizeLabel = pointSizeMarks[pointSize] ?? pointSize.toString();
+    const handleFocusModeChange = async (value: FocusMode) => {
+    setFocusMode(value); // 你原本就有的
 
+    // 1. 发送指令，让后端开始微调并准备好内存缓存
+    await axios.post('/updateFocusContext', {
+        focus_mode: value,
+        selected_indices: selectedIndices
+    });
+
+    // 2. 【避开所有报错的终极刷新】
+    // 我们不需。或者如果你能找到任何一个会触发请求的变量（如 epoch），随便改它一下。
+    // 如果实在不想动代码，直接强制当前窗口重新发起数据拉取请求。
+    window.location.hash = `refresh_${Date.now()}`; 
+    // 或者调用项目最外层的刷新逻辑。
+};
     function changeLabelColor(i: number, newColor: [number, number, number]) {
         setColorDict(new Map([...colorDict, [i, newColor]]));
     }
@@ -290,6 +306,27 @@ export function FunctionPanel() {
                         }
                     </ComponentBlock>
                 }
+            </FunctionalBlock>
+            <FunctionalBlock label="Precision Control">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <span style={{ fontSize: '12px' }}>Focus Mode</span>
+                    <Select
+                        size="small"
+                        value={focusMode}
+                        style={{ width: '120px' }}
+                        onChange={(value: FocusMode) => setFocusMode(value)}
+                        options={[
+                            { value: 'coarse', label: 'Coarse' },
+                            { value: 'balanced', label: 'Balanced' },
+                            { value: 'fine', label: 'Fine' },
+                        ]}
+                    />
+                </div>
+                <div className='alt-text' style={{ fontSize: '10px', lineHeight: '1.2' }}>
+                    {focusMode === 'coarse' && 'Visual highlight only.'}
+                    {focusMode === 'balanced' && 'Increase sampling weight.'}
+                    {focusMode === 'fine' && 'Enable LoRA local adaptation.'}
+                </div>
             </FunctionalBlock>
             <FunctionalBlock label="Categories">
                 <ComponentBlock>

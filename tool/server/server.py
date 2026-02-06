@@ -182,6 +182,11 @@ Response:
     attribute2 (object)
     ...
 """
+# 用于存储微调后的实时坐标
+ttav_buffer = {
+    "latest_prediction": None,
+    "active_mode": "coarse"
+}
 @app.route('/getAttributes', methods = ["POST"])
 @cross_origin()
 def get_attributes():
@@ -189,14 +194,24 @@ def get_attributes():
     content_path = req['content_path']
     epoch = req['epoch']
     attributes = req['attributes']
-
+    
+    # 【核心劫持逻辑】
+    # 如果当前处于 Fine/Balanced 模式，直接返回内存里的“热数据”
+    if ttav_context["mode"] != "coarse" and ttav_buffer["cache"] is not None:
+        result = {}
+        for attr in req['attributes']:
+            if attr == 'prediction': 
+                result[attr] = ttav_context["cache"] # 返回实时算的坐标
+            else:
+                result[attr] = load_single_attribute(...) # 其它属性（如label）照常读磁盘
+        return make_response(jsonify(result), 200)
+        
     result = {}
     for attribute in attributes:
         result[attribute] = load_single_attribute(content_path, epoch, attribute)
 
     result = jsonify(result)
     return make_response(result, 200)
-
 
 """
 Api: get simple filter result
@@ -440,6 +455,29 @@ def calculate_training_events():
         print(e)
         return make_response(jsonify({'error_message': 'Error in calculating training events'}), 400)
 
+
+ttav_context = {"selected_indices": [], "focus_mode": "coarse"}
+# tool/server/server.py
+import threading
+# 全局内存缓存，用于存储针对不同选区的实时微调结果
+ttav_memory_cache = {}
+# 全局状态，记录当前是否处于微调模式及最新的坐标数据
+ttav_context = {
+    "mode": "coarse",
+    "cache": None  # 存储微调后的实时 embedding
+}
+
+@app.route('/updateFocusContext', methods=['POST'])
+def update_focus_context():
+    req = request.get_json()
+    ttav_context["mode"] = req.get("focus_mode", "coarse")
+    
+    if ttav_context["mode"] != "coarse":
+        # 1. 立即执行微调（利用你提到的索引优化和 LoRA）
+        # 算完后直接更新内存缓存
+        ttav_context["cache"] = strategy.trainer.quick_refine(req['selected_indices'])
+    
+    return jsonify({"status": "success"})
 
 def check_port_inuse(port, host):
     import socket

@@ -17,6 +17,9 @@ export type EpochData = {
     background: string;
 };
 
+// New Type for TTAV Focus Mode
+export type FocusMode = "coarse" | "balanced" | "fine";
+
 // Unified state interface combining all views
 export type BaseMutableGlobalStore = {
     // Basic configuration
@@ -68,7 +71,8 @@ export type BaseMutableGlobalStore = {
     // Focus mode
     isFocusMode: boolean;
     focusIndices: number[];
-    
+    focusMode: FocusMode; // Added focusMode field
+
     // Training events and influence
     trainingEvents: TrainingEvent[];
     trainingEvent: TrainingEvent | null; // Current training event for influence view
@@ -130,6 +134,7 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     // Focus mode
     isFocusMode: false,
     focusIndices: [],
+    focusMode: "coarse", // Default to coarse
     
     // Training events and influence
     trainingEvents: [],

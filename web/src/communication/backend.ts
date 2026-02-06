@@ -225,3 +225,31 @@ export function testConnection(message: string, options?: NetworkOptions) {
     const data = { message };
     return basicPostWithJsonResponse('/testConnection', data, options);
 }
+
+/* web/src/communication/backend.ts */
+
+export function updateFocusContext(
+    contentPath: string,
+    selectedIndices: number[],
+    focus_mode: string,
+    options?: NetworkOptions
+) {
+    // 1. 严格保护：如果路径为空或没有选中点，直接返回，不发起任何网络通信
+    if (!contentPath || !selectedIndices || selectedIndices.length === 0) {
+        return Promise.resolve({ status: "ignored" });
+    }
+
+    const data = {
+        "content_path": contentPath,
+        "selected_indices": selectedIndices,
+        "focus_mode": focus_mode
+    };
+
+    // 2. 增加超时控制：防止这个非核心请求长时间挂起，拖累初始化
+    const ttavOptions = {
+        ...options,
+        timeout: 2000, // 2秒不回直接断掉，优先保证主界面加载
+    };
+
+    return basicPostWithJsonResponse('/updateFocusContext', data, ttavOptions);
+}

@@ -1,8 +1,9 @@
 // ChartComponent.tsx
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import React,{ memo, useEffect, useMemo, useRef, useState } from 'react';
 import { EmbeddingView, type EmbeddingViewProps, type DataPoint, type ViewportState } from 'embedding-atlas/react';
 import { useDefaultStore } from "../state/state.unified";
 import { transferArray2Color } from './utils';
+import * as BackendAPI from '../communication/backend';
 
 type EmbeddingData = NonNullable<EmbeddingViewProps['data']>;
 
@@ -188,6 +189,21 @@ export const ChartComponent = memo(() => {
 
     const [trailRefresh, setTrailRefresh] = useState(0);
     useEffect(() => { setTrailRefresh((v) => v + 1); }, [selectedIndices]);
+
+    const { focusMode, contentPath } = useDefaultStore(['focusMode', 'contentPath']);
+    useEffect(() => {
+    // 增加严格判定：只有当真正有选中点，且路径合法时才尝试同步
+    if (contentPath && selectedIndices && selectedIndices.length > 0) {
+        
+        const timer = setTimeout(() => {
+            console.log('[TTAV] Throttled update sent to backend');
+            BackendAPI.updateFocusContext(contentPath, selectedIndices, focusMode)
+                .catch(e => console.error("TTAV sync failed", e));
+        }, 800); // 增加到 800ms，确保用户操作稳定后再发
+
+        return () => clearTimeout(timer); // 这一行是防止崩溃的关键，它会取消掉之前的待发请求
+    }
+}, [selectedIndices, focusMode, contentPath]); 
 
     const neighborOverlayProps = useMemo(() => {
         if (!prepared || !epochData) return { center: null, original: [], projection: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors } as any;
