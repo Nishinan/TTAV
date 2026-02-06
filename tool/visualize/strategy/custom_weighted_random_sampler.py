@@ -40,3 +40,24 @@ class CustomWeightedRandomSampler(WeightedRandomSampler):
         # Update the actual sampler weights
         self.weights = new_weights
         print(f"[TTAV Sampler] Weights updated. Focus multiplier: {multiplier}")
+
+    # tool/visualize/strategy/custom_weighted_random_sampler.py
+
+import torch
+
+class TTAWeightedSampler:
+    def __init__(self, size):
+        self.weights = torch.ones(size)
+        self.size = size
+
+    def update_weights(self, focus_indices, mode="fine"):
+        """
+        分层计算逻辑：
+        1. 全局层：保持基础权重 (1.0)
+        2. 焦点层：强梯度下降 (5.0x 采样频率)
+        """
+        self.weights.fill_(1.0)
+        if focus_indices:
+            idx_tensor = torch.as_tensor(focus_indices, dtype=torch.long)
+            multiplier = 5.0 if mode == "fine" else 2.0
+            self.weights[idx_tensor] = multiplier

@@ -37,6 +37,40 @@ function MessageHandler() {
         'setTextData', 'setTokenList', 'setInherentLabelData',
         'setColorDict', 'setLabelDict', 'setProgress', 'setValue'
     ]);
+    const { 
+        contentPath, allEpochData, epoch // 获取当前状态
+         
+    } = useDefaultStore(['contentPath', 'allEpochData', 'epoch']);
+
+    const [isTTAMode, setIsTTAMode] = useState(false);
+    // [新增] 实时坐标轮询逻辑
+    useEffect(() => {
+        let timer: NodeJS.Timeout;
+
+        if (isTTAMode) {
+            timer = setInterval(async () => {
+                try {
+                    // 调用后端新加的获取实时坐标接口 (需在 backend.ts 补充，见下文)
+                    const response = await fetch(`http://localhost:5050/getLiveProjection`);
+                    const data = await response.json();
+
+                    if (data.projection) {
+                        // 局部更新当前 Epoch 的投影坐标，触发 Chart 重绘
+                        const updatedAllData = { ...allEpochData };
+                        if (updatedAllData[epoch]) {
+                            updatedAllData[epoch].projection = data.projection;
+                            setValue('allEpochData', updatedAllData);
+                        }
+                    }
+                } catch (e) {
+                    console.error("TTA Polling error:", e);
+                }
+            }, 1000); // 1秒更新一次
+        }
+
+        return () => clearInterval(timer);
+    }, [isTTAMode, contentPath, epoch, allEpochData]);
+
 
     // Start visualizing process
     const handleStartVisualizing = async (
@@ -197,6 +231,19 @@ function MessageHandler() {
                 break;
             case 'loadVisualization':
                 await handleLoadVisualization(data.config, data.visualizationID);
+                break;
+            case 'startLiveVisualizing': 
+                setIsTTAMode(true);
+                // 从 data 中解构出必要的配置
+                const { contentPath, visConfig } = data;
+                BackendAPI.startLiveMode(contentPath, visConfig)
+                    .then(() => {
+                        message.success('实时微调模式已启动');
+                    })
+                    .catch(err => {
+                        console.error('启动实时模式失败:', err);
+                        setIsTTAMode(false);
+                    });
                 break;
             default:
                 console.log('Unknown message command:', command);

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useDefaultStore } from '../state/state.unified';
 import ChartComponent from './chart';
 import { notifyEpochSwitch } from '../communication/extension';
-
+import * as BackendAPI from '../communication/backend';
 // https://stackoverflow.com/questions/54095994/react-useeffect-comparing-objects
 // FIXME use a library for all object/array nested comparison
 function deepCompareEquals(a: Array<number>, b: Array<number>){
@@ -228,12 +228,32 @@ function Timeline({ epoch, epochs, progress, onSwitchEpoch }: { epoch: number, e
         </div>
     );
 };
+// web/src/communication/backend.ts
+// 修改前：interface NetworkOptions
+export interface NetworkOptions {  // 添加 export 关键字
+    host?: string;
+    timeout?: number; // 建议加上这个，方便 TTA 轮询控制
+}
+
 
 export function MainBlock() {
-    const { epoch, setEpoch } = useDefaultStore(['epoch', 'setEpoch']);
+    const { epoch, setEpoch,contentPath } = useDefaultStore(['epoch', 'setEpoch', 'contentPath']);
     const { availableEpochs } = useDefaultStore(['availableEpochs']);
     const { progress } = useDefaultStore(['progress']);
+    // 在 ChartComponent 或处理选中的地方
+const { selectedIndices,setSelectedIndices } = useDefaultStore(['selectedIndices','setSelectedIndices']);
 
+// [核心改动] 自动同步焦点到后端
+    useEffect(() => {
+        // 只有当路径存在且选区不为空时才通知后端
+        if (contentPath && selectedIndices.length > 0) {
+            console.log("Syncing focus to backend:", selectedIndices);
+            
+            // 直接使用 Store 中的 selectedIndices
+            BackendAPI.updateFocusContext(contentPath, selectedIndices, "fine")
+                .catch(err => console.error("Failed to sync focus context", err));
+        }
+    }, [selectedIndices, contentPath]); // 监听这两个值的变化
     // only consider single container for now
     return (
         <div className="canvas-column">
@@ -246,6 +266,10 @@ export function MainBlock() {
                     }} />
                 </div>
             </div>
+            <ChartComponent onSelectIds={(ids: string[]) => {
+                const nums = ids.map(id => parseInt(id)).filter(n => !isNaN(n));
+                setSelectedIndices(nums);
+            }}/>
         </div >
     )
 }

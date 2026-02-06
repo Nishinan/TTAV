@@ -467,18 +467,110 @@ ttav_context = {
     "cache": None  # 存储微调后的实时 embedding
 }
 
-@app.route('/updateFocusContext', methods=['POST'])
-def update_focus_context():
-    req = request.get_json()
-    ttav_context["mode"] = req.get("focus_mode", "coarse")
+# @app.route('/updateFocusContext', methods=['POST'])
+# def update_focus_context():
+#     req = request.get_json()
+#     ttav_context["mode"] = req.get("focus_mode", "coarse")
     
-    if ttav_context["mode"] != "coarse":
-        # 1. 立即执行微调（利用你提到的索引优化和 LoRA）
-        # 算完后直接更新内存缓存
-        ttav_context["cache"] = strategy.trainer.quick_refine(req['selected_indices'])
+#     if ttav_context["mode"] != "coarse":
+#         # 1. 立即执行微调（利用你提到的索引优化和 LoRA）
+#         # 算完后直接更新内存缓存
+#         ttav_context["cache"] = strategy.trainer.quick_refine(req['selected_indices'])
     
-    return jsonify({"status": "success"})
+#     return jsonify({"status": "success"})
 
+
+# tool/server/server.py
+
+import threading
+from flask import Flask, jsonify, request
+# 假设你已定义了 TTA 相关的 Trainer
+
+class TTALiveState:
+    def __init__(self):
+        self.trainer = None
+        self.projection_buffer = None  # 存储显存/内存中的最新投影
+        self.is_running = False
+        self.lock = threading.Lock()
+
+live_state = TTALiveState()
+
+@app.route('/updateFocusContext', methods=["POST"])
+def update_focus_context():
+    """
+    焦点判断：接收前端索引并实时更新采样权重
+    """
+    req = request.get_json()
+    indices = req.get('selectedIndices', [])
+    
+    if live_state.trainer and hasattr(live_state.trainer.sampler, 'update_weights'):
+        # 调用你实现的三级资源调度逻辑
+        live_state.trainer.sampler.update_weights(indices, mode="fine")
+    return jsonify({"status": "success"}), 200
+
+@app.route('/getLiveProjection', methods=["GET"])
+def get_live_projection():
+    """
+    动态获取：取代原来的 load_projection (读取文件逻辑)
+    """
+    if live_state.projection_buffer is not None:
+        return jsonify({'projection': live_state.projection_buffer.tolist()})
+    return jsonify({'status': 'pending'}), 202
+
+def training_loop_worker(content_path, vis_config):
+    """
+    后台常驻训练线程
+    """
+    # 还原并初始化 Trainer (AE Refinement 策略)
+    live_state.trainer = init_tta_trainer(content_path, vis_config) 
+    live_state.is_running = True
+    
+    while live_state.is_running:
+        # 执行增量训练步进
+        new_proj = live_state.trainer.live_train_step()
+        with live_state.lock:
+            live_state.projection_buffer = new_proj
+
+@app.route('/startLiveVisualizing', methods=["POST"])
+def start_live_visualizing():
+    req = request.get_json()
+    # 启动后台守护线程，避免阻塞主进程
+    t = threading.Thread(target=training_loop_worker, 
+                         args=(req['content_path'], req['vis_config']))
+    t.daemon = True
+    t.start()
+    return jsonify({"status": "live_mode_started"}), 200
+
+
+# nishinan/ttav/TTAV-.../tool/server/server.py
+
+# 全局状态管理
+tta_state = {
+    "latest_projection": None,
+    "is_live": False,
+    "trainer": None
+}
+
+def tta_worker_thread():
+    """守护线程：持续微调模型"""
+    while tta_state["is_live"]:
+        if tta_state["trainer"]:
+            # 调用新增的 live_train_step
+            new_proj = tta_state["trainer"].live_train_step()
+            tta_state["latest_projection"] = new_proj.tolist()
+        time.sleep(0.01) # 避免 CPU 过载
+
+@app.route('/startLiveMode', methods=['POST'])
+def start_live_mode():
+    tta_state["is_live"] = True
+    # 初始化 trainer 后启动线程
+    threading.Thread(target=tta_worker_thread, daemon=True).start()
+    return jsonify({"status": "live_mode_active"})
+
+@app.route('/getLiveProjection', methods=['GET'])
+def get_live_projection():
+    """前端轮询此接口获取最新坐标"""
+    return jsonify({"projection": tta_state["latest_projection"]})
 def check_port_inuse(port, host):
     import socket
 

@@ -242,6 +242,58 @@ class SingleVisTrainer(TrainerAbstractClass):
 
             # tool/visualize/strategy/trainer.py
 
+    def live_train_step(self):
+        """
+        [TTAV 新增] 实时训练步进：不写磁盘，直接返回最新投影。
+        由后端守护线程循环调用。
+        """
+        self.model.to(device=self.DEVICE)
+        self.model.train()
+        
+        # 1. 确保在 Fine 模式下仅训练 LoRA 参数 (AE Refinement)
+        if self.ttav_mode == "fine":
+            for name, param in self.model.named_parameters():
+                param.requires_grad = "lora_" in name
+        else:
+            for param in self.model.parameters():
+                param.requires_grad = True
+
+        # 2. 仅执行 1-2 个 batch 的训练，确保响应实时性
+        # 注意：这里使用 iter_loader 避免每次重新扫全量数据
+        if not hasattr(self, "_iter_loader"):
+            self._iter_loader = iter(self.edge_loader)
+        
+        try:
+            data = next(self._iter_loader)
+        except StopIteration:
+            self._iter_loader = iter(self.edge_loader)
+            data = next(self._iter_loader)
+
+        # 执行标准训练步进（复用你 Step 5 的加权 Loss 逻辑）
+        edge_to, edge_from, a_to, a_from, idx_to, idx_from = data
+        edge_to = edge_to.to(self.DEVICE)
+        edge_from = edge_from.to(self.DEVICE)
+        
+        # 计算权重 (基于 self.ttav_indices)
+        batch_weights = torch.ones(edge_to.shape[0]).to(self.DEVICE)
+        if self.ttav_mode != "coarse" and self.ttav_indices:
+            alpha = 5.0 if self.ttav_mode == "fine" else 2.0
+            focus_mask = torch.tensor([(i.item() in self.ttav_indices) for i in idx_to]).to(self.DEVICE)
+            batch_weights[focus_mask] *= alpha
+
+        # 优化
+        outputs = self.model(edge_to, edge_from)
+        umap_l, recon_l, loss = self.criterion(edge_to, edge_from, a_to, a_from, outputs, weights=batch_weights)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # 3. 关键：直接从模型获取所有点的最新 2D 坐标（无 IO 损耗）
+        self.model.eval()
+        with torch.no_grad():
+            # 假设 model 有 get_projection 方法，或直接用 encoder
+            return self.model.encoder(self.edge_loader.dataset.all_data).cpu().numpy()
     def ttav_fast_refine(self, indices, mode, epochs=10):
         """
         TTAV 专属算法：针对焦点区域的快速流形拉伸
