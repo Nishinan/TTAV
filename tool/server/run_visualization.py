@@ -115,30 +115,23 @@ def init_visualize_component(config):
             config['vis_config']['lambda'] = 1.0
             
     if config['vis_method'] == "DVI":
-        data_provider = DataProvider(config, device)  
+        data_provider = DataProvider(config, device)
         projector = DVIProjector(config)
         visualizer = ResultGenerator(config, data_provider, projector)
         strategy = DeepVisualInsight(config, data_provider)
     elif config['vis_method'] == "TimeVis":
-        data_provider = DataProvider(config, device)  
+        data_provider = DataProvider(config, device)
         projector = TimeVisProjector(config)
         visualizer = ResultGenerator(config, data_provider, projector)
         strategy = TimeVis(config, data_provider)
     elif config['vis_method'] == "DynaVis":
-        # [修改点 2]：重写 DynaVis 分支逻辑
-        if 'selected_idxs' in config['vis_config']:
-            selected_idxs = config['vis_config']['selected_idxs']
-        else:
-            # 默认值逻辑保持不变
-            selected_idxs = list(range(100))
-        
-        # DynaVis 通常需要自己的数据提供者和投影器
-        data_provider = DataProvider(config, device)   
+        data_provider = DataProvider(config, device)
         projector = DynaVisProjector(config)
         visualizer = ResultGenerator(config, data_provider, projector)
-      
-        from visualize.dynavis.runner import DynaVisRunner
-        runner = DynaVisRunner( config["content_path"], config["vis_id"], config["data_type"], config["task_type"], config["vis_config"])
+        runner = DynaVisRunner(
+            config["content_path"], config["vis_id"],
+            config["data_type"], config["task_type"], config["vis_config"]
+        )
         strategy = runner
         
     elif config['vis_method'] == "UMAP":
@@ -158,22 +151,18 @@ def visualize_run(content_path, vis_method, vis_id, data_type, task_type, vis_co
     visualizer, strategy = init_visualize_component(config)
 
     if vis_method == "DynaVis":
-        runner = strategy
-        runner.run()
-        
+        # DynaVis manages its own training and output; do not call visualize_all_epochs().
+        strategy.run()
     else:
-        # step 3: generate visualization results
-        if vis_method == "DVI" or vis_method == "TimeVis":
-            # now we assume that all the metries are already saved to train visualization model
-            # 3.1 trian visualization model
+        if vis_method in ("DVI", "TimeVis"):
             print("Start training visualization model...")
             strategy.train_vis_model()
             print("Train visualization model finished.")
-            
-    # 3.2 generate visualization results
-    print("Start generating visualization results...")
-    visualizer.visualize_all_epochs()
-    print("Generate visualization results finished, visualization process completed successfully!")
+
+        # Project all epochs with the trained model.
+        print("Start generating visualization results...")
+        visualizer.visualize_all_epochs()
+        print("Generate visualization results finished, visualization process completed successfully!")
     
     # step 4: save config
     os.makedirs(os.path.join(content_path, 'visualize', f"{vis_method}_{vis_id}"), exist_ok=True)

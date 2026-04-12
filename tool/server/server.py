@@ -77,77 +77,58 @@ def sync_session():
         
 import threading
 
-# 1. 在全局定义这把锁
-computation_lock = threading.Lock()
 @app.route('/updateFocusContext', methods=['POST'])
 @cross_origin()
 def update_focus_context():
     """
     Endpoint to receive user selection and trigger dynamic refinement.
     """
-    data = request.get_json()
-    content_path = data.get("content_path")
-    selected_indices = data.get("selected_indices", [])
-    focus_mode = data.get("focus_mode", "coarse")
-    
     req = request.get_json()
+    content_path = req.get("content_path")
+    selected_indices = req.get("selected_indices", [])
+    focus_mode = req.get("focus_mode", "balanced")
 
-    # Check if a session is active and matches the current data path
-    if active_session["strategy"] is None: # or active_session["content_path"] != content_path:
-        print("No active session, strategy: ",active_session["strategy"],", path: ",active_session["content_path"],"content path: ", content_path)
+    # Check if a session is active
+    if active_session["strategy"] is None:
+        print("No active session, strategy:", active_session["strategy"],
+              ", path:", active_session["content_path"], "content path:", content_path)
         return jsonify({"status": "error", "message": "No active session"}), 400
-    
 
     strategy = active_session["strategy"]
     visualizer = active_session["visualizer"]
-    
+
     try:
-        # 1. 提取前端参数
-        selected_indices = req.get("selected_indices", [])
-        focus_mode = req.get("focus_mode", "balanced")
-        
         print(f"Starting refinement: mode={focus_mode}, selected_points={selected_indices}")
 
         mask = strategy.get_focus_mask(selected_indices)
-        # 3. 将参数注入到 Trainer 状态中
-        # 这一步确保了下一步 strategy.train() 会看到这些焦点信息
         strategy.update_ttav_context(selected_indices, focus_mode, mask)
 
-        # 4. 执行训练 (根据模式决定轮次)
-        refine_epochs = 5 if focus_mode == "fine" else 2
         vis_method = active_session["vis_method"]
         if vis_method == "DynaVis":
-
             strategy.refine_train(focus_mode=focus_mode)
-
+            # DynaVis writes its own output; regenerate projections via visualizer.
+            print("Start generating DynaVis visualization results...")
+            visualizer.visualize_all_epochs()
+            print("DynaVis visualization results generated.")
+        elif vis_method in ("DVI", "TimeVis"):
+            # refine() saves refined projections to visualize/{vis_method}_{vis_id}_refined/.
+            # Do NOT call visualize_all_epochs() here — it would overwrite the standard
+            # (non-refined) directory with old-model results and not touch the _refined dir.
+            print("Start refining visualization model...")
+            strategy.refine(
+                focus_indices=selected_indices,
+                neighbor_indices=[],  # empty: let refine() look up saved neighbors
+                epochs_to_update=10
+            )
+            print("Refinement finished. Refined projections saved to _refined directory.")
         else:
-            # step 3: generate visualization results
-            if vis_method == "DVI" or vis_method == "TimeVis":
-                # now we assume that all the metries are already saved to train visualization model
-                print("Start training visualization model...")
-                strategy.refine(
-                    focus_index = selected_indices[0], 
-                    neighbor_indices = [], # 传空，让后端去读取保存的邻居
-                    epochs_to_update = 10
-                )
-                print("Train visualization model finished.")
-                
-        # generate visualization results
-        print("Start generating visualization results...")
-        visualizer.visualize_all_epochs()
-        print("Generate visualization results finished, visualization process completed successfully!")
-       
-        # # 定位刚才保存的最新坐标文件
-        # # 注意：这里需要根据你的文件结构拼接路径
-        # latest_proj_path = os.path.join(strategy.data_provider.content_path, "Model", "Iteration_1", "dvi_json", f"index_1.npy")
-        # new_coords = np.load(latest_proj_path)
+            visualizer.visualize_all_epochs()
 
-        return jsonify({
-            "status": "success", 
-            "projection": "new_projection" # new_coords.tolist()
-        })
+        return jsonify({"status": "success"})
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
     
     
@@ -187,7 +168,7 @@ def start_visualizing():
     
 @app.route("/", methods=["GET", "POST"])
 def GUI():
-    return send_from_directory('../frontend', 'index.html')
+    return send_from_directory('../../web/dist', 'index.html')
 
 
 """
@@ -519,9 +500,11 @@ def get_projection_neighbors():
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
-    
+    # Support refine_flag so the caller can request neighbors from the refined projection
+    refine_flag = bool(req.get('refine_flag', False))
+
     try:
-        neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch,False)
+        neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, refine_flag)
         result = jsonify({
             'neighbors': neighbors,
         })

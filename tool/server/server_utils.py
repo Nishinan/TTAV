@@ -410,48 +410,95 @@ def generate_dimension_array(dimension):
     decoder_dims = encoder_dims[::-1]
     return encoder_dims, decoder_dims
 
-def calculate_visualize_metrics(content_path, vis_method, vis_id, epoch):
-    high_dimensional_neighbors = calculate_high_dimensional_neighbors(content_path, epoch)
-    projection_neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch,False)
-
-    # Neighbor trustworthiness and continuity
-    K = min(len(high_dimensional_neighbors[0]), len(projection_neighbors[0]))
-    N = len(high_dimensional_neighbors)
+def _compute_trustworthiness_continuity(high_neighbors, low_neighbors):
+    """
+    Core T&C computation shared by both static (disk-based) and dynamic (in-memory) paths.
+    Both inputs are List[List[int]] — precomputed neighbor index lists.
+    Returns (trustworthiness, continuity) as floats in [0, 1].
+    """
+    N = len(high_neighbors)
+    K = min(len(high_neighbors[0]), len(low_neighbors[0]))
 
     trust_sum = 0.0
     cont_sum = 0.0
 
     for i in range(N):
-        high = high_dimensional_neighbors[i][:K]
-        low = projection_neighbors[i][:K]
+        high = high_neighbors[i][:K]
+        low = low_neighbors[i][:K]
 
-        # 1. Trustworthiness
+        # Trustworthiness: points that appear in low-dim neighborhood but not high-dim
         u_set = set(low) - set(high)
         for j in u_set:
             try:
-                rank = high_dimensional_neighbors[i].index(j) + 1  # 1-based
+                rank = high_neighbors[i].index(j) + 1  # 1-based rank in high-dim
                 trust_sum += (rank - K)
             except ValueError:
-                trust_sum += (len(high_dimensional_neighbors[i]) + 1 - K)
+                trust_sum += (len(high_neighbors[i]) + 1 - K)
 
-        # 2. Continuity
+        # Continuity: points that appear in high-dim neighborhood but not low-dim
         v_set = set(high) - set(low)
         for j in v_set:
             try:
-                rank = projection_neighbors[i].index(j) + 1  # 1-based
+                rank = low_neighbors[i].index(j) + 1  # 1-based rank in low-dim
                 cont_sum += (rank - K)
             except ValueError:
-                cont_sum += (len(projection_neighbors[i]) + 1 - K)
+                cont_sum += (len(low_neighbors[i]) + 1 - K)
 
     normalizer = N * K * (2 * N - 3 * K - 1)
-
     trustworthiness = 1.0 - (2.0 / normalizer) * trust_sum
     continuity = 1.0 - (2.0 / normalizer) * cont_sum
+    return trustworthiness, continuity
 
-    return {
+
+def _metrics_cache_path(content_path, vis_method, vis_id):
+    """Return the path of the per-visualisation metrics cache JSON."""
+    return os.path.join(
+        content_path, 'visualize',
+        f"{vis_method}_{vis_id}",
+        'metrics_cache.json'
+    )
+
+
+def calculate_visualize_metrics(content_path, vis_method, vis_id, epoch):
+    """
+    Static path: load neighbor lists from disk and compute T&C metrics.
+    Results are cached to disk (metrics_cache.json) to avoid re-computation
+    across server restarts and repeated API calls for the same epoch.
+    """
+    cache_path = _metrics_cache_path(content_path, vis_method, vis_id)
+    epoch_key = str(epoch)
+
+    # --- try reading from cache ---
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r') as f:
+                cache = json.load(f)
+            if epoch_key in cache:
+                return cache[epoch_key]
+        except Exception:
+            cache = {}
+    else:
+        cache = {}
+
+    # --- compute ---
+    high_neighbors = calculate_high_dimensional_neighbors(content_path, epoch)
+    low_neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, False)
+    trustworthiness, continuity = _compute_trustworthiness_continuity(high_neighbors, low_neighbors)
+    result = {
         "neighbor_trustworthiness": trustworthiness,
-        "neighbor_continuity": continuity
+        "neighbor_continuity": continuity,
     }
+
+    # --- persist to cache ---
+    cache[epoch_key] = result
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump(cache, f)
+    except Exception:
+        pass  # cache write failure is non-fatal
+
+    return result
 
 
 """
@@ -609,55 +656,40 @@ def compute_training_events(content_path, epoch, event_types):
     return events
 
 
-# tool/server/server_utils.py
 
 def calculate_neighbor_preservation(high_neighbors, low_neighbors):
     """
-    计算高维和低维邻居的交集比例 (Neighbor Preservation Rate)
-    high_neighbors: List[List[int]] 高维空间的邻居索引
-    low_neighbors: List[List[int]] 低维空间的邻居索引
+    Dynamic path: compute Neighbor Preservation Rate from in-memory neighbor lists.
+    Returns the fraction of high-dim neighbors that are also low-dim neighbors.
+    high_neighbors / low_neighbors: List[List[int]]
     """
     num_samples = len(high_neighbors)
     if num_samples == 0:
         return 0.0
-    
     k = len(high_neighbors[0])
-    total_overlap = 0
-    for i in range(num_samples):
-        h_set = set(high_neighbors[i])
-        l_set = set(low_neighbors[i])
-        total_overlap += len(h_set.intersection(l_set))
-    
+    total_overlap = sum(
+        len(set(high_neighbors[i]).intersection(set(low_neighbors[i])))
+        for i in range(num_samples)
+    )
     return total_overlap / (num_samples * k)
 
-def calculate_trustworthiness(X_high, X_low, k=10):
+
+def calculate_ttav_metrics(X_high, X_low, k=10):
     """
-    计算 Trustworthiness (信任度)
-    衡量低维空间中出现的邻居在多大程度上也是高维空间中的邻居
+    Dynamic path: compute T&C metrics from raw numpy arrays (used after TTAV refinement).
+    Builds neighbor lists in-memory then delegates to the shared _compute_trustworthiness_continuity.
+    Returns {"neighbor_trustworthiness": float, "neighbor_continuity": float}.
     """
-    from sklearn.neighbors import NearestNeighbors
-    n = X_high.shape[0]
-    
-    # 获取高维和低维的近邻
-    nbrs_high = NearestNeighbors(n_neighbors=n, algorithm='auto').fit(X_high)
-    high_dist, high_indices = nbrs_high.kneighbors(X_high)
-    
-    # 计算高维距离的排名 (Rank)
-    high_ranks = np.zeros((n, n), dtype=int)
-    for i in range(n):
-        high_ranks[i, high_indices[i]] = np.arange(n)
-        
+    nbrs_high = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(X_high)
+    _, high_indices = nbrs_high.kneighbors(X_high)
+    high_neighbors = [high_indices[i, 1:].tolist() for i in range(len(X_high))]
+
     nbrs_low = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(X_low)
-    low_dist, low_indices = nbrs_low.kneighbors(X_low)
-    
-    sum_val = 0
-    for i in range(n):
-        # 找到在低维是邻居但在高维不是邻居的点 (U_i)
-        for j in range(1, k + 1):
-            idx_j = low_indices[i, j]
-            rank_high = high_ranks[i, idx_j]
-            if rank_high > k:
-                sum_val += (rank_high - k)
-                
-    t = 1 - (2 / (n * k * (2 * n - 3 * k - 1))) * sum_val
-    return t
+    _, low_indices = nbrs_low.kneighbors(X_low)
+    low_neighbors = [low_indices[i, 1:].tolist() for i in range(len(X_low))]
+
+    trustworthiness, continuity = _compute_trustworthiness_continuity(high_neighbors, low_neighbors)
+    return {
+        "neighbor_trustworthiness": trustworthiness,
+        "neighbor_continuity": continuity
+    }

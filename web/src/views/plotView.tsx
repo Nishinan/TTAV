@@ -27,13 +27,16 @@ interface FunctionViewPanelsProps {
 }
 
 
-  const loadSingleEpoch = async (contentPath: string, method: string, visID: string, epochNum: number, taskType: string) => {
+  const loadSingleEpoch = async (
+        contentPath: string, method: string, visID: string, epochNum: number, taskType: string,
+        refineFlag: boolean = false  // when true, load from the _refined projection directory
+    ) => {
         // 1. 获取投影坐标 (最核心)
         const projection = await BackendAPI.fetchEpochProjection(contentPath, method, visID, epochNum);
-        
-        // 2. 获取邻居数据 (用于对比微调前后的流形保持)
+
+        // 2. 获取邻居数据: use refineFlag so post-refine neighbors match the refined projection
         const originalNeighbors = await BackendAPI.getOriginalNeighbors(contentPath, epochNum);
-        const projectionNeighbors = await BackendAPI.getProjectionNeighbors(contentPath, method, visID, epochNum);
+        const projectionNeighbors = await BackendAPI.getProjectionNeighbors(contentPath, method, visID, epochNum, refineFlag);
 
         const data: any = {
             projection: projection.projection || [],
@@ -231,14 +234,16 @@ export const calculateDisplacementStats = (
 const refreshEpochData = async (
     epochNum: number,
     params: { contentPath: string; vis_method: string; visID: string; taskType: string },
-    updateGlobal: boolean = true
+    updateGlobal: boolean = true,
+    refineFlag: boolean = false  // propagated to loadSingleEpoch for post-refine neighbor accuracy
 ) => {
     const epochData = await loadSingleEpoch(
         params.contentPath,
         params.vis_method,
         params.visID,
         epochNum,
-        params.taskType
+        params.taskType,
+        refineFlag
     );
 
     const curP = epochData.projection;
@@ -434,8 +439,11 @@ export function AppCombinedView() {
     const {
         contentPath,
         selectedIndices,
-        visID,
+        visID: currentVisID,
         epoch,
+        epoch: targetEpoch,
+        vis_method,
+        taskType,
         setValue,
         focusMode,
     } = useDefaultStore([
@@ -443,15 +451,11 @@ export function AppCombinedView() {
         'selectedIndices',
         'visID',
         'epoch',
+        'vis_method',
+        'taskType',
         'setValue',
-        'focusMode'
+        'focusMode',
     ]);
-    const { 
-        epoch: targetEpoch, 
-        vis_method, 
-        taskType, 
-        visID: currentVisID 
-    } = useDefaultStore(["epoch", "vis_method", "taskType", "visID"]);
 // 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
     const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
     const animationRef = useRef<number>();
@@ -510,24 +514,24 @@ export function AppCombinedView() {
             
 
             if (response && response.status === "success") {
-                
                 console.log(`[TTAV] Refine success. Fetching new projection for epoch ${targetEpoch}...`);
 
-                // 不刷新当前目标 Epoch
-                const newEpochData=await refreshEpochData(targetEpoch, {
+                // Fetch and commit new epoch data to the store (updateGlobal=true, refineFlag=true)
+                // so the canvas re-renders with the refined projection and neighbors are also
+                // computed from the _refined directory (fixes neighbor preservation metric).
+                const newEpochData = await refreshEpochData(targetEpoch, {
                     contentPath,
                     vis_method,
                     visID: currentVisID,
-                    //visID: response.new_vis_id || currentVisID, // 使用后端返回的新 ID（如有）
                     taskType
-                },false);
-                // 3. 执行投影质量评估
+                }, true, true);
+
+                // Quality metrics (console-only, no UI impact)
                 await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
-                // 执行位移统计
-                await calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices);
+                calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices);
+
                 message.success(`Epoch ${targetEpoch} refined! Plot updated!`);
-                console.log(`Epoch ${targetEpoch} refined! Plot updated!`);
-                }
+            }
         } catch (error) {
             console.error("Update failed:", error);
             message.error('Failed to update projection.');

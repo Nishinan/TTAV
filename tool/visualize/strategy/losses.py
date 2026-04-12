@@ -112,35 +112,31 @@ class SingleVisLoss(nn.Module):
     
     def forward(self, edge_to, edge_from, a_to, a_from, outputs, weights=None):
         """
-        Step 5: Apply sample-wise weights to both UMAP and Reconstruction losses.
-        :param weights: torch.Tensor, shape (batch_size,), importance of each edge.
+        Compute combined UMAP + reconstruction loss, with optional per-edge TTAV weights.
+
+        :param edge_to:   high-dim source vectors  [B, D]
+        :param edge_from: high-dim target vectors  [B, D]
+        :param a_to:      attention weights for source  [B, D]
+        :param a_from:    attention weights for target  [B, D]
+        :param outputs:   4-tuple (emb_to, emb_from, recon_to, recon_from) from VisModel
+        :param weights:   optional per-edge importance tensor [B], for TTAV focus mode
         """
         embedding_to, embedding_from, recon_to, recon_from = outputs
 
-        # 1. Calculate Reconstruction Loss (typically Mean Squared Error)
-        # We compute per-sample loss instead of direct mean()
-        recon_l_to = torch.mean(torch.pow(recon_to - a_to, 2), dim=1)
-        recon_l_from = torch.mean(torch.pow(recon_from - a_from, 2), dim=1)
-        
-        # 2. Calculate UMAP Loss (Negative Log Likelihood)
-        # We calculate the distance between embeddings
-        distance_square = torch.sum(torch.pow(embedding_to - embedding_from, 2), dim=1)
-        # (Simplified UMAP logic for illustration)
-        umap_l = -torch.log(torch.exp(-distance_square) + 1e-6)
+        # Standard UMAP loss with negative sampling (returns a scalar)
+        umap_l = self.umap_loss(embedding_to, embedding_from)
 
-        # 3. Apply weights if provided
+        # Attention-weighted reconstruction loss (returns a scalar)
+        recon_l = self.recon_loss(edge_to, edge_from, recon_to, recon_from, a_to, a_from)
+
         if weights is not None:
-            # Multiplier: alpha for focus area, 1.0 for global area
-            umap_l = umap_l * weights
-            recon_l_to = recon_l_to * weights
-            recon_l_from = recon_l_from * weights
+            # TTAV weighted mode: scale by mean batch weight as an approximation,
+            # since UmapLoss and ReconstructionLoss return scalars, not per-sample values.
+            w = weights.mean()
+            loss = w * umap_l + self.lambd * w * recon_l
+        else:
+            loss = umap_l + self.lambd * recon_l
 
-        # 4. Final aggregation (Mean of weighted individual losses)
-        recon_l = torch.mean(recon_l_to + recon_l_from)
-        umap_l = torch.mean(umap_l)
-        
-        loss = umap_l + self.negative_sample_rate * recon_l
-        
         return umap_l, recon_l, loss
 class HybridLoss(nn.Module):
     def __init__(self, umap_loss, recon_loss, smooth_loss, lambd1, lambd2):
@@ -152,8 +148,8 @@ class HybridLoss(nn.Module):
         self.lambd2 = lambd2
 
     def forward(self, edge_to, edge_from, a_to, a_from, embeded_to, coeff, outputs):
-        embedding_to, embedding_from = outputs["umap"]
-        recon_to, recon_from = outputs["recon"]
+        # outputs is a 4-tuple from VisModel: (emb_to, emb_from, recon_to, recon_from)
+        embedding_to, embedding_from, recon_to, recon_from = outputs
 
         recon_l = self.recon_loss(edge_to, edge_from, recon_to, recon_from, a_to, a_from)
         umap_l = self.umap_loss(embedding_to, embedding_from)
@@ -207,9 +203,8 @@ class BoundaryAwareLoss(nn.Module):
 
     
     def forward(self, edge_from, edge_to, model):
-        outputs = model( edge_to, edge_from)
-        embedding_to, embedding_from = outputs["umap"]
-        recon_to, recon_from = outputs["recon"]
+        # VisModel returns a 4-tuple: (emb_to, emb_from, recon_to, recon_from)
+        embedding_to, embedding_from, recon_to, recon_from = model(edge_to, edge_from)
 
         reconstruction_loss_to = F.mse_loss(recon_to, edge_to)
         reconstruction_loss_from = F.mse_loss(recon_from, edge_from)
@@ -232,11 +227,11 @@ class DVILoss(nn.Module):
     def forward(self, edge_to, edge_from, a_to, a_from, curr_model, weights=None):
         """
         [TTAV] Weighted DVI loss for real-time local refinement.
+        curr_model is called internally; VisModel returns 4-tuple (emb_to, emb_from, recon_to, recon_from).
         """
         curr_model = curr_model.to(self.device)
-        outputs = curr_model(edge_to, edge_from)
-        embedding_to, embedding_from = outputs["umap"]
-        recon_to, recon_from = outputs["recon"]
+        # VisModel returns a 4-tuple: (emb_to, emb_from, recon_to, recon_from)
+        embedding_to, embedding_from, recon_to, recon_from = curr_model(edge_to, edge_from)
 
         # 1. Calculate basic losses (UMAP & Reconstruction)
         # Note: We need per-sample loss for weighting

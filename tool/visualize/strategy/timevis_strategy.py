@@ -11,7 +11,7 @@ from strategy.edge_dataset import DataHandler
 from strategy.spatial_edge_constructor import kcSpatialEdgeConstructor
 from strategy.temporal_edge_constructor import GlobalTemporalEdgeConstructor
 from strategy.losses import SingleVisLoss, UmapLoss, ReconstructionLoss
-from tool.visualize.visualize_model import VisModel
+from visualize_model import VisModel
 from strategy.strategy_abstract import StrategyAbstractClass
 from data_provider import DataProvider
 from umap.umap_ import find_ab_params
@@ -38,7 +38,6 @@ class TimeVis(StrategyAbstractClass):
     def train(self):
         self.train_vis_model()
 
-        
     def train_vis_model(self):
         # parameters
         N_NEIGHBORS = self.config['vis_config']["n_neighbors"]
@@ -68,16 +67,19 @@ class TimeVis(StrategyAbstractClass):
         probs = probs[eliminate_zeros]
         
         dataset = DataHandler(edge_to, edge_from, feature_vectors, attention)
+        # Save edge graph so refine() can look up neighbors without rebuilding the graph.
+        self.data_handler = dataset
+        self.feature_vectors = feature_vectors
+
         n_samples = int(np.sum(S_N_EPOCHS * probs) // 1)
-        # chose sampler based on the number of dataset
-        if len(edge_to) > 2^24:
+        # 2^24 written as a Python XOR (^) is a bug; use the correct bit-shift form.
+        if len(edge_to) > 2 ** 24:
             sampler = CustomWeightedRandomSampler(probs, n_samples, replacement=True)
         else:
             sampler = WeightedRandomSampler(probs, n_samples, replacement=True)
         edge_loader = DataLoader(dataset, batch_size=1000, sampler=sampler)
 
         trainer = SingleVisTrainer(self.visualize_model, self.criterion, optimizer, lr_scheduler, edge_loader=edge_loader, DEVICE=self.device)
-        # trainer.train(PATIENT, MAX_EPOCH)
         trainer.train(MAX_EPOCH)
 
         self.save_vis_model(self.visualize_model, trainer.loss, trainer.optimizer)
@@ -140,26 +142,36 @@ class TimeVis(StrategyAbstractClass):
         self.ttav_mode = mode
         self.ttav_mask = mask # Boolean mask on GPU
                 
-    def refine(self, focus_index, neighbor_indices=None, epochs_to_update=10):
+    def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None, epochs_to_update=10):
+        """
+        Refine projections for one or more focus points.
+        `focus_indices` is preferred (list); `focus_index` kept for backwards compat.
+        """
         import torch
         import numpy as np
         import time
         import os
 
+        # Normalise to a list of focus points
+        if focus_indices is None:
+            focus_indices = [focus_index] if focus_index is not None else []
+
         start_time = time.time()
-        
+
         if not neighbor_indices:
             all_edges_to = self.data_handler.edge_to
             all_edges_from = self.data_handler.edge_from
+            collected = set()
+            for fi in focus_indices:
+                idx = np.where(all_edges_to == fi)[0]
+                collected.update(all_edges_from[idx].tolist())
+            # Cap at 15 neighbours per focus point to avoid memory blow-up
+            neighbor_indices = list(collected - set(focus_indices))[:15 * max(len(focus_indices), 1)]
 
-            indices = np.where(all_edges_to == focus_index)[0]
-            neighbor_indices = all_edges_from[indices].tolist()
-            neighbor_indices = list(set(neighbor_indices))[:15]
-
-        all_indices = [focus_index] + neighbor_indices
+        all_indices = list(focus_indices) + neighbor_indices
         available_epochs = self.config['available_epochs']
         target_epochs = available_epochs[-epochs_to_update:]
-        
+
         train_data = []
         for e in target_epochs:
             feat = self.data_provider.get_representation(e)[all_indices]
@@ -168,31 +180,38 @@ class TimeVis(StrategyAbstractClass):
 
         optimizer = torch.optim.Adam(self.visualize_model.parameters(), lr=0.01)
         self.visualize_model.train()
+        # Dummy attention (ones) so ReconstructionLoss treats all features equally.
+        dummy_a = torch.ones_like(train_batch)
         for _ in range(10):
             optimizer.zero_grad()
             outputs = self.visualize_model(train_batch, train_batch)
-            _, _, loss = self.criterion(train_batch, train_batch, None, None, outputs)
+            _, _, loss = self.criterion(train_batch, train_batch, dummy_a, dummy_a, outputs)
             loss.backward()
             optimizer.step()
-            if time.time() - start_time > 1.2: break # 硬时间限制
+            if time.time() - start_time > 1.2:
+                break
 
-        # 4. 模拟 DynaVis 保存机制：直接生成 Refined 结果
-        # 我们不改变目录结构，而是覆盖或新建一个特定的 VisID 目录
-        # 假设当前 VisID 是 DynaVis_8，我们存到 DynaVis_8_refined
-        refined_vis_id = f"{self.vis_id}_refined"
-        # 这里只投影受影响的 Epoch 坐标
+        # Save refined projections to visualize/{vis_method}_{vis_id}_refined/epochs/epoch_N/projection.npy
+        # This matches the path that load_projection(refine_flag=True) expects.
+        vis_method = self.config['vis_method']
+        vis_id = self.config['vis_id']
+        content_path = self.config['content_path']
+
         self.visualize_model.eval()
         with torch.no_grad():
-            for e in target_epochs:
-                # 这里的 save_path 逻辑需对应你的 ResultGenerator 路径
+            for e in available_epochs:
                 full_feat = self.data_provider.get_representation(e)
-                embedding = self.visualize_model.encoder(torch.from_numpy(full_feat).float().to(self.device)).cpu().numpy()
-                
-                # 保存路径：Model/Iteration_x/refined_vis_id/index_e.npy
-                save_dir = os.path.join(self.data_provider.content_path, "Model", f"Iteration_{self.iteration}", refined_vis_id)
+                embedding = self.visualize_model.encoder(
+                    torch.from_numpy(full_feat).float().to(self.device)
+                ).cpu().numpy()
+
+                save_dir = os.path.join(
+                    content_path, 'visualize',
+                    f"{vis_method}_{vis_id}_refined",
+                    'epochs', f'epoch_{e}'
+                )
                 os.makedirs(save_dir, exist_ok=True)
-                np.save(os.path.join(save_dir, f"index_{e}.npy"), embedding)
+                np.save(os.path.join(save_dir, 'projection.npy'), embedding)
 
         print(f"Refine & Save finished in {time.time() - start_time:.2f}s")
-        return refined_vis_id
 

@@ -4,7 +4,6 @@ Edge dataset from temporal complex
 from abc import ABC, abstractmethod
 from torch.utils.data import Dataset
 from PIL import Image
-import tensorflow as tf
 import numpy as np
 
 class DataHandlerAbstractClass(Dataset, ABC):
@@ -129,6 +128,9 @@ class DVIDataHandler(Dataset):
 def construct_edge_dataset(
     edges_to_exp, edges_from_exp, weight, data, alpha, n_rate, batch_size
 ):
+    # TensorFlow is only needed for the tf.data pipeline; import lazily to keep
+    # the PyTorch-only path (DataHandler, DVIDataHandler) free of TF dependencies.
+    import tensorflow as tf
 
     def gather_index(index):
         return data[index]

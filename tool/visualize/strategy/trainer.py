@@ -174,7 +174,7 @@ class SingleVisTrainer(TrainerAbstractClass):
 
         # LoRA Injection: Only inject if mode is 'fine' and not already present
         if self.ttav_mode == "fine" and not hasattr(self, "lora_injected"):
-            from tool.visualize.visualize_model import inject_lora
+            from visualize_model import inject_lora
             # Adhering to your existing signature
             inject_lora(self.model, target_layer_names=["decoder"], rank=4)
             self.lora_injected = True
@@ -238,24 +238,14 @@ class SingleVisTrainer(TrainerAbstractClass):
         with open(save_file, 'w') as f:
             json.dump(evaluation, f)
 
-    # tool/visualize/strategy/trainer.py
-
     def update_weights(self):
         """
-        Step 4: 实现 CustomWeightedRandomSampler 的动态重分配算子 [cite: 33]
+        Dynamically reweight the edge sampler based on the current TTAV focus context.
+        Delegates to CustomWeightedRandomSampler.update_weights() which owns the logic.
         """
-        mode = ttav_context["focus_mode"]
-        indices = ttav_context["selected_indices"]
-        
-        # 基础权重为 1.0
-        weights = torch.ones(self.total_data_size)
-        
-        if mode == "balanced":
-            weights[indices] *= 2.0 # Balanced 模式采样概率提升至 200% [cite: 31]
-        elif mode == "fine":
-            weights[indices] *= 5.0 # Fine 模式采样概率提升至 500% [cite: 32]
-            
-        self.sampler.weights = weights
+        if not hasattr(self, 'sampler') or self.sampler is None:
+            return
+        self.sampler.update_weights(self.ttav_indices, self.ttav_mode)
 
     def update_ttav_context(self, indices, mode, mask):
         """
@@ -326,7 +316,21 @@ class HybridVisTrainer(SingleVisTrainer):
 class DVITrainer(SingleVisTrainer):
     def __init__(self, model, criterion, optimizer, lr_scheduler, edge_loader, DEVICE):
         super().__init__(model, criterion, optimizer, lr_scheduler, edge_loader, DEVICE)
-    
+
+    def train(self, PATIENT, MAX_EPOCH):
+        """DVI training loop with early stopping."""
+        patient = PATIENT
+        for epoch in range(MAX_EPOCH):
+            prev_loss = self.loss
+            self.train_step()
+            self.lr_scheduler.step()
+            if prev_loss - self.loss < 5e-3:
+                if patient == 0:
+                    break
+                patient -= 1
+            else:
+                patient = PATIENT
+
     def train_step(self):
         self.model = self.model.to(device=self.DEVICE)
         self.model.train()
@@ -338,14 +342,14 @@ class DVITrainer(SingleVisTrainer):
         t = tqdm(self.edge_loader, leave=True, total=len(self.edge_loader))
         
         for data in t:
-            edge_to, edge_from, a_to, a_from = data
+            # DVIDataHandler returns 6 elements: (edge_to, edge_from, a_to, a_from, idx_to, idx_from)
+            edge_to, edge_from, a_to, a_from, _idx_to, _idx_from = data
 
             edge_to = edge_to.to(device=self.DEVICE, dtype=torch.float32)
             edge_from = edge_from.to(device=self.DEVICE, dtype=torch.float32)
             a_to = a_to.to(device=self.DEVICE, dtype=torch.float32)
             a_from = a_from.to(device=self.DEVICE, dtype=torch.float32)
 
-            # outputs = self.model(edge_to, edge_from)
             umap_l, recon_l, temporal_l, loss = self.criterion(edge_to, edge_from, a_to, a_from, self.model)
             all_loss.append(loss.item())
             umap_losses.append(umap_l.item())
@@ -594,7 +598,6 @@ class TrustTrainer(SingleVisTrainer):
             json.dump(evaluation, f)
 
 
-            import torch
 
 class LocalRefineTrainer:
     def __init__(self, model, criterion, optimizer, device):

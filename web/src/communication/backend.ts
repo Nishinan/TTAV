@@ -151,17 +151,19 @@ export function getOriginalNeighbors(contentPath: string, epoch: number, options
 }
 
 export function getProjectionNeighbors(
-    contentPath: string, 
+    contentPath: string,
     vis_method: string,
-    vis_id: string, 
-    epoch: number, 
+    vis_id: string,
+    epoch: number,
+    refineFlag: boolean = false,
     options?: NetworkOptions
 ) {
     const data = {
         "content_path": contentPath,
-        "vis_method":vis_method,
+        "vis_method": vis_method,
         "vis_id": vis_id,
-        "epoch": epoch
+        "epoch": epoch,
+        "refine_flag": refineFlag
     };
     return basicPostWithJsonResponse('/getProjectionNeighbors', data, options);
 }

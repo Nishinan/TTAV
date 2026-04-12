@@ -313,4 +313,10 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+# Claude Code / AI tool files
 .claude/
+AGENTS.md
+CLAUDE.md
+CLAUDE_GUIDE.md
+*.md.bak
+project_readme.md

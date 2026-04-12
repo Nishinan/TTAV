@@ -11,7 +11,8 @@ class DynaVisRunner:
         self.vis_id = vis_id
         self.data_type = data_type
         self.task_type = task_type
-        self.vis_config = {}
+        # Use caller-supplied config, falling back to empty dict so defaults apply.
+        self.vis_config = vis_config or {}
 
         defaults = {
             "D": 512,
