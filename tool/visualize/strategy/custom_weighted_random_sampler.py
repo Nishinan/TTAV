@@ -32,3 +32,14 @@ class CustomWeightedRandomSampler:
         
         # Update the active weights used by the PyTorch sampler
         self.weights = new_weights
+
+    def __iter__(self):
+        """
+        实现迭代器，根据当前权重生成采样索引
+        """
+        # 使用 torch.multinomial 根据权重进行采样
+        # 返回的是一个包含采样索引的 Tensor，转为 yield 模式以符合 Sampler 规范
+        yield from torch.multinomial(self.weights, self.num_samples, self.replacement).tolist()
+        
+    def __len__(self):
+        return self.num_samples

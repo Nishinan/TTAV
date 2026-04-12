@@ -3,7 +3,7 @@ import torch
 import os
 from .scripts.hparams import HParams
 from .scripts.train_motion import main as train_motion_main
-import train_refined from .scripts.train_motion_main
+from .scripts.train_motion import train_refined 
 
 class DynaVisRunner:
     def __init__(self, content_path: str, vis_id: str, data_type: str, task_type: str, vis_config: Optional[Dict[str, Any]] = None):
@@ -84,6 +84,7 @@ class DynaVisRunner:
 
     # 在 DynaVisRunner 内部处理 refine 逻辑
     def refine_train(self, focus_mode="fine"):
+        
         # 根据交互模式决定微调轮次
         refine_epochs = 5 if focus_mode == "fine" else 2
         
@@ -94,9 +95,8 @@ class DynaVisRunner:
         # 关键设置：跳过 AE 预训练，只进行少量的联合优化
         self.hparams.epochs_ae = 0 
         self.hparams.epochs_joint = refine_epochs
-        
         # 执行训练
-        self.train_refined(self.hparams) 
+        train_refined(self.hparams) 
         
         # 恢复原始设置（防止影响下次 full train）
         self.hparams.epochs_ae = original_ae

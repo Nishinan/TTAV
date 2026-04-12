@@ -344,6 +344,7 @@ def main(h: HParams) -> None:
         out_root=h.ckpt_dir,
         batch_n=2048,
         epoch_ids=epoch_ids,
+        refine_flag=False,
     )
 
     # 7) 保存模型权重，供后续交互式 Refine (LoRA) 使用
@@ -420,6 +421,7 @@ def train_refined(h: HParams, ttav_mask=None) -> None:
         out_root=h.ckpt_dir, # 注意：如果你不想覆盖，可以指定一个新的 temp 目录
         batch_n=2048,
         epoch_ids=epoch_ids,
+        refine_flag=True,
     )
     
     print("[TTAV] Refined training complete.")

@@ -1,0 +1,58 @@
+{
+  // ===== 编辑器基础 =====
+  "editor.fontSize": 14,
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.wordWrap": "on",
+  "editor.minimap.enabled": false,
+
+  // 自动保存
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 1000,
+
+  // ===== 格式化 =====
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+
+  // ===== Python =====
+  "python.defaultInterpreterPath": "python",
+  "python.formatting.provider": "black",
+  "python.linting.enabled": true,
+  "python.linting.flake8Enabled": true,
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.typeCheckingMode": "basic",
+
+  // ===== C++ =====
+  "C_Cpp.default.cppStandard": "c++17",
+  "C_Cpp.default.intelliSenseMode": "gcc-x64",
+
+  // ===== 终端 =====
+  "terminal.integrated.fontSize": 14,
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+
+  // ===== Git =====
+  "git.enableSmartCommit": true,
+  "git.autofetch": true,
+
+  // ===== UI =====
+  "workbench.startupEditor": "none",
+  "workbench.editor.enablePreview": false,
+
+  // ===== 文件排除 =====
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.DS_Store": true
+  },
+
+  // ===== Claude Code 代理 =====
+  "claudeCode.environmentVariables": [
+    {
+      "name": "HTTP_PROXY",
+      "value": "http://127.0.0.1:7897"
+    },
+    {
+      "name": "HTTPS_PROXY",
+      "value": "http://127.0.0.1:7897"
+    }
+  ]
+}

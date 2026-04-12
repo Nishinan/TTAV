@@ -38,16 +38,17 @@ class VisModel(nn.Module):
 
 
     def forward(self, edge_to, edge_from):
-        outputs = dict()
+        # 1. 计算起点和终点的低维嵌入（投影） 
         embedding_to = self.encoder(edge_to)
         embedding_from = self.encoder(edge_from)
+        
+        # 2. 计算起点和终点的重构高维向量 
         recon_to = self.decoder(embedding_to)
         recon_from = self.decoder(embedding_from)
         
-        outputs["umap"] = (embedding_to, embedding_from)
-        outputs["recon"] = (recon_to, recon_from)
-
-        return outputs
+        # 3. 核心修改：返回 4 元组而非字典 
+        # 顺序必须是：(起点投影, 终点投影, 起点重构, 终点重构)
+        return embedding_to, embedding_from, recon_to, recon_from
 
 class SingleVisualizationModel(nn.Module):
     def __init__(self, input_dims, output_dims, units, hidden_layer=3, device='cpu'):

@@ -51,7 +51,7 @@ class Projector(ProjectorAbstractClass):
         self.vis_model = VisModel(self.config['vis_config']['encoder_dims'], self.config['vis_config']['decoder_dims']).to(self.device)
 
     def load(self, iteration):
-        file_path = os.path.join(self.content_path, 'visualize', self.vis_id, 'epochs', f'epoch_{iteration}', 'vis_model.pth')
+        file_path = os.path.join(self.content_path, 'visualize', f"{self.vis_method}_{self.vis_id}", 'epochs', f'epoch_{iteration}', 'vis_model.pth')
         save_model = torch.load(file_path, map_location="cpu")
         self.vis_model.load_state_dict(save_model["state_dict"])
         self.vis_model.to(self.device)
@@ -221,7 +221,7 @@ class DVIProjector(Projector):
         self.init_model()
 
     def load(self, iteration):
-        file_path = os.path.join(self.content_path, 'visualize', self.vis_id, 'epochs', f'epoch_{iteration}', 'vis_model.pth')
+        file_path = os.path.join(self.content_path, 'visualize', f"{self.vis_method}_{self.vis_id}", 'epochs', f'epoch_{iteration}', 'vis_model.pth')
         save_model = torch.load(file_path, map_location="cpu")
         self.vis_model.load_state_dict(save_model["state_dict"])
         self.vis_model.to(self.device)
@@ -234,7 +234,7 @@ class TimeVisProjector(Projector):
         self.init_model()
 
     def load(self, iteration):
-        file_path = os.path.join(self.content_path, 'visualize', self.vis_id, 'vis_model.pth')
+        file_path = os.path.join(self.content_path, 'visualize', f"{self.vis_method}_{self.vis_id}", 'vis_model.pth')
         save_model = torch.load(file_path, map_location="cpu")
         self.vis_model.load_state_dict(save_model["state_dict"])
         self.vis_model.to(self.device)
@@ -300,6 +300,7 @@ class DynaVisProjector(Projector):
         # 5. 设备同步与推理模式
         self.vis_model.to(self.device)
         self.vis_model.eval()
+        
 class UmapProjector():
     def __init__(self, config):
         """

@@ -203,7 +203,7 @@ type WithClear = {
 
 type GlobalStore = MutableGlobalStore & WithDefaultValueSetter & WithClear;
 
-const useGlobalStore = create<GlobalStore>()(subscribeWithSelector((set) => ({
+export const useGlobalStore = create<GlobalStore>()(subscribeWithSelector((set) => ({
     setValue: createDefaultValueSetter(set),
     ...createMutableTypes(configuredMutableGlobalStore, set),
     clear: () => {

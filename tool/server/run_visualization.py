@@ -58,6 +58,34 @@ def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vi
         # r = resolution_str.split(",")
         # config['vis_config']['resolution'] = [int(i) for i in r]
     
+    # 为不同方法补充缺失的默认超参数
+    vc = config['vis_config']
+    
+    # 通用默认值
+    if 'n_neighbors' not in vc:
+        vc['n_neighbors'] = 10
+    if 'max_epochs' not in vc:
+        vc['max_epochs'] = 10
+    if 'patient' not in vc:
+        vc['patient'] = 3
+    if 's_n_epochs' not in vc:
+        vc['s_n_epochs'] = 500
+    if 'b_n_epochs' not in vc:
+        vc['b_n_epochs'] = 0
+
+    # 特定方法的默认值
+    if vis_method == "TimeVis":
+        if 't_n_epochs' not in vc:
+            vc['t_n_epochs'] = 5 # TimeVis 特有的时间边训练轮次
+        if 'lambda' not in vc:
+            vc['lambda'] = 1.0   # TimeVis 的损失权重
+            
+    elif vis_method == "DVI":
+        if 'lambda1' not in vc:
+            vc['lambda1'] = 1.0
+        if 'lambda2' not in vc:
+            vc['lambda2'] = 1.0 # DVI 的时间连续性权重
+
     return config
 
 def init_visualize_component(config):
@@ -151,6 +179,6 @@ def visualize_run(content_path, vis_method, vis_id, data_type, task_type, vis_co
     os.makedirs(os.path.join(content_path, 'visualize', f"{vis_method}_{vis_id}"), exist_ok=True)
 
 
-    json.dump(config, open(os.path.join(content_path, 'visualize', vis_id, 'info.json'), 'w'), indent=2)
+    json.dump(config, open(os.path.join(content_path, 'visualize', f"{vis_method}_{vis_id}", 'info.json'), 'w'), indent=2)
     return visualizer, strategy 
         

@@ -5,7 +5,7 @@ import { FunctionPanel } from '../component/function-panel';
 import { TrainingEventPanel } from '../component/training-event-panel';
 import InfluenceAnalysisPanel from '../component/influence-panel';
 import { TokenPanel } from '../component/token-panel';
-import { useDefaultStore } from '../state/state.unified';
+import { useDefaultStore,useGlobalStore } from '../state/state.unified';
 import * as BackendAPI from '../communication/backend';
 
 import "../index.css";
@@ -93,6 +93,181 @@ const initStaticContext = async (contentPath: string, dataType: string) => {
         } 
     };
 };
+
+/**
+ * 投影质量评估函数
+ * 评估微调（Refine）后的投影在稳定性、保持率和有效性上的表现
+ */
+export const evaluateProjectionQuality = async (
+    epochNum: number,
+    selectedIndices: number[],
+    oldData: any, // 微调前的全量数据快照
+    newData: any  // 微调后的新数据
+) => {
+    console.log(`\n[Quality Evaluation] Starting evaluation for Epoch ${epochNum}...`);
+
+    const oldProj = oldData.projection;
+    const newProj = newData.projection;
+    
+    if (!oldProj || !newProj) return;
+
+    // --- 维度 1: 焦点位移 (Focus Displacement) ---
+    // 衡量选中的点是否发生了显著移动（体现微调效用）
+    let focusShift = 0;
+    selectedIndices.forEach(idx => {
+        const d = Math.sqrt(
+            Math.pow(newProj[idx][0] - oldProj[idx][0], 2) + 
+            Math.pow(newProj[idx][1] - oldProj[idx][1], 2)
+        );
+        focusShift += d;
+    });
+    const avgFocusShift = focusShift / (selectedIndices.length || 1);
+
+    // --- 维度 2: 全局稳定性 (Global Stability / Drift) ---
+    // 衡量非选中点（背景点）的平均位移（越小越稳）
+    let globalDrift = 0;
+    let nonFocusCount = 0;
+    const selectedSet = new Set(selectedIndices);
+
+    oldProj.forEach((pos: number[], i: number) => {
+        if (!selectedSet.has(i)) {
+            const d = Math.sqrt(
+                Math.pow(newProj[i][0] - pos[0], 2) + 
+                Math.pow(newProj[i][1] - pos[1], 2)
+            );
+            globalDrift += d;
+            nonFocusCount++;
+        }
+    });
+    const avgGlobalDrift = globalDrift / (nonFocusCount || 1);
+
+    // --- 维度 3: 局部保持率变化 (Neighbor Preservation Change) ---
+    // 比较微调前后低维邻居的一致性（仅示意，完整需对比高维邻居）
+    const oldLowNeighbors = oldData.projectionNeighbors || [];
+    const newLowNeighbors = newData.projectionNeighbors || [];
+    
+    let neighborConsistency = 0;
+    selectedIndices.forEach(idx => {
+        const oldSet = new Set(oldLowNeighbors[idx] || []);
+        const newSet = new Set(newLowNeighbors[idx] || []);
+        const intersection = [...oldSet].filter(x => newSet.has(x));
+        neighborConsistency += intersection.length / (oldSet.size || 1);
+    });
+    const avgNeighborConsistency = neighborConsistency / (selectedIndices.length || 1);
+
+    // --- 结果打印 ---
+    console.log("-----------------------------------------");
+    console.log(`> Focus Displacement (效用): ${avgFocusShift.toFixed(4)}`);
+    console.log(`> Global Drift (稳定性): ${avgGlobalDrift.toFixed(4)}`);
+    console.log(`> Neighbor Consistency (保持率): ${( avgNeighborConsistency* 100).toFixed(2)}%`);
+    console.log("-----------------------------------------");
+
+    return {
+        avgFocusShift,
+        avgGlobalDrift,
+        avgNeighborConsistency
+    };
+};
+
+
+/**
+ * 计算位移统计指标
+ * @param oldProj 原始投影坐标矩阵 [n, 2]
+ * @param newProj 微调后的投影坐标矩阵 [n, 2]
+ * @param selectedIndices 用户选中的点索引
+ */
+export const calculateDisplacementStats = (
+    oldProj: number[][],
+    newProj: number[][],
+    selectedIndices: number[]
+) => {
+    if (!oldProj || !newProj || oldProj.length !== newProj.length) {
+        console.error("Invalid projection data for displacement stats.");
+        return null;
+    }
+
+    let focusShiftTotal = 0;
+    let globalDriftTotal = 0;
+    const selectedSet = new Set(selectedIndices);
+    const numTotal = oldProj.length;
+    const numFocus = selectedIndices.length;
+    const numNonFocus = numTotal - numFocus;
+
+    // 遍历所有点计算欧式距离
+    for (let i = 0; i < numTotal; i++) {
+        const dx = newProj[i][0] - oldProj[i][0];
+        const dy = newProj[i][1] - oldProj[i][1];
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (selectedSet.has(i)) {
+            focusShiftTotal += distance;
+        } else {
+            globalDriftTotal += distance;
+        }
+    }
+
+    const avgFocusShift = numFocus > 0 ? focusShiftTotal / numFocus : 0;
+    const avgGlobalDrift = numNonFocus > 0 ? globalDriftTotal / numNonFocus : 0;
+
+    // 打印格式化的报告
+    console.log(`\n[Displacement Stats]`);
+    console.log(`- Avg Focus Shift (选中点): ${avgFocusShift.toFixed(5)}`);
+    console.log(`- Avg Global Drift (非选中点): ${avgGlobalDrift.toFixed(5)}`);
+    
+    // 计算信噪比：理想情况下 Focus Shift 应远大于 Global Drift
+    const snr = avgGlobalDrift > 0 ? avgFocusShift / avgGlobalDrift : Infinity;
+    console.log(`- Stability Ratio (效用/漂移比): ${snr.toFixed(2)}x`);
+
+    return {
+        avgFocusShift,
+        avgGlobalDrift,
+        stabilityRatio: snr
+    };
+};
+
+// 1. 在组件外部定义 refreshEpochData
+// 无需使用 Hook，直接引用 store 实例
+
+const refreshEpochData = async (
+    epochNum: number,
+    params: { contentPath: string; vis_method: string; visID: string; taskType: string },
+    updateGlobal: boolean = true
+) => {
+    const epochData = await loadSingleEpoch(
+        params.contentPath,
+        params.vis_method,
+        params.visID,
+        epochNum,
+        params.taskType
+    );
+
+    const curP = epochData.projection;
+    const minX = Math.min(...curP.map((p: any) => p[0])), maxX = Math.max(...curP.map((p: any) => p[0]));
+    const minY = Math.min(...curP.map((p: any) => p[1])), maxY = Math.max(...curP.map((p: any) => p[1]));
+
+    // 直接从 store 实例获取当前快照，无需 Hook
+    const state = useGlobalStore.getState(); 
+    const currentBounds = state.globalBounds;
+
+    const newBounds = {
+        minX: Math.min(currentBounds?.minX ?? Infinity, minX),
+        maxX: Math.max(currentBounds?.maxX ?? -Infinity, maxX),
+        minY: Math.min(currentBounds?.minY ?? Infinity, minY),
+        maxY: Math.max(currentBounds?.maxY ?? -Infinity, maxY),
+    };
+
+    if (updateGlobal) {
+        // 直接使用 getState 里的 setValue 触发更新
+        state.setValue('allEpochData', {
+            ...state.allEpochData,
+            [epochNum]: epochData
+        });
+        state.setValue('globalBounds', newBounds);
+    }
+
+    return epochData;
+};
+
 // MessageHandler component for handling extension communication and backend requests
 function MessageHandler() {
     // State from unified store
@@ -189,28 +364,11 @@ function MessageHandler() {
             const epochs = staticCtx.processInfo.available_epochs || [];
             setAvailableEpochs(epochs);
            
-            // 2. 准备状态容器
-            let allEpochDataTemp: Record<number, any> = {};
-            let gMinX = Infinity, gMaxX = -Infinity, gMinY = Infinity, gMaxY = -Infinity;
-
-            // 3. 循环加载 Epoch 数据 (可以指定范围或全量)
             for (const epochNum of epochs) {
-                const epochData = await loadSingleEpoch(contentPath, visualizationMethod, visualizationID, epochNum, taskType);
+                await refreshEpochData(epochNum, { contentPath, vis_method: visualizationMethod, visID:visualizationID, taskType },true);
                 
-                // 更新全局边界 (Bounds)
-                const curP = epochData.projection;
-                const minX = Math.min(...curP.map((p: any) => p[0])), maxX = Math.max(...curP.map((p: any) => p[0]));
-                const minY = Math.min(...curP.map((p: any) => p[1])), maxY = Math.max(...curP.map((p: any) => p[1]));
-                
-                gMinX = Math.min(gMinX, minX); gMaxX = Math.max(gMaxX, maxX);
-                gMinY = Math.min(gMinY, minY); gMaxY = Math.max(gMaxY, maxY);
-
-                allEpochDataTemp[epochNum] = epochData;
-                
-                // 更新进度条和 Store
+                // 更新进度条
                 setProgress(((epochs.indexOf(epochNum) + 1) / epochs.length) * 100);
-                setValue('allEpochData', { ...allEpochDataTemp });
-                setValue('globalBounds', { minX: gMinX, maxX: gMaxX, minY: gMinY, maxY: gMaxY });
             }
 
             // 4. 同步后端 Session
@@ -343,49 +501,39 @@ export function AppCombinedView() {
             message.warning("Please select points on the canvas first.");
             return;
         }
+        const hide = message.loading('Refining layout...', 0);
 
         try {
-            const hide = message.loading('Refining layout...', 0);
-            
+            const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
             // 1. 发起请求：后端执行 train_refined
             const response = await BackendAPI.updateFocusContext(contentPath, selectedIndices, focusMode);
-            hide();
+            
 
             if (response && response.status === "success") {
                 
-                // 2. 确定新的 visID：优先使用后端返回的，否则使用当前 Store 里的
-                const newVisID = response.new_vis_id || currentVisID;
-                // setValue('visID', newVisID);
-
                 console.log(`[TTAV] Refine success. Fetching new projection for epoch ${targetEpoch}...`);
 
-                // 3. 调用原子加载函数
-                // 此时所有参数类型（string, string, string, number, string）均已正确匹配
-                const epochData = await loadSingleEpoch(
+                // 不刷新当前目标 Epoch
+                const newEpochData=await refreshEpochData(targetEpoch, {
                     contentPath,
                     vis_method,
-                    newVisID, 
-                    targetEpoch,
-                    taskType 
-                );
-
-                // 4. 覆盖 allEpochData，触发原有的 Canvas 渲染逻辑
-                // 注意：prevAllData 依然需要从 react-hook-form 的 getValues 获取最新的内存状态
-                // const prevAllData = getValues('allEpochData') || {};
-                // setValue('allEpochData', {
-                //     ...prevAllData,
-                //     [targetEpoch]: epochData
-                // });
-                setValue('allEpochData', { ...epochData });
-
-                // 备份微调结果
-                setValue('refinedProjection', response.projection);
-
-                message.success('Projection refined and reloaded!');
-            }
+                    visID: currentVisID,
+                    //visID: response.new_vis_id || currentVisID, // 使用后端返回的新 ID（如有）
+                    taskType
+                },false);
+                // 3. 执行投影质量评估
+                await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
+                // 执行位移统计
+                await calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices);
+                message.success(`Epoch ${targetEpoch} refined! Plot updated!`);
+                console.log(`Epoch ${targetEpoch} refined! Plot updated!`);
+                }
         } catch (error) {
             console.error("Update failed:", error);
             message.error('Failed to update projection.');
+        }
+        finally {
+            hide(); // 2. 无论 try 还是 catch，强制销毁弹窗
         }
     };
     // 1. 监听全局选点，确保 selectedIndices 响应

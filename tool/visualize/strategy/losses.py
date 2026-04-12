@@ -103,12 +103,13 @@ class SmoothnessLoss(nn.Module):
 
 
 class SingleVisLoss(nn.Module):
-    def __init__(self, umap_loss, recon_loss, lambd):
+    def __init__(self, umap_loss, recon_loss, lambd, negative_sample_rate):
         super(SingleVisLoss, self).__init__()
         self.umap_loss = umap_loss
         self.recon_loss = recon_loss
         self.lambd = lambd
-
+        self.negative_sample_rate = negative_sample_rate
+    
     def forward(self, edge_to, edge_from, a_to, a_from, outputs, weights=None):
         """
         Step 5: Apply sample-wise weights to both UMAP and Reconstruction losses.

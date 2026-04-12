@@ -93,8 +93,8 @@ def update_focus_context():
     req = request.get_json()
 
     # Check if a session is active and matches the current data path
-    if active_session["strategy"] is None or active_session["content_path"] != content_path:
-        print("No active session, strategy: ",active_session["strategy"],", path: ",active_session["content_path"], content_path)
+    if active_session["strategy"] is None: # or active_session["content_path"] != content_path:
+        print("No active session, strategy: ",active_session["strategy"],", path: ",active_session["content_path"],"content path: ", content_path)
         return jsonify({"status": "error", "message": "No active session"}), 400
     
 
@@ -106,7 +106,7 @@ def update_focus_context():
         selected_indices = req.get("selected_indices", [])
         focus_mode = req.get("focus_mode", "balanced")
         
-        print(f"Starting refinement: mode={focus_mode}, selected_points={len(selected_indices)}")
+        print(f"Starting refinement: mode={focus_mode}, selected_points={selected_indices}")
 
         mask = strategy.get_focus_mask(selected_indices)
         # 3. 将参数注入到 Trainer 状态中
@@ -117,13 +117,19 @@ def update_focus_context():
         refine_epochs = 5 if focus_mode == "fine" else 2
         vis_method = active_session["vis_method"]
         if vis_method == "DynaVis":
+
             strategy.refine_train(focus_mode=focus_mode)
+
         else:
             # step 3: generate visualization results
             if vis_method == "DVI" or vis_method == "TimeVis":
                 # now we assume that all the metries are already saved to train visualization model
                 print("Start training visualization model...")
-                strategy.train_vis_model()
+                strategy.refine(
+                    focus_index = selected_indices[0], 
+                    neighbor_indices = [], # 传空，让后端去读取保存的邻居
+                    epochs_to_update = 10
+                )
                 print("Train visualization model finished.")
                 
         # generate visualization results
@@ -258,7 +264,7 @@ def update_projection():
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
 
-    projection = load_projection(content_path, vis_method, vis_id, epoch)
+    projection = load_projection(content_path, vis_method, vis_id, epoch, True)
 
     result = jsonify({
         'projection': projection,
@@ -515,7 +521,7 @@ def get_projection_neighbors():
     vis_method = req['vis_method']
     
     try:
-        neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch)
+        neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch,False)
         result = jsonify({
             'neighbors': neighbors,
         })

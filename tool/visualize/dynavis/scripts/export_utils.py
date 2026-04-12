@@ -73,6 +73,7 @@ def export_2d_per_epoch(
     out_root: str,
     batch_n: int = 2048,
     epoch_ids: np.ndarray | None = None,
+    refine_flag: bool =True,
 ):
     """
     Export 2D projection per epoch to:
@@ -81,6 +82,8 @@ def export_2d_per_epoch(
     f.eval()
     X, t = apply_normalization_with_stats(X_raw, t_raw, stats)
     T, N, D = X.shape
+    if(refine_flag):
+        out_root=out_root+"_refined"
     epochs_dir = os.path.join(out_root, "epochs")
     os.makedirs(epochs_dir, exist_ok=True)
 

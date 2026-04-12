@@ -137,7 +137,6 @@ class SingleVisTrainer(TrainerAbstractClass):
                 focus_mask = self.ttav_mask[idx_to] | self.ttav_mask[idx_from]
                 batch_weights[focus_mask] *= alpha
 
-            # 2. 前向传播与加权 Loss
             outputs = self.model(edge_to, edge_from)
             
             # 传入 weights 引导梯度向焦点区域倾斜
@@ -593,3 +592,37 @@ class TrustTrainer(SingleVisTrainer):
         evaluation[operation][iteration] = round(t, 3)
         with open(save_file, 'w') as f:
             json.dump(evaluation, f)
+
+
+            import torch
+
+class LocalRefineTrainer:
+    def __init__(self, model, criterion, optimizer, device):
+        self.model = model
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.device = device
+
+    def train_step(self, focus_features, focus_indices):
+        """
+        focus_features: [Batch_Size, Time_Steps, Feature_Dim] 
+        这里 Batch_Size = 1 (焦点) + 10 (近邻)
+        """
+        self.model.train()
+        # 跨 Epoch 展开：将 [B, T, D] 转为 [B*T, D] 模拟跨 epoch 训练
+        B, T, D = focus_features.shape
+        flat_features = focus_features.view(-1, D).to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        # 前向传播
+        embedding, reconstruction = self.model(flat_features)
+        
+        # 这里的 criterion 应该只计算 UmapLoss 和 ReconstructionLoss
+        # 因为点数极少，梯度计算非常快
+        loss = self.criterion(flat_features, embedding, reconstruction)
+        
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()

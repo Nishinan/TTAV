@@ -50,8 +50,21 @@ def get_coloring_list(class_num):
     return color_255.tolist()
 
 # Func: load projection of certain epoch
-def load_projection(content_path, vis_method, vis_id, epoch):
-    projection_path = os.path.join(content_path, "visualize", f"{vis_method}_{vis_id}", "epochs", f"epoch_{epoch}", "projection.npy")
+def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
+    """
+    加载指定 epoch 的投影坐标
+    :param refine_flag: 如果为 True，则从带有 _refined 后缀的临时文件夹读取
+    """
+    folder_name = f"{vis_method}_{vis_id}_refined" if refine_flag else f"{vis_method}_{vis_id}"
+    
+    projection_path = os.path.join(
+        content_path, 
+        "visualize", 
+        folder_name, 
+        "epochs", 
+        f"epoch_{epoch}", 
+        "projection.npy"
+    )
     projection = np.load(projection_path)
     projection_list = projection.tolist()
 
@@ -273,8 +286,8 @@ def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
     
     return neighbors
 
-def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10):
-    projection_list = load_projection(content_path, vis_method,  vis_id, epoch)
+def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10,refine_flag=False):
+    projection_list = load_projection(content_path, vis_method,  vis_id, epoch, refine_flag)
     projection = np.array(projection_list)
     num_samples = len(projection)
     
@@ -399,7 +412,7 @@ def generate_dimension_array(dimension):
 
 def calculate_visualize_metrics(content_path, vis_method, vis_id, epoch):
     high_dimensional_neighbors = calculate_high_dimensional_neighbors(content_path, epoch)
-    projection_neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch)
+    projection_neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch,False)
 
     # Neighbor trustworthiness and continuity
     K = min(len(high_dimensional_neighbors[0]), len(projection_neighbors[0]))
@@ -594,3 +607,57 @@ def compute_training_events(content_path, epoch, event_types):
     detector = TrainingEventDetector(content_path, epoch, data_provider)
     events = detector.detect_events(event_types)
     return events
+
+
+# tool/server/server_utils.py
+
+def calculate_neighbor_preservation(high_neighbors, low_neighbors):
+    """
+    计算高维和低维邻居的交集比例 (Neighbor Preservation Rate)
+    high_neighbors: List[List[int]] 高维空间的邻居索引
+    low_neighbors: List[List[int]] 低维空间的邻居索引
+    """
+    num_samples = len(high_neighbors)
+    if num_samples == 0:
+        return 0.0
+    
+    k = len(high_neighbors[0])
+    total_overlap = 0
+    for i in range(num_samples):
+        h_set = set(high_neighbors[i])
+        l_set = set(low_neighbors[i])
+        total_overlap += len(h_set.intersection(l_set))
+    
+    return total_overlap / (num_samples * k)
+
+def calculate_trustworthiness(X_high, X_low, k=10):
+    """
+    计算 Trustworthiness (信任度)
+    衡量低维空间中出现的邻居在多大程度上也是高维空间中的邻居
+    """
+    from sklearn.neighbors import NearestNeighbors
+    n = X_high.shape[0]
+    
+    # 获取高维和低维的近邻
+    nbrs_high = NearestNeighbors(n_neighbors=n, algorithm='auto').fit(X_high)
+    high_dist, high_indices = nbrs_high.kneighbors(X_high)
+    
+    # 计算高维距离的排名 (Rank)
+    high_ranks = np.zeros((n, n), dtype=int)
+    for i in range(n):
+        high_ranks[i, high_indices[i]] = np.arange(n)
+        
+    nbrs_low = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(X_low)
+    low_dist, low_indices = nbrs_low.kneighbors(X_low)
+    
+    sum_val = 0
+    for i in range(n):
+        # 找到在低维是邻居但在高维不是邻居的点 (U_i)
+        for j in range(1, k + 1):
+            idx_j = low_indices[i, j]
+            rank_high = high_ranks[i, idx_j]
+            if rank_high > k:
+                sum_val += (rank_high - k)
+                
+    t = 1 - (2 / (n * k * (2 * n - 3 * k - 1))) * sum_val
+    return t
