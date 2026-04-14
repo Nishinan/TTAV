@@ -77,6 +77,9 @@ def sync_session():
         
 import threading
 
+# Global lock: only one refine() may run at a time (strategy objects are not thread-safe).
+_refine_lock = threading.Lock()
+
 @app.route('/updateFocusContext', methods=['POST'])
 @cross_origin()
 def update_focus_context():
@@ -87,12 +90,17 @@ def update_focus_context():
     content_path = req.get("content_path")
     selected_indices = req.get("selected_indices", [])
     focus_mode = req.get("focus_mode", "balanced")
+    current_epoch = req.get("current_epoch", None)  # epoch currently viewed by user
 
     # Check if a session is active
     if active_session["strategy"] is None:
         print("No active session, strategy:", active_session["strategy"],
               ", path:", active_session["content_path"], "content path:", content_path)
         return jsonify({"status": "error", "message": "No active session"}), 400
+
+    # Reject concurrent refine requests immediately rather than queueing them.
+    if not _refine_lock.acquire(blocking=False):
+        return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
 
     strategy = active_session["strategy"]
     visualizer = active_session["visualizer"]
@@ -106,21 +114,28 @@ def update_focus_context():
         vis_method = active_session["vis_method"]
         if vis_method == "DynaVis":
             strategy.refine_train(focus_mode=focus_mode)
-            # DynaVis writes its own output; regenerate projections via visualizer.
             print("Start generating DynaVis visualization results...")
             visualizer.visualize_all_epochs()
             print("DynaVis visualization results generated.")
         elif vis_method in ("DVI", "TimeVis"):
-            # refine() saves refined projections to visualize/{vis_method}_{vis_id}_refined/.
-            # Do NOT call visualize_all_epochs() here — it would overwrite the standard
-            # (non-refined) directory with old-model results and not touch the _refined dir.
             print("Start refining visualization model...")
             strategy.refine(
                 focus_indices=selected_indices,
-                neighbor_indices=[],  # empty: let refine() look up saved neighbors
+                neighbor_indices=[],
+                current_epoch=current_epoch,
                 epochs_to_update=10
             )
+            # Incrementally update kNN for only the patched points (~20 pts, ~15ms).
+            # This avoids a full 30k-point recompute while keeping the neighbor list fresh.
+            if current_epoch is not None:
+                vis_id = active_session["vis_id"]
+                patched = getattr(strategy, '_last_refine_indices', selected_indices)
+                update_projection_neighbors_incremental(
+                    content_path, vis_method, vis_id, current_epoch, patched
+                )
             print("Refinement finished. Refined projections saved to _refined directory.")
+            # Patch remaining epochs in the background so switching epochs also shows refined results.
+            strategy.patch_other_epochs(skip_epoch=current_epoch)
         else:
             visualizer.visualize_all_epochs()
 
@@ -130,6 +145,9 @@ def update_focus_context():
         import traceback
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
+    finally:
+        _refine_lock.release()
     
     
 
@@ -244,8 +262,11 @@ def update_projection():
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
+    # refine_flag is optional; when True load from the _refined directory
+    refine_flag = bool(req.get('refine_flag', False))
+    print(f"[updateProjection] content_path={content_path!r} vis_method={vis_method!r} vis_id={vis_id!r} epoch={epoch} refine_flag={refine_flag}")
 
-    projection = load_projection(content_path, vis_method, vis_id, epoch, True)
+    projection = load_projection(content_path, vis_method, vis_id, epoch, refine_flag)
 
     result = jsonify({
         'projection': projection,
@@ -504,9 +525,10 @@ def get_projection_neighbors():
     refine_flag = bool(req.get('refine_flag', False))
 
     try:
-        neighbors = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, refine_flag)
+        neighbors, index_list = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, refine_flag=refine_flag)
         result = jsonify({
             'neighbors': neighbors,
+            'index_list': index_list,
         })
         return make_response(result, 200)
     except Exception as e:
@@ -600,7 +622,8 @@ if __name__ == "__main__":
         port = port + 1
 
     if not is_dev_mode:
-        app.run(host=host, port=port, threaded=True)
+        # use_reloader=True: werkzeug auto-restarts on any .py file change (no extra deps)
+        app.run(host=host, port=port, threaded=True, use_reloader=True)
     else:
         from livereload import Server
         from flask_debugtoolbar import DebugToolbarExtension

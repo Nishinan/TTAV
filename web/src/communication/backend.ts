@@ -53,17 +53,21 @@ async function basicPostWithJsonResponse(path: string, data: any, options?: Netw
  * Notify backend of current focus indices and chosen precision mode
  */
 export function updateFocusContext(
-    contentPath: string, 
-    selectedIndices: number[], 
-    focusMode: string, 
+    contentPath: string,
+    selectedIndices: number[],
+    focusMode: string,
+    currentEpoch?: number,
     options?: NetworkOptions
 ) {
-    const data = {
+    const data: Record<string, any> = {
         "content_path": contentPath,
         "selected_indices": selectedIndices,
-        "focus_mode": focusMode
+        "focus_mode": focusMode,
     };
-    return basicPostWithJsonResponse('/updateFocusContext', data, options); //
+    if (currentEpoch !== undefined) {
+        data["current_epoch"] = currentEpoch;
+    }
+    return basicPostWithJsonResponse('/updateFocusContext', data, options);
 }
 
 export async function syncSession(config: any): Promise<any> {
@@ -98,18 +102,19 @@ export function fetchTrainingProcessInfo(contentPath: string, options?: NetworkO
 }
 
 export async function fetchEpochProjection(
-    contentPath: string, 
+    contentPath: string,
     vis_method: string,
-    visID: string, 
-    epoch: number, 
-    
+    visID: string,
+    epoch: number,
+    refineFlag: boolean = false,
     options?: NetworkOptions
 ) {
     const data = {
         "content_path": contentPath,
-        "vis_method":vis_method,
+        "vis_method": vis_method,
         "vis_id": visID,
-        "epoch": `${epoch}`
+        "epoch": `${epoch}`,
+        "refine_flag": refineFlag,
     };
     return basicPostWithJsonResponse('/updateProjection', data, options);
 }

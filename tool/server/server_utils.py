@@ -53,18 +53,28 @@ def get_coloring_list(class_num):
 def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
     """
     加载指定 epoch 的投影坐标
-    :param refine_flag: 如果为 True，则从带有 _refined 后缀的临时文件夹读取
+    :param refine_flag: 如果为 True，优先从带有 _refined 后缀的文件夹读取；
+                        若 _refined 文件不存在则回退到原始路径（graceful fallback）
     """
-    folder_name = f"{vis_method}_{vis_id}_refined" if refine_flag else f"{vis_method}_{vis_id}"
-    
-    projection_path = os.path.join(
-        content_path, 
-        "visualize", 
-        folder_name, 
-        "epochs", 
-        f"epoch_{epoch}", 
-        "projection.npy"
-    )
+    def _proj_path(folder):
+        return os.path.join(content_path, "visualize", folder,
+                            "epochs", f"epoch_{epoch}", "projection.npy")
+
+    if refine_flag:
+        refined_path = _proj_path(f"{vis_method}_{vis_id}_refined")
+        if os.path.exists(refined_path):
+            projection_path = refined_path
+        else:
+            # _refined not ready yet — fall back to the original projection silently
+            projection_path = _proj_path(f"{vis_method}_{vis_id}")
+    else:
+        projection_path = _proj_path(f"{vis_method}_{vis_id}")
+
+    if not os.path.exists(projection_path):
+        raise FileNotFoundError(
+            f"Projection not found: {projection_path}\n"
+            f"  vis_method={vis_method!r}, vis_id={vis_id!r}, epoch={epoch}, refine_flag={refine_flag}"
+        )
     projection = np.load(projection_path)
     projection_list = projection.tolist()
 
@@ -271,36 +281,133 @@ def load_one_text(content_path, index):
         return ""
 
 def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
-    featrue_list = load_single_attribute(content_path, epoch, 'representation')
+    # Cache to disk: high-D neighbors never change after training completes.
+    cache_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}',
+                              f'hd_neighbors_{max_neighbors}.json')
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r') as f:
+            return json.load(f)
 
+    featrue_list = load_single_attribute(content_path, epoch, 'representation')
     features = np.array(featrue_list)
     num_samples = len(features)
     nbrs = NearestNeighbors(n_neighbors=max_neighbors + 1, algorithm='auto').fit(features)
     distances, indices = nbrs.kneighbors(features)
-    
+
     neighbors = [[] for _ in range(num_samples)]
     for i in range(num_samples):
         for j in range(1, max_neighbors + 1):
-            neighbor_idx = indices[i][j]
-            neighbors[i].append(int(neighbor_idx))
-    
+            neighbors[i].append(int(indices[i][j]))
+
+    with open(cache_path, 'w') as f:
+        json.dump(neighbors, f)
     return neighbors
 
-def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10,refine_flag=False):
-    projection_list = load_projection(content_path, vis_method,  vis_id, epoch, refine_flag)
-    projection = np.array(projection_list)
-    num_samples = len(projection)
-    
-    nbrs = NearestNeighbors(n_neighbors=max_neighbors + 1, algorithm='auto').fit(projection)
-    distances, indices = nbrs.kneighbors(projection)
-    
-    neighbors = [[] for _ in range(num_samples)]
-    for i in range(num_samples):
-        for j in range(1, max_neighbors + 1):
-            neighbor_idx = indices[i][j]
-            neighbors[i].append(int(neighbor_idx))
-    
-    return neighbors
+def _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, refine_flag):
+    suffix = "_refined" if refine_flag else ""
+    folder = os.path.join(content_path, "visualize", f"{vis_method}_{vis_id}{suffix}",
+                          "epochs", f"epoch_{epoch}")
+    return os.path.join(folder, f"proj_neighbors_{max_neighbors}.json")
+
+def invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, epoch, max_neighbors=10):
+    """Delete disk cache + in-memory faiss index for a specific epoch (call after refine)."""
+    cache_path = _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, True)
+    if os.path.exists(cache_path):
+        os.remove(cache_path)
+    key = (content_path, vis_method, vis_id, epoch, True)
+    _faiss_index_cache.pop(key, None)
+
+def update_projection_neighbors_incremental(
+    content_path, vis_method, vis_id, epoch, patched_indices, max_neighbors=10
+):
+    """
+    After refine, update kNN only for `patched_indices` (~20 points) using faiss.
+    This avoids a full O(N log N) recompute — only O(M log N) queries are issued.
+
+    Returns the updated neighbors list and writes it to the disk cache.
+    """
+    import faiss as _faiss
+
+    index_dict = load_or_create_index(content_path)
+    index_list = index_dict['train'] + index_dict['test']
+
+    # Load the updated refined projection
+    projection_list = load_projection(content_path, vis_method, vis_id, epoch, refine_flag=True)
+    proj = np.array(projection_list, dtype='float32')
+
+    # Rebuild the faiss index with the new coordinates (build is ~6ms for 30k pts)
+    index = _faiss.IndexFlatL2(proj.shape[1])
+    index.add(proj)
+    _faiss_index_cache[(content_path, vis_method, vis_id, epoch, True)] = (index, proj)
+
+    # Load the existing full neighbor list from the *baseline* cache (non-refined),
+    # then patch only the rows that changed.
+    base_cache = _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, False)
+    if os.path.exists(base_cache):
+        with open(base_cache, 'r') as f:
+            neighbors = json.load(f)
+    else:
+        # Baseline cache not ready — fall back to full search (one-time cost)
+        _, all_indices = index.search(proj, max_neighbors + 1)
+        neighbors = [[int(all_indices[i][j]) for j in range(1, max_neighbors + 1)]
+                     for i in range(len(proj))]
+
+    # Patch only patched_indices rows with fresh faiss queries (~8ms for 20 pts)
+    query = proj[patched_indices]
+    _, nn = index.search(query, max_neighbors + 1)
+    for local_i, global_i in enumerate(patched_indices):
+        neighbors[global_i] = [int(nn[local_i][j]) for j in range(1, max_neighbors + 1)
+                                if int(nn[local_i][j]) != global_i][:max_neighbors]
+
+    # Write the patched list to the refined disk cache
+    cache_path = _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, True)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, 'w') as f:
+        json.dump(neighbors, f)
+
+    return neighbors, index_list
+
+# In-process faiss index cache: key → (faiss_index, projection_array)
+# Avoids rebuilding the index on every /getProjectionNeighbors call.
+_faiss_index_cache: dict = {}
+
+def _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag):
+    """Return (faiss_index, projection_np) — build and cache on first call."""
+    import faiss
+    key = (content_path, vis_method, vis_id, epoch, refine_flag)
+    if key in _faiss_index_cache:
+        return _faiss_index_cache[key]
+
+    projection_list = load_projection(content_path, vis_method, vis_id, epoch, refine_flag)
+    proj = np.array(projection_list, dtype='float32')
+
+    index = faiss.IndexFlatL2(proj.shape[1])
+    index.add(proj)
+    _faiss_index_cache[key] = (index, proj)
+    return index, proj
+
+def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10, refine_flag=False):
+    index_dict = load_or_create_index(content_path)
+    index_list = index_dict['train'] + index_dict['test']
+
+    # --- disk cache (survives process restarts) ---
+    cache_path = _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, refine_flag)
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r') as f:
+            return json.load(f), index_list
+
+    # --- build via faiss (fast, result cached in memory too) ---
+    faiss_index, proj = _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag)
+    _, indices = faiss_index.search(proj, max_neighbors + 1)  # +1 to skip self
+
+    neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)]
+                 for i in range(len(proj))]
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, 'w') as f:
+        json.dump(neighbors, f)
+
+    return neighbors, index_list
 
 
 # Func: Load a single attribute from a file based on the configuration and epoch

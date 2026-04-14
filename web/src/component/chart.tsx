@@ -16,9 +16,10 @@ export const ChartComponent = memo(() => {
     const atlasRef = useRef<HTMLDivElement | null>(null);
     const [dimensions, setDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
-    const { epoch, allEpochData, globalBounds } = useDefaultStore(["epoch", "allEpochData","globalBounds"]);
+    const { epoch, allEpochData, globalBounds } = useDefaultStore(["epoch", "allEpochData", "globalBounds"]);
     const { inherentLabelData, colorDict, labelDict, textData } = useDefaultStore(["inherentLabelData", "colorDict", "labelDict", "textData"]);
     const { shownData, index, isFocusMode, focusIndices } = useDefaultStore(["shownData", "index", "isFocusMode", "focusIndices"]);
+    const { highlightData } = useDefaultStore(["highlightData"]);
 
     const { setHoveredIndex } = useDefaultStore(["setHoveredIndex"]);
     const { mode } = useDefaultStore(["mode"]);
@@ -123,6 +124,39 @@ export const ChartComponent = memo(() => {
         return current;
     }, [epochData, focusIndices, index, isFocusMode, shownData]);
 
+    // Build a set of highlighted point indices based on highlightData toggles.
+    // prediction_error: prediction !== ground-truth label
+    // prediction_flip:  prediction changed vs. the previous epoch
+    const highlightedSet = useMemo<Set<number>>(() => {
+        const s = new Set<number>();
+        if (!epochData || highlightData.length === 0) return s;
+
+        const prediction = epochData.prediction;
+        if (!prediction) return s;
+
+        if (highlightData.includes('prediction_error')) {
+            prediction.forEach((pred, idx) => {
+                if (pred !== inherentLabelData[idx]) s.add(idx);
+            });
+        }
+
+        if (highlightData.includes('prediction_flip')) {
+            const epochIndex = allEpochData ? Object.keys(allEpochData).map(Number).sort((a, b) => a - b) : [];
+            const epochPos = epochIndex.indexOf(epoch);
+            if (epochPos > 0) {
+                const prevEpoch = epochIndex[epochPos - 1];
+                const prevPrediction = allEpochData[prevEpoch]?.prediction;
+                if (prevPrediction) {
+                    prediction.forEach((pred, idx) => {
+                        if (pred !== prevPrediction[idx]) s.add(idx);
+                    });
+                }
+            }
+        }
+
+        return s;
+    }, [epochData, highlightData, inherentLabelData, allEpochData, epoch]);
+
     // convert data for embedding view
     const prepared = useMemo<PreparedEmbedding | null>(() => {
         if (!epochData || filteredIndices.length === 0) {
@@ -135,6 +169,15 @@ export const ChartComponent = memo(() => {
         const categoryColorList: string[] = [];
         const labelToCategoryIndex = new Map<number, number>();
 
+        // Reserve a fixed slot for the highlight colour (bright red) at index 0
+        // so highlighted points always render red regardless of their class.
+        const HIGHLIGHT_COLOR = '#ff2222';
+        const HIGHLIGHT_CATEGORY_IDX = 0;
+        const hasHighlights = highlightedSet.size > 0;
+        if (hasHighlights) {
+            categoryColorList.push(HIGHLIGHT_COLOR); // slot 0
+        }
+
         let dataPoints : DataPoint[] = []
 
         filteredIndices.forEach((originalIndex, position) => {
@@ -142,24 +185,31 @@ export const ChartComponent = memo(() => {
             x[position] = px;
             y[position] = py;
 
-            const label = inherentLabelData[originalIndex] ?? 0;
-            const colorTuple = colorDict.get(label);
-            let categoryIndex = labelToCategoryIndex.get(label);
-            if (categoryIndex === undefined) {
-                categoryIndex = categoryColorList.length;
-                labelToCategoryIndex.set(label, categoryIndex);
-                const colorString = transferArray2Color(colorTuple, 1);
-                categoryColorList.push(colorString);
+            // Highlighted points always use slot 0 (red); normal points use their label colour.
+            if (hasHighlights && highlightedSet.has(originalIndex)) {
+                category[position] = HIGHLIGHT_CATEGORY_IDX;
+            } else {
+                const label = inherentLabelData[originalIndex] ?? 0;
+                const colorTuple = colorDict.get(label);
+                // Offset by 1 when highlights are active to leave slot 0 for red
+                let categoryIndex = labelToCategoryIndex.get(label);
+                if (categoryIndex === undefined) {
+                    categoryIndex = categoryColorList.length; // next available slot
+                    labelToCategoryIndex.set(label, categoryIndex);
+                    const colorString = transferArray2Color(colorTuple, 1);
+                    categoryColorList.push(colorString);
+                }
+                category[position] = categoryIndex;
             }
-            category[position] = categoryIndex;
 
+            const label = inherentLabelData[originalIndex] ?? 0;
             dataPoints.push({
                 x: px,
                 y: py,
                 category: label,
                 text: `Index: ${originalIndex}\nLabel: ${label}`,
                 identifier: originalIndex,
-                fields: {} // add more fields if needed
+                fields: {}
             })
         });
 
@@ -174,7 +224,7 @@ export const ChartComponent = memo(() => {
             dataPoints,
             categoryColors: categoryColorList.length > 0 ? categoryColorList : null,
         };
-    }, [colorDict, epochData, filteredIndices, inherentLabelData]);
+    }, [colorDict, epochData, filteredIndices, inherentLabelData, highlightedSet]);
 
     const posMap = useMemo(() => {
         const m = new Map<number, number>();

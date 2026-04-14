@@ -3,9 +3,9 @@ import { Tag, Form, Button, Collapse, Select, message } from 'antd';
 import { useEffect, useState } from 'react';
 import { FunctionalBlock } from './custom/basic-components';
 import { useDefaultStore } from '../state/state.unified';
-import { notifyFocusModeSwitch, notifyTracingInfluence } from '../communication/extension';
+import { notifyFocusModeSwitch } from '../communication/extension';
 import { TrainingEvent, InconsistentMovementEvent, PredictionFlipEvent, ConfidenceChangeEvent, SignificantMovementEvent } from './types';
-import { calculateTrainingEvents } from '../communication/backend';
+import { calculateTrainingEvents, getInfluenceSamples } from '../communication/backend';
 
 
 const { Panel } = Collapse;
@@ -344,7 +344,8 @@ export function TrainingEventPanel() {
   const [isFocusMode, setIsFocusMode] = useState(false);
   const [groupedEvents, setGroupedEvents] = useState<Record<string, TrainingEvent[]>>({});
 
-  const { contentPath, epoch, trainingEvents, setTrainingEvents } = useDefaultStore(["contentPath", "epoch", "trainingEvents", "setTrainingEvents"]);
+  const { contentPath, epoch, trainingEvents, setTrainingEvents, setTrainingEvent, setInfluenceSamples } =
+    useDefaultStore(["contentPath", "epoch", "trainingEvents", "setTrainingEvents", "setTrainingEvent", "setInfluenceSamples"]);
 
   const handleFormSubmit = async () => {
     if (tempSelectedTypes.length === 0) {
@@ -400,11 +401,40 @@ export function TrainingEventPanel() {
 
   useEffect(() => {
     setSelectedTrainingEvents([]);
+    // Auto-recompute when epoch changes, but only if the user had already selected an event type
+    if (selectedTypes.length === 0 || !contentPath) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await calculateTrainingEvents(contentPath, epoch, selectedTypes);
+        if (cancelled) return;
+        const events = Array.isArray(resp?.training_events) ? resp.training_events : [];
+        setTrainingEvents(events as TrainingEvent[]);
+      } catch {
+        // silently ignore auto-recompute errors; user can hit Compute manually
+      }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epoch]);
 
-  const handleTracingClick = (event: React.MouseEvent, item: TrainingEvent) => {
-    event.stopPropagation(); 
-    notifyTracingInfluence(item, epoch);
+  const handleTracingClick = async (event: React.MouseEvent, item: TrainingEvent) => {
+    event.stopPropagation();
+    // Set the active event in the store so InfluenceAnalysisPanel can display it
+    setTrainingEvent(item);
+    setInfluenceSamples([]);
+
+    const hide = message.loading('Computing influence samples...', 0);
+    try {
+      const resp = await getInfluenceSamples(contentPath, epoch, item);
+      const samples = Array.isArray(resp?.influence_samples) ? resp.influence_samples : [];
+      setInfluenceSamples(samples);
+      message.success(`Found ${samples.length} influential sample(s)`);
+    } catch (e) {
+      message.error('Failed to compute influence samples');
+    } finally {
+      hide();
+    }
   };
 
   const handleItemClick = (item: TrainingEvent) => {

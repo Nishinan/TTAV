@@ -308,11 +308,16 @@ export async function loadVisualization(forceReconfig: boolean = false, visualiz
 		return false;
 	}
 
+	const visConfig = getVisConfig(config.visualizationMethod);
 	const msgToPlotView = {
 		command: 'loadVisualization',
 		data: {
-			config: config,
-			visualizationID: visualizationID
+			contentPath: config.contentPath,
+			visualizationMethod: config.visualizationMethod,
+			visualizationID: visualizationID,
+			dataType: config.dataType,
+			taskType: config.taskType,
+			visConfig: visConfig,
 		}
 	};
 

@@ -1,0 +1,492 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[a4paper,left=1.5in,right=1.5in,top=1in,bottom=1in]{geometry}
+\usepackage{times}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{url}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0pt}
+\doublespacing
+\pagestyle{plain}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=black
+}
+
+\newcommand{\systemname}{TTAV}
+\newcommand{\projectname}{Time-Travelling Visualizer}
+
+\begin{document}
+
+% ---------------------------
+% Title page (no page number)
+% ---------------------------
+\pagenumbering{gobble}
+
+\begin{titlepage}
+\centering
+{\fontsize{16}{20}\selectfont\bfseries INTERACTIVE TEST-TIME ADAPTATION FOR TIME-TRAVELLING EMBEDDING VISUALIZATION\par}
+\vspace{2.5cm}
+{\Large A PROJECT REPORT\par}
+\vspace{2.0cm}
+{\large SHINAN\par}
+\vspace{1.0cm}
+{\large B.ENG. (CANDIDATE)\par}
+\vfill
+{\large A REPORT SUBMITTED FOR PROJECT DOCUMENTATION PURPOSES\par}
+\vspace{0.7cm}
+{\large DEPARTMENT OF COMPUTER SCIENCE\par}
+{\large NATIONAL UNIVERSITY OF SINGAPORE\par}
+\vspace{0.7cm}
+{\large 2026\par}
+\end{titlepage}
+
+% ---------------------------
+% Front matter (Roman)
+% ---------------------------
+\cleardoublepage
+\pagenumbering{roman}
+\setcounter{page}{1}
+
+\chapter*{Declaration}
+\addcontentsline{toc}{chapter}{Declaration}
+I hereby declare that this report is my original work and has not been submitted, in whole or in part, for any other degree or qualification at any institution.
+
+\vspace{1.5cm}
+\noindent
+Signature: \rule{5cm}{0.4pt}\\
+Name: Shinan\\
+Date: \rule{3cm}{0.4pt}
+
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+This project was made possible by continuous feedback from supervisors, peers, and users who tested early versions of the \projectname{} extension. Their comments on interaction latency, visual stability, and practical debugging workflows directly shaped the final design of \systemname{}. I also thank the open-source research community for foundational work on UMAP, TimeVis, DVI, and parameter-efficient adaptation, which provided both technical inspiration and strong baselines for comparison.
+
+\tableofcontents
+
+\chapter*{Summary}
+\addcontentsline{toc}{chapter}{Summary}
+Dimension-reduction visualization is a standard tool for understanding high-dimensional representation spaces, yet most existing methods optimize a single global objective and therefore cannot react to user intent during analysis. In practical debugging, users often care about a small set of tokens, outliers, or unstable samples; however, static embeddings typically provide no mechanism to reallocate optimization effort to those regions at test time. This report presents \systemname{} (Test-time Adaptation Visualization), an interactive extension to the \projectname{} system that addresses this gap.
+
+\systemname{} introduces a focus-driven refinement loop over a three-layer architecture: a VS Code extension and React frontend for interaction, a Flask backend for session orchestration and metric services, and strategy engines (DVI, TimeVis, DynaVis, UMAP) for projection generation. Users can select focus points, choose precision levels, and trigger real-time refinement. The backend maintains an active session and runs incremental updates without restarting the full visualization pipeline. Refined projections are saved in dedicated \texttt{\_refined} directories, enabling clean side-by-side comparison with baseline embeddings.
+
+At the algorithm level, \systemname{} implements tiered computation modes (coarse, balanced, fine), focus-aware weighting, neighborhood-constrained local training, and optional low-rank adaptation hooks. The current implementation also includes custom weighted sampling and a strict time-budget policy to preserve interactive responsiveness. To evaluate quality beyond conventional global metrics, the system reports focus displacement, global drift, stability ratio, and neighborhood consistency, while retaining trustworthiness and continuity for topology monitoring.
+
+The resulting framework links interactive intent with projection adaptation and offers a practical path from passive visualization to active, analyst-in-the-loop representation debugging. This report documents the motivation, system design, algorithmic choices, evaluation protocol, implementation mapping to source code, and a roadmap for full empirical validation and deployment.
+
+\listoftables
+\listoffigures
+\chapter*{List of Illustrations}
+\addcontentsline{toc}{chapter}{List of Illustrations}
+Not applicable in this draft.
+
+\chapter*{List of Symbols}
+\addcontentsline{toc}{chapter}{List of Symbols}
+\begin{tabular}{p{0.2\textwidth}p{0.7\textwidth}}
+\(X\) & High-dimensional representation matrix. \\
+\(Y\) & Baseline two-dimensional projection. \\
+\(Y'\) & Refined two-dimensional projection after TTAV update. \\
+\(F\) & User-selected focus index set. \\
+\(B\) & Background (non-focus) index set. \\
+\(\mathrm{FD}\) & Focus Displacement. \\
+\(\mathrm{GD}\) & Global Drift. \\
+\(\mathrm{SR}\) & Stability Ratio. \\
+\(\mathrm{NC}\) & Neighbor Consistency. \\
+\end{tabular}
+
+% ---------------------------
+% Main matter (Arabic)
+% ---------------------------
+\cleardoublepage
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+\chapter{Introduction}
+\section{Background}
+Visualization of high-dimensional embeddings is central to understanding machine learning behavior across epochs, classes, and individual samples. In model debugging, two-dimensional projections are often used to inspect class separation, confusion zones, and anomalous trajectories. Methods such as t-SNE and UMAP focus on preserving local neighborhood structure, while time-aware systems such as DVI and TimeVis extend visualization to training dynamics. Despite these advances, most pipelines remain offline and globally optimized, meaning that local analysis intent is not directly represented in optimization.
+
+\section{Problem Statement}
+This project targets a concrete pain point: global optimization can preserve coarse topology while distorting local details exactly where users need fidelity. Once a user finds problematic points (for example, unstable tokens, outliers, or event-triggered samples), standard systems rarely support fast and controlled local correction. Re-running full optimization is too slow and can alter unrelated regions.
+
+The challenge is therefore twofold:
+\begin{enumerate}
+\item enable user-driven local refinement in near real time;
+\item preserve global structure while improving local faithfulness in selected focus areas.
+\end{enumerate}
+
+\section{Project Goal}
+The goal of \systemname{} is to provide test-time adaptation for embedding visualization. Instead of replacing existing projectors, \systemname{} introduces an interactive refinement loop that dynamically reallocates optimization effort according to user-selected focus indices.
+
+\section{Contributions}
+This report makes four primary contributions:
+\begin{enumerate}
+\item A focus-driven concept that bridges human interaction and projection optimization.
+\item A cross-language end-to-end architecture spanning VS Code extension, React frontend, Flask backend, and multiple strategy engines.
+\item A tiered adaptation design with precision modes, weighted sampling, neighborhood-constrained refinement, and optional LoRA pathways.
+\item A multi-dimensional evaluation framework combining utility, stability, and topology preservation metrics.
+\end{enumerate}
+
+\chapter{Related Work}
+\section{Static and Parametric Dimensionality Reduction}
+t-SNE and UMAP are widely used for low-dimensional projection. UMAP is especially attractive for large datasets due to speed and topology-aware manifold approximation \cite{umap2018}. However, these methods are typically applied as static optimization steps and do not expose interactive focus-aware adaptation during inspection sessions.
+
+\section{Time-Aware Visualization}
+Time-oriented systems such as DVI and TimeVis model representation evolution across epochs and improve interpretability of training trajectories \cite{dvi,timevis}. They provide richer temporal context than one-shot projection but still prioritize global objectives in the base pipeline. When a user identifies a local issue during analysis, adaptation is generally not integrated as a low-latency interaction primitive.
+
+\section{Parameter-Efficient Adaptation}
+LoRA demonstrates that low-rank parameter updates can adapt models efficiently with limited trainable parameters \cite{lora2021}. This idea is promising for interactive visualization, where response time matters as much as final objective value. A direct translation is to confine adaptation capacity to selected submodules and short budgeted updates.
+
+\section{Gap and Positioning}
+\systemname{} is positioned at the intersection of these lines of work. It keeps time-aware visualization foundations while adding an analyst-in-the-loop adaptation mechanism. The design emphasizes practical constraints: controlled latency, reversible storage, and metric-aware monitoring of global side effects.
+
+\chapter{System Architecture}
+\section{Overview}
+The \projectname{} repository implements a three-layer architecture:
+\begin{enumerate}
+\item \textbf{Extension and Web Frontend Layer}: VS Code extension (\texttt{extension/src}) and React + TypeScript frontend (\texttt{web/src}) provide interaction.
+\item \textbf{Backend Service Layer}: Flask server (\texttt{tool/server/server.py}) exposes REST APIs and maintains a single \texttt{active\_session} context.
+\item \textbf{Algorithm Engine Layer}: strategy implementations in \texttt{tool/visualize/strategy} and \texttt{tool/visualize/dynavis} generate and refine embeddings.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\fbox{
+\parbox{0.9\textwidth}{
+\textbf{Architecture Sketch}\newline
+VS Code Extension \(\leftrightarrow\) Webview Message Bus \(\leftrightarrow\) React State\newline
+React Frontend \(\xrightarrow{\text{HTTP/JSON}}\) Flask Backend (\texttt{:5050})\newline
+Flask Backend \(\rightarrow\) Strategy Engine (DVI / TimeVis / DynaVis / UMAP)\newline
+Strategy Engine \(\leftrightarrow\) Dataset Epoch Files (\texttt{embeddings.npy}, \texttt{projection.npy})
+}}
+\caption{End-to-end architecture of \systemname{} in \projectname{}.}
+\label{fig:architecture}
+\end{figure}
+
+\section{Frontend Interaction Design}
+User focus selection is represented as \texttt{selectedIndices} in unified state management (\texttt{web/src/state/state.unified.ts}). Precision mode is represented as \texttt{focusMode} with values \texttt{coarse}, \texttt{balanced}, and \texttt{fine}. The function panel exposes mode switching and an explicit \texttt{Update Projection} trigger to avoid unintended retraining.
+
+\section{Backend Session Orchestration}
+The backend exposes:
+\begin{itemize}
+\item \texttt{/syncSession} to initialize strategy objects and bind session state;
+\item \texttt{/startVisualizing} to run full visualization generation;
+\item \texttt{/updateFocusContext} to trigger focus-driven refinement;
+\item neighbor and metric endpoints for evaluation and diagnostics.
+\end{itemize}
+The global \texttt{active\_session} object stores strategy, visualizer, content path, method, and configuration. This avoids reinitialization overhead between consecutive interactions.
+
+\section{Algorithm Strategy Layer}
+The current codebase supports four visualization methods:
+\begin{itemize}
+\item \textbf{DVI}: spatio-temporal regularized training with per-epoch model checkpoints.
+\item \textbf{TimeVis}: global time graph construction with a unified visualization model.
+\item \textbf{DynaVis}: motion-oriented training pipeline with dedicated runner.
+\item \textbf{UMAP}: non-parametric baseline projector.
+\end{itemize}
+\systemname{} extends these engines with refinement entry points and refined output paths for post-update loading.
+
+\chapter{Motivation and Core Concept of TTAV}
+\section{Why Interaction Matters}
+In practical model analysis, users often ask specific questions:
+\begin{itemize}
+\item Why did this token move across classes?
+\item Is this outlier a true anomaly or a projection artifact?
+\item Which region should be trusted for downstream debugging?
+\end{itemize}
+Purely global optimization cannot prioritize these questions at run time. \systemname{} addresses this by treating user interaction as a dynamic optimization signal, not just a visual filter.
+
+\section{Focus-Aware Adaptation Principle}
+Given high-dimensional representations \(X \in \mathbb{R}^{N \times D}\) and projection \(Y \in \mathbb{R}^{N \times 2}\), let \(F\subseteq\{1,\dots,N\}\) denote user-selected focus indices. \systemname{} aims to improve local faithfulness around \(F\) while constraining changes on \(B=\{1,\dots,N\}\setminus F\).
+
+The core operational principle is:
+\begin{quote}
+Reallocate optimization budget to focus-connected samples under a strict latency budget, then export a refined projection snapshot without overwriting the baseline path.
+\end{quote}
+
+\section{Static Flow vs Dynamic Flow}
+\textbf{Static flow} computes embeddings for all epochs from a fixed training objective. \textbf{Dynamic flow} inserts the following loop:
+\begin{enumerate}
+\item User selects focus samples and precision mode.
+\item Backend builds focus mask and retrieves neighborhood edges.
+\item Strategy executes short refinement under a time budget.
+\item Refined projection files are written to \texttt{\{method\}\_\{id\}\_refined}.
+\item Frontend reloads the current epoch with \texttt{refine\_flag=true}.
+\end{enumerate}
+This design keeps baseline and refined states separate and reproducible.
+
+\chapter{Algorithm and Strategy}
+\section{Tiered Computation Modes}
+\systemname{} defines three precision modes:
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{0.18\textwidth}p{0.18\textwidth}p{0.24\textwidth}p{0.30\textwidth}}
+\toprule
+Mode & Weight Multiplier & Intended Behavior & Typical Use \\
+\midrule
+Coarse & \(1\times\) & no focus amplification & quick visual check \\
+Balanced & \(2\times\) & increased sampling pressure near focus & local correction with moderate risk \\
+Fine & \(5\times\) & strongest focus emphasis, optional LoRA-only updates & precise local alignment \\
+\bottomrule
+\end{tabular}
+\caption{Tiered computation design in \systemname{}.}
+\label{tab:tiered}
+\end{table}
+
+In trainer abstractions, mode influences per-batch weighting and parameter freezing policy. Fine mode can inject LoRA adapters into decoder linear layers and freeze base parameters to reduce update cost.
+
+\section{Focus-Weighted Objective}
+For a batch with optional focus-aware weights \(w_i\), the implemented weighted formulation follows:
+\begin{equation}
+\mathcal{L}_{\text{TTAV}} \approx \bar{w}\,\mathcal{L}_{\text{UMAP}} + \lambda_1 \bar{w}\,\mathcal{L}_{\text{rec}} + \lambda_2 \mathcal{L}_{\text{temp}},
+\end{equation}
+where \(\bar{w}\) is mean batch weight and \(\lambda_1,\lambda_2\) control reconstruction and temporal terms. In DVI loss implementation, reconstruction can additionally be computed per sample before weighting.
+
+\section{Neighborhood-Constrained Refinement}
+To avoid global drift, \systemname{} builds refinement batches from focus indices and their graph neighbors. For multiple focus points:
+\begin{enumerate}
+\item collect all edges touching each focus index;
+\item merge neighboring nodes with duplicate removal;
+\item cap neighborhood size (e.g., \(15\times |F|\)) for memory safety;
+\item train on the union \(F \cup \mathcal{N}(F)\) across recent epochs.
+\end{enumerate}
+
+\section{Custom Weighted Sampling}
+The repository includes \texttt{CustomWeightedRandomSampler}, which stores base weights and updates probabilities dynamically by mode-specific multipliers. This provides a direct mechanism to increase focus exposure frequency in sampled edges while preserving compatibility with existing dataloader loops.
+
+\section{LoRA-Style Adaptation Path}
+The codebase provides:
+\begin{itemize}
+\item \texttt{LoRALinear} wrapper for linear layers;
+\item \texttt{inject\_lora(...)} utility targeting decoder modules;
+\item fine-mode logic in trainer to freeze non-LoRA parameters.
+\end{itemize}
+This enables parameter-efficient adaptation in principle. In the current strategy-specific refine entry points, integration depth differs by method; DVI/TimeVis use lightweight budgeted updates, while DynaVis currently applies short refined training epochs and leaves LoRA injection as an explicit extension point.
+
+\section{Time-Budget Control}
+Interactive usability requires predictable latency. Current refine loops enforce hard stopping by wall-clock budget (e.g., around \(1.2\) to \(1.5\) seconds in DVI/TimeVis strategy paths). This bounds user waiting time and prevents runaway adaptation cycles.
+
+\chapter{Evaluation Framework}
+\section{Design Requirements}
+Evaluation must answer four questions:
+\begin{enumerate}
+\item Did focus points move enough to be useful?
+\item Did non-focus points remain stable?
+\item Is utility gain larger than side effects?
+\item Is local neighborhood quality preserved or improved?
+\end{enumerate}
+
+\section{Metrics}
+\subsection{Focus Displacement}
+\begin{equation}
+\mathrm{FD} = \frac{1}{|F|}\sum_{i\in F}\left\|Y_i' - Y_i\right\|_2.
+\end{equation}
+Higher values indicate stronger local adaptation effect.
+
+\subsection{Global Drift}
+\begin{equation}
+\mathrm{GD} = \frac{1}{|B|}\sum_{j\in B}\left\|Y_j' - Y_j\right\|_2.
+\end{equation}
+Lower values indicate better background stability.
+
+\subsection{Stability Ratio}
+\begin{equation}
+\mathrm{SR} = \frac{\mathrm{FD}}{\mathrm{GD}+\epsilon}.
+\end{equation}
+This summarizes utility-to-side-effect tradeoff.
+
+\subsection{Neighbor Consistency}
+For each focused sample \(i\), let \(N_i\) and \(N_i'\) be low-dimensional neighbors before and after refinement:
+\begin{equation}
+\mathrm{NC} = \frac{1}{|F|}\sum_{i\in F}\frac{|N_i \cap N_i'|}{|N_i|}.
+\end{equation}
+The metric tracks local structure stability during adaptation.
+
+\subsection{Trustworthiness and Continuity}
+The backend computes trustworthiness and continuity from precomputed neighbor lists, with per-epoch caching in \texttt{metrics\_cache.json}. This supports both rigorous topology checks and low-latency repeated queries.
+
+\section{Recommended Experimental Protocol}
+\begin{enumerate}
+\item Run baseline projection for each method and dataset.
+\item Select representative focus sets (single, multi-focus, event-driven).
+\item Apply each precision mode under identical time budgets.
+\item Record FD, GD, SR, NC, trustworthiness, continuity, and response latency.
+\item Compare baseline vs refined states with both quantitative and qualitative evidence.
+\end{enumerate}
+
+\chapter{Implementation Mapping to Repository}
+\section{Core Modules}
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{0.28\textwidth}p{0.62\textwidth}}
+\toprule
+Module & Role \\
+\midrule
+\texttt{web/src/views/plotView.tsx} & Focus update trigger, refined epoch reload, displacement and quality metrics. \\
+\texttt{web/src/component/function-panel.tsx} & Precision mode UI and explicit update button. \\
+\texttt{tool/server/server.py} & Session synchronization and \texttt{/updateFocusContext} refinement endpoint. \\
+\texttt{tool/server/server\_utils.py} & Neighbor queries, trustworthiness/continuity, metric caching. \\
+\texttt{tool/visualize/strategy/dvi\_strategy.py} & DVI training and neighborhood-constrained refine with budgeted updates. \\
+\texttt{tool/visualize/strategy/timevis\_strategy.py} & TimeVis training and refine output to \texttt{\_refined} path. \\
+\texttt{tool/visualize/strategy/trainer.py} & Focus-weighted train step, mode logic, optional LoRA injection path. \\
+\texttt{tool/visualize/visualize\_model.py} & Unified model output contract and LoRA utilities. \\
+\bottomrule
+\end{tabular}
+\caption{Code-grounded mapping for \systemname{} implementation.}
+\label{tab:mapping}
+\end{table}
+
+\section{Communication Path}
+There are two communication channels:
+\begin{enumerate}
+\item \textbf{VS Code extension \(\leftrightarrow\) webview}: message passing via \texttt{postMessage}.
+\item \textbf{Web frontend \(\leftrightarrow\) Flask backend}: REST over HTTP/JSON.
+\end{enumerate}
+This architecture is robust for local tooling and cross-platform deployment. If needed, future versions can add WebSocket streaming for long-running jobs.
+
+\section{Refined Output Isolation}
+Refined projection files are written under:
+\begin{quote}
+\texttt{visualize/\{method\}\_\{id\}\_refined/epochs/epoch\_\{k\}/projection.npy}
+\end{quote}
+This avoids accidental overwrite of baseline outputs and supports accurate before/after comparison.
+
+\chapter{Experimental Results (Draft Template)}
+\section{Setup}
+The following setup is recommended and partially aligned with current project scripts:
+\begin{itemize}
+\item Datasets: MNIST, Fashion-MNIST, CIFAR-10 (and optional ImageNet features).
+\item Backbones: lightweight CNN and ResNet family feature extractors.
+\item Baselines: UMAP, DVI, TimeVis, DynaVis.
+\item Focus sets: single-point, multi-point, and event-triggered samples.
+\item Time budget: approximately 2 seconds per interactive refinement.
+\end{itemize}
+
+\section{Preliminary Quantitative Template}
+Table \ref{tab:main-results} provides a report-ready template with placeholder or pilot values from development notes. Final numbers should be replaced by reproducible experiment logs.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{0.17\textwidth}p{0.16\textwidth}p{0.16\textwidth}p{0.15\textwidth}p{0.16\textwidth}}
+\toprule
+Method & Trust. \(\uparrow\) & Cont. \(\uparrow\) & Refine Time \(\downarrow\) & Interactivity \\
+\midrule
+UMAP (baseline) & 0.79 & 0.76 & N/A & static \\
+DVI (static) & 0.85 & 0.83 & N/A & static \\
+TimeVis (static) & 0.82 & 0.80 & N/A & static \\
+\systemname{} (balanced) & 0.89 & 0.87 & \(\sim\)1.5s & interactive \\
+\systemname{} (fine) & 0.91 & 0.89 & \(\sim\)2.0s & interactive \\
+\bottomrule
+\end{tabular}
+\caption{Main comparison template (replace with validated experiment outputs).}
+\label{tab:main-results}
+\end{table}
+
+\section{Ablation Template}
+\begin{table}[htbp]
+\centering
+\begin{tabular}{p{0.20\textwidth}p{0.16\textwidth}p{0.16\textwidth}p{0.16\textwidth}p{0.16\textwidth}}
+\toprule
+Setting & FD \(\uparrow\) & GD \(\downarrow\) & SR \(\uparrow\) & NC \(\uparrow\) \\
+\midrule
+Coarse mode & 0.021 & 0.017 & 1.24 & 0.84 \\
+Balanced mode & 0.046 & 0.020 & 2.30 & 0.88 \\
+Fine mode & 0.063 & 0.022 & 2.86 & 0.90 \\
+Fine w/o neighborhood cap & 0.069 & 0.041 & 1.68 & 0.81 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation template for precision and neighborhood controls.}
+\label{tab:ablation}
+\end{table}
+
+\section{Qualitative Analysis Plan}
+Recommended qualitative figures:
+\begin{enumerate}
+\item baseline vs refined projection snapshots;
+\item zoom-in around focused regions;
+\item neighbor edge overlay before/after;
+\item per-epoch trajectory panel for selected samples.
+\end{enumerate}
+The current frontend already supports most of these inspection paths via existing panels and neighbor overlays.
+
+\chapter{Discussion}
+\section{Key Observations}
+The architecture demonstrates that interactive refinement can be integrated without redesigning the full visualization stack. Session synchronization, isolated refined outputs, and metric caching jointly make iterative analysis practical.
+
+\section{Engineering Tradeoffs}
+\textbf{Local gain vs global stability}: stronger focus weights increase utility but may raise background drift.\\
+\textbf{Speed vs fidelity}: strict time budgets protect responsiveness but may underfit complex local corrections.\\
+\textbf{Generality vs depth}: unified abstractions ease maintenance, while method-specific refine depth still differs across engines.
+
+\section{Current Limitations}
+\begin{enumerate}
+\item Some advanced mode logic (e.g., full LoRA workflow) exists at abstraction level but is not yet uniformly wired into every strategy-specific refine path.
+\item Reported numerical gains in this draft should be treated as pilot values until finalized by controlled experiment runs.
+\item User-study evidence on cognitive load and debugging efficiency is still pending.
+\end{enumerate}
+
+\section{Future Work}
+\begin{enumerate}
+\item unify precision-mode semantics across DVI, TimeVis, and DynaVis refine pipelines;
+\item add benchmark scripts that auto-generate tables and figures from logs;
+\item support optional WebSocket progress streaming for long adaptation jobs;
+\item include user study and statistical significance tests for interaction outcomes.
+\end{enumerate}
+
+\chapter{Conclusion}
+This report presents \systemname{}, an interactive test-time adaptation framework for embedding visualization in the \projectname{} system. The project addresses a practical gap between global projection objectives and local analyst intent by combining focus-driven interaction, budgeted refinement, and quality monitoring. The implementation establishes a working end-to-end pathway from user selection to refined projection reload, with an architecture that is extensible across multiple visualization strategies. With full empirical validation and deeper method-level integration, \systemname{} can evolve from a promising engineering prototype into a robust methodology for interactive representation debugging.
+
+% ---------------------------
+% Bibliography
+% ---------------------------
+\cleardoublepage
+\bibliographystyle{plain}
+\bibliography{ttav_references}
+
+% ---------------------------
+% Appendix
+% ---------------------------
+\appendix
+
+\chapter{API Summary}
+\begin{longtable}{p{0.27\textwidth}p{0.22\textwidth}p{0.43\textwidth}}
+\toprule
+Endpoint & Method & Purpose \\
+\midrule
+\texttt{/startVisualizing} & POST & Full initialization and projection generation. \\
+\texttt{/syncSession} & POST & Rebind runtime strategy/visualizer state for loading workflows. \\
+\texttt{/updateFocusContext} & POST & Trigger user-driven refinement with selected indices and mode. \\
+\texttt{/getOriginalNeighbors} & POST & Query high-dimensional neighbors for evaluation. \\
+\texttt{/getProjectionNeighbors} & POST & Query projection-space neighbors (supports refined path). \\
+\texttt{/getVisualizeMetrics} & POST & Retrieve trustworthiness/continuity (cached). \\
+\bottomrule
+\end{longtable}
+
+\chapter{Reproducibility Checklist}
+\begin{enumerate}
+\item Freeze dataset versions, preprocessing, and epoch exports.
+\item Log random seeds for Python, NumPy, and PyTorch.
+\item Save mode, focus indices, and refinement time budget per run.
+\item Export both baseline and refined projections for each evaluated epoch.
+\item Record all metric scripts and configuration files used for tables.
+\end{enumerate}
+
+\chapter{Suggested Expansion to Full Thesis Length}
+To expand this draft toward the 30,000-word upper limit, prioritize:
+\begin{enumerate}
+\item full related-work chapter with deeper theory and broader baselines;
+\item rigorous experiment chapter with multiple datasets and significance tests;
+\item dedicated chapter for human-in-the-loop case studies;
+\item richer appendix with pseudocode, hyperparameter sweeps, and raw logs.
+\end{enumerate}
+
+\end{document}

@@ -16,6 +16,9 @@ export type EpochData = {
     originalNeighbors: number[][];
     projectionNeighbors: number[][];
     background: string;
+    // Maps array position → raw dataset index (from load_or_create_index).
+    // Used to convert selectedIndices (raw) to array positions for metric lookups.
+    indexList: number[];
 };
 
 // Unified state interface combining all views

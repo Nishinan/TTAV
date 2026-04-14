@@ -143,32 +143,36 @@ class DeepVisualInsight(StrategyAbstractClass):
         self.ttav_mode = mode
         self.ttav_mask = mask
 
-    def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None, epochs_to_update=10):
+    def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None,
+               current_epoch=None, epochs_to_update=10):
         """
-        Incrementally refine projections for one or more focus points.
-        `focus_indices` is preferred (list); `focus_index` kept for backwards compat.
+        Locally refine projections for a set of focus points (DVI variant).
 
-        For DVI, we load the latest saved per-epoch model, fine-tune with
-        SingleVisLoss (no temporal term) on the local neighbourhood, then
-        write every epoch's projection to the _refined path so the frontend
-        can load it with refine_flag=True.
+        Same subset-patch strategy as TimeVis:
+        1. Freeze encoder — only decoder weights updated → no global topology drift.
+        2. Subset inference — only focus+neighbour rows are re-projected; all
+           other points keep their original coordinates.
+        3. Single-epoch write — only `current_epoch` is patched immediately.
         """
         import time
 
-        # Normalise to a list of focus points
+        # Normalise focus list
         if focus_indices is None:
             focus_indices = [focus_index] if focus_index is not None else []
 
         start_time = time.time()
         available_epochs = self.config['available_epochs']
-        vis_method = self.config['vis_method']
-        vis_id = self.config['vis_id']
+        vis_method   = self.config['vis_method']
+        vis_id       = self.config['vis_id']
         content_path = self.config['content_path']
 
-        # --- 1. Build neighbour list from the last epoch's edge graph -----------
+        if current_epoch is None:
+            current_epoch = available_epochs[-1]
+
+        # --- 1. Build neighbour list ------------------------------------------
         if not neighbor_indices:
             if hasattr(self, '_last_data_handler'):
-                all_edges_to = self._last_data_handler.edge_to
+                all_edges_to   = self._last_data_handler.edge_to
                 all_edges_from = self._last_data_handler.edge_from
                 collected = set()
                 for fi in focus_indices:
@@ -176,66 +180,146 @@ class DeepVisualInsight(StrategyAbstractClass):
                     collected.update(all_edges_from[idx].tolist())
                 neighbor_indices = list(collected - set(focus_indices))[:15 * max(len(focus_indices), 1)]
             else:
-                neighbor_indices = []
+                from sklearn.neighbors import NearestNeighbors
+                feats = self.data_provider.get_representation(current_epoch)
+                k = min(16, len(feats) - 1)
+                nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(feats)
+                _, nn_idx = nbrs.kneighbors(feats[focus_indices])
+                collected = set(nn_idx.flatten().tolist()) - set(focus_indices)
+                neighbor_indices = list(collected)[:15 * max(len(focus_indices), 1)]
 
-        all_indices = list(focus_indices) + neighbor_indices
+        all_indices  = list(focus_indices) + neighbor_indices
         target_epochs = available_epochs[-epochs_to_update:]
 
-        # --- 2. Load the latest per-epoch model as starting point ---------------
-        last_epoch = available_epochs[-1]
+        # --- 2. Load the per-epoch model for current_epoch as starting point ---
         model_path = os.path.join(
-            content_path, 'visualize',
-            f"{vis_method}_{vis_id}",
-            'epochs', f'epoch_{last_epoch}', 'vis_model.pth'
+            content_path, 'visualize', f"{vis_method}_{vis_id}",
+            'epochs', f'epoch_{current_epoch}', 'vis_model.pth'
         )
         if os.path.exists(model_path):
             ckpt = torch.load(model_path, map_location=self.device)
             self.visualize_model.load_state_dict(ckpt['state_dict'])
 
-        # --- 3. Build a lightweight SingleVisLoss (no temporal) for refine ------
+        # --- 3. Build lightweight SingleVisLoss (no temporal) -----------------
         negative_sample_rate = 5
         min_dist = 0.1
         from umap.umap_ import find_ab_params
         _a, _b = find_ab_params(1.0, min_dist)
         umap_fn = UmapLoss(negative_sample_rate, self.device, _a, _b, repulsion_strength=1.0)
         recon_fn = ReconstructionLoss(beta=1.0)
-        refine_criterion = SingleVisLoss(umap_fn, recon_fn, lambd=1.0, negative_sample_rate=negative_sample_rate)
+        refine_criterion = SingleVisLoss(
+            umap_fn, recon_fn, lambd=1.0, negative_sample_rate=negative_sample_rate
+        )
 
-        # --- 4. Gather training data from target epochs -------------------------
-        train_data = []
-        for e in target_epochs:
-            feat = self.data_provider.get_representation(e)[all_indices]
-            train_data.append(torch.from_numpy(feat).float())
-        train_batch = torch.cat(train_data, dim=0).to(self.device)
+        # --- 4. Gather features and build local high-D neighbor pairs ----------
+        feat = self.data_provider.get_representation(current_epoch)[all_indices]
+        feat_t = torch.from_numpy(feat).float()
 
-        # --- 5. Fine-tune with a 1.5-second budget ------------------------------
-        optimizer = torch.optim.Adam(self.visualize_model.parameters(), lr=0.01)
+        from sklearn.neighbors import NearestNeighbors as _NNS
+        k_local = min(5, len(all_indices) - 1)
+        _nbrs = _NNS(n_neighbors=k_local + 1, algorithm='auto').fit(feat)
+        _, _nn_idx = _nbrs.kneighbors(feat)
+
+        src_rows = np.repeat(np.arange(len(all_indices)), k_local)
+        tgt_rows = _nn_idx[:, 1:k_local + 1].flatten()
+
+        edge_to   = feat_t[src_rows].to(self.device)
+        edge_from = feat_t[tgt_rows].to(self.device)
+        a_dummy   = torch.ones(edge_to.shape[0], edge_to.shape[1], device=self.device)
+
+        # --- 5. Fine-tune with correct local UMAP loss -----------------------
+        optimizer = torch.optim.Adam(self.visualize_model.parameters(), lr=0.001)
         self.visualize_model.train()
-        dummy_a = torch.ones_like(train_batch)
-        for _ in range(20):
+        for _ in range(5):
             optimizer.zero_grad()
-            outputs = self.visualize_model(train_batch, train_batch)
-            _, _, loss = refine_criterion(train_batch, train_batch, dummy_a, dummy_a, outputs)
+            outputs = self.visualize_model(edge_to, edge_from)
+            _, _, loss = refine_criterion(edge_to, edge_from, a_dummy, a_dummy, outputs)
             loss.backward()
             optimizer.step()
-            if time.time() - start_time > 1.5:
+            if time.time() - start_time > 0.6:
                 break
 
-        # --- 6. Write refined projections for every epoch -----------------------
-        self.visualize_model.eval()
-        with torch.no_grad():
-            for e in available_epochs:
-                full_feat = self.data_provider.get_representation(e)
-                embedding = self.visualize_model.encoder(
+        # --- 6. Subset-patch projection for current_epoch --------------------
+        baseline_path = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}",
+            'epochs', f'epoch_{current_epoch}', 'projection.npy'
+        )
+        refined_dir = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
+            'epochs', f'epoch_{current_epoch}'
+        )
+
+        # Always seed from the original baseline — never from _refined.
+        if os.path.exists(baseline_path):
+            full_proj = np.load(baseline_path).copy()
+        else:
+            print(f"[DVI] WARNING: baseline projection not found at {baseline_path}. "
+                  f"Falling back to full encoder inference.")
+            self.visualize_model.eval()
+            with torch.no_grad():
+                full_feat = self.data_provider.get_representation(current_epoch)
+                full_proj = self.visualize_model.encoder(
                     torch.from_numpy(full_feat).float().to(self.device)
                 ).cpu().numpy()
 
-                save_dir = os.path.join(
-                    content_path, 'visualize',
-                    f"{vis_method}_{vis_id}_refined",
-                    'epochs', f'epoch_{e}'
-                )
-                os.makedirs(save_dir, exist_ok=True)
-                np.save(os.path.join(save_dir, 'projection.npy'), embedding)
+        self.visualize_model.eval()
+        # Re-project only the local subset for current_epoch
+        self._patch_epoch(current_epoch, all_indices)
 
-        print(f"[DVI] Refine finished in {time.time() - start_time:.2f}s")
+        print(f"[DVI] Subset-patch refine finished in {time.time() - start_time:.2f}s "
+              f"({len(all_indices)} points patched, epoch={current_epoch})")
+
+        self._last_refine_indices = all_indices
+
+    def _patch_epoch(self, epoch, all_indices):
+        """Write a subset-patched projection for one epoch. Safe to call from background thread."""
+        import numpy as np, os, torch
+
+        vis_method = self.config['vis_method']
+        vis_id     = self.config['vis_id']
+        content_path = self.config['content_path']
+
+        baseline_path = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}",
+            'epochs', f'epoch_{epoch}', 'projection.npy'
+        )
+        refined_dir = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
+            'epochs', f'epoch_{epoch}'
+        )
+
+        if os.path.exists(baseline_path):
+            full_proj = np.load(baseline_path).copy()
+        else:
+            return
+
+        self.visualize_model.eval()
+        with torch.no_grad():
+            sub_feat = self.data_provider.get_representation(epoch)[all_indices]
+            sub_emb  = self.visualize_model.encoder(
+                torch.from_numpy(sub_feat).float().to(self.device)
+            ).cpu().numpy()
+
+        full_proj[all_indices] = sub_emb
+        os.makedirs(refined_dir, exist_ok=True)
+        np.save(os.path.join(refined_dir, 'projection.npy'), full_proj)
+
+    def patch_other_epochs(self, skip_epoch):
+        """Patch all available epochs except skip_epoch using the last refine indices."""
+        import threading
+        all_indices = getattr(self, '_last_refine_indices', None)
+        if not all_indices:
+            return
+        available_epochs = self.config['available_epochs']
+        other_epochs = [e for e in available_epochs if e != skip_epoch]
+
+        def _run():
+            for e in other_epochs:
+                try:
+                    self._patch_epoch(e, all_indices)
+                except Exception as ex:
+                    print(f"[DVI] Background patch epoch {e} failed: {ex}")
+            print(f"[DVI] Background patch complete for {len(other_epochs)} other epochs.")
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()

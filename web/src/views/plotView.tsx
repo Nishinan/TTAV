@@ -31,27 +31,33 @@ interface FunctionViewPanelsProps {
         contentPath: string, method: string, visID: string, epochNum: number, taskType: string,
         refineFlag: boolean = false  // when true, load from the _refined projection directory
     ) => {
-        // 1. 获取投影坐标 (最核心)
-        const projection = await BackendAPI.fetchEpochProjection(contentPath, method, visID, epochNum);
+        // Fire all independent requests in parallel to minimize round-trip latency.
+        const isClassification = taskType === 'Classification';
 
-        // 2. 获取邻居数据: use refineFlag so post-refine neighbors match the refined projection
-        const originalNeighbors = await BackendAPI.getOriginalNeighbors(contentPath, epochNum);
-        const projectionNeighbors = await BackendAPI.getProjectionNeighbors(contentPath, method, visID, epochNum, refineFlag);
+        const [projection, originalNeighbors, projectionNeighbors, predictionResponse, background] =
+            await Promise.all([
+                BackendAPI.fetchEpochProjection(contentPath, method, visID, epochNum, refineFlag),
+                BackendAPI.getOriginalNeighbors(contentPath, epochNum),
+                BackendAPI.getProjectionNeighbors(contentPath, method, visID, epochNum, refineFlag),
+                isClassification
+                    ? BackendAPI.getAttributeResource(contentPath, epochNum, 'prediction')
+                    : Promise.resolve({ prediction: [] }),
+                isClassification
+                    ? BackendAPI.getBackground(contentPath, method, visID, epochNum)
+                    : Promise.resolve(''),
+            ]);
 
         const data: any = {
             projection: projection.projection || [],
             originalNeighbors: originalNeighbors.neighbors || [],
             projectionNeighbors: projectionNeighbors.neighbors || [],
+            indexList: projectionNeighbors.index_list || [],
         };
 
-        // 3. 分类任务额外数据
-        if (taskType === 'Classification') {
-            const predictionResponse = await BackendAPI.getAttributeResource(contentPath, epochNum, 'prediction');
+        if (isClassification) {
             const prob = predictionResponse.prediction || [];
             data['predProbability'] = prob;
             data['prediction'] = prob.map((p: number[]) => p.indexOf(Math.max(...p)));
-            
-            const background = await BackendAPI.getBackground(contentPath, method, visID, epochNum);
             data['background'] = background || '';
         }
         return data;
@@ -111,16 +117,28 @@ export const evaluateProjectionQuality = async (
 
     const oldProj = oldData.projection;
     const newProj = newData.projection;
-    
+
     if (!oldProj || !newProj) return;
+
+    // Build reverse mapping: raw dataset index → array position
+    // indexList[pos] = rawIdx  =>  rawToPos[rawIdx] = pos
+    const indexList: number[] = (newData.indexList && newData.indexList.length > 0)
+        ? newData.indexList
+        : (oldData.indexList || []);
+    const rawToPos = new Map<number, number>();
+    indexList.forEach((rawIdx: number, pos: number) => rawToPos.set(rawIdx, pos));
+    // Helper: convert a raw dataset index to its array position (identity fallback)
+    const toPos = (rawIdx: number) => rawToPos.has(rawIdx) ? rawToPos.get(rawIdx)! : rawIdx;
 
     // --- 维度 1: 焦点位移 (Focus Displacement) ---
     // 衡量选中的点是否发生了显著移动（体现微调效用）
     let focusShift = 0;
-    selectedIndices.forEach(idx => {
+    selectedIndices.forEach(rawIdx => {
+        const pos = toPos(rawIdx);
+        if (!oldProj[pos] || !newProj[pos]) return;
         const d = Math.sqrt(
-            Math.pow(newProj[idx][0] - oldProj[idx][0], 2) + 
-            Math.pow(newProj[idx][1] - oldProj[idx][1], 2)
+            Math.pow(newProj[pos][0] - oldProj[pos][0], 2) +
+            Math.pow(newProj[pos][1] - oldProj[pos][1], 2)
         );
         focusShift += d;
     });
@@ -130,12 +148,12 @@ export const evaluateProjectionQuality = async (
     // 衡量非选中点（背景点）的平均位移（越小越稳）
     let globalDrift = 0;
     let nonFocusCount = 0;
-    const selectedSet = new Set(selectedIndices);
+    const selectedPosSet = new Set(selectedIndices.map(toPos));
 
     oldProj.forEach((pos: number[], i: number) => {
-        if (!selectedSet.has(i)) {
+        if (!selectedPosSet.has(i)) {
             const d = Math.sqrt(
-                Math.pow(newProj[i][0] - pos[0], 2) + 
+                Math.pow(newProj[i][0] - pos[0], 2) +
                 Math.pow(newProj[i][1] - pos[1], 2)
             );
             globalDrift += d;
@@ -144,31 +162,73 @@ export const evaluateProjectionQuality = async (
     });
     const avgGlobalDrift = globalDrift / (nonFocusCount || 1);
 
-    // --- 维度 3: 局部保持率变化 (Neighbor Preservation Change) ---
-    // 比较微调前后低维邻居的一致性（仅示意，完整需对比高维邻居）
+    // --- 维度 3: 局部保持率变化 (Neighbor Consistency) ---
+    // 比较微调前后低维邻居的一致性（衡量 refine 的稳定性）
     const oldLowNeighbors = oldData.projectionNeighbors || [];
     const newLowNeighbors = newData.projectionNeighbors || [];
-    
+
     let neighborConsistency = 0;
-    selectedIndices.forEach(idx => {
-        const oldSet = new Set(oldLowNeighbors[idx] || []);
-        const newSet = new Set(newLowNeighbors[idx] || []);
+    selectedIndices.forEach(rawIdx => {
+        const pos = toPos(rawIdx);
+        const oldSet = new Set(oldLowNeighbors[pos] || []);
+        const newSet = new Set(newLowNeighbors[pos] || []);
         const intersection = [...oldSet].filter(x => newSet.has(x));
         neighborConsistency += intersection.length / (oldSet.size || 1);
     });
     const avgNeighborConsistency = neighborConsistency / (selectedIndices.length || 1);
 
+    // --- 维度 4: Trustworthiness (局部可信度) ---
+    // 衡量 refine 后低维邻居的准确性：低维邻居有多少在高维也是邻居？
+    // T = 1 - (2 / n·k·(2n-3k-1)) × Σ_i Σ_{j∈U_i} (r(i,j) - k)
+    // 其中 U_i = 低维邻居但不是高维邻居的点集，r(i,j) = j 在 i 高维排名
+    // 这里只在 selectedIndices 上计算局部 trustworthiness
+    const highNeighbors = oldData.originalNeighbors || [];  // 高维邻居，refine 前后不变
+    const lowNeighbors  = newData.projectionNeighbors || []; // refine 后的低维邻居
+
+    let trustSum = 0;
+    let trustCount = 0;
+    const N = newProj.length;
+
+    selectedIndices.forEach(rawIdx => {
+        const pos = toPos(rawIdx);
+        const highList: number[] = highNeighbors[pos] || [];
+        const lowList:  number[] = lowNeighbors[pos]  || [];
+        if (highList.length === 0 || lowList.length === 0) return;
+
+        const k = Math.min(highList.length, lowList.length);
+        const highSet = new Set(highList.slice(0, k));
+
+        // U_i: points that appear in low-D neighborhood but not in high-D neighborhood
+        let penalty = 0;
+        lowList.slice(0, k).forEach(j => {
+            if (!highSet.has(j)) {
+                // r(i,j): rank of j in i's high-D neighbor list (1-based, beyond k if not in list)
+                const rank = highList.indexOf(j);
+                const r = rank === -1 ? highList.length + 1 : rank + 1;
+                penalty += (r - k);
+            }
+        });
+
+        // Normalisation factor for a single point
+        const norm = k * (2 * N - 3 * k - 1) / 2;
+        trustSum += norm > 0 ? 1 - penalty / norm : 1;
+        trustCount++;
+    });
+    const avgTrustworthiness = trustCount > 0 ? trustSum / trustCount : 1;
+
     // --- 结果打印 ---
     console.log("-----------------------------------------");
     console.log(`> Focus Displacement (效用): ${avgFocusShift.toFixed(4)}`);
     console.log(`> Global Drift (稳定性): ${avgGlobalDrift.toFixed(4)}`);
-    console.log(`> Neighbor Consistency (保持率): ${( avgNeighborConsistency* 100).toFixed(2)}%`);
+    console.log(`> Neighbor Consistency (保持率): ${(avgNeighborConsistency * 100).toFixed(2)}%`);
+    console.log(`> Trustworthiness (局部可信度): ${(avgTrustworthiness * 100).toFixed(2)}%`);
     console.log("-----------------------------------------");
 
     return {
         avgFocusShift,
         avgGlobalDrift,
-        avgNeighborConsistency
+        avgNeighborConsistency,
+        avgTrustworthiness,
     };
 };
 
@@ -182,16 +242,22 @@ export const evaluateProjectionQuality = async (
 export const calculateDisplacementStats = (
     oldProj: number[][],
     newProj: number[][],
-    selectedIndices: number[]
+    selectedIndices: number[],
+    indexList: number[] = []
 ) => {
     if (!oldProj || !newProj || oldProj.length !== newProj.length) {
         console.error("Invalid projection data for displacement stats.");
         return null;
     }
 
+    // Build raw → pos mapping if indexList provided
+    const rawToPos = new Map<number, number>();
+    indexList.forEach((rawIdx, pos) => rawToPos.set(rawIdx, pos));
+    const toPos = (rawIdx: number) => rawToPos.has(rawIdx) ? rawToPos.get(rawIdx)! : rawIdx;
+
     let focusShiftTotal = 0;
     let globalDriftTotal = 0;
-    const selectedSet = new Set(selectedIndices);
+    const selectedPosSet = new Set(selectedIndices.map(toPos));
     const numTotal = oldProj.length;
     const numFocus = selectedIndices.length;
     const numNonFocus = numTotal - numFocus;
@@ -202,7 +268,7 @@ export const calculateDisplacementStats = (
         const dy = newProj[i][1] - oldProj[i][1];
         const distance = Math.sqrt(dx * dx + dy * dy);
 
-        if (selectedSet.has(i)) {
+        if (selectedPosSet.has(i)) {
             focusShiftTotal += distance;
         } else {
             globalDriftTotal += distance;
@@ -382,6 +448,11 @@ function MessageHandler() {
                 data_type: dataType, task_type: taskType, vis_config: visConfig
             });
 
+            // 5. 更新 store，确保后续 handleUpdate 能拿到正确的 vis_method / visID
+            setContentPath(contentPath);
+            setValue('vis_method', visualizationMethod);
+            setValue('visID', visualizationID);
+
             message.success('Visualization loaded successfully!');
         } catch (error) {
             console.error('Error:', error);
@@ -500,44 +571,60 @@ export function AppCombinedView() {
 
          
 
+    const isRefining = useRef(false);
+    const REFINE_MSG_KEY = 'ttav_refine_loading';
+
     const handleUpdate = async () => {
         if (!selectedIndices || selectedIndices.length === 0) {
             message.warning("Please select points on the canvas first.");
             return;
         }
-        const hide = message.loading('Refining layout...', 0);
+        // Prevent concurrent refine calls — each would create its own loading toast
+        if (isRefining.current) {
+            message.warning("Refinement already in progress, please wait.");
+            return;
+        }
+        isRefining.current = true;
+        // Use a stable key so any stale toast from a prior crash is destroyed first
+        message.loading({ content: 'Refining layout...', key: REFINE_MSG_KEY, duration: 0 });
 
         try {
             const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
-            // 1. 发起请求：后端执行 train_refined
-            const response = await BackendAPI.updateFocusContext(contentPath, selectedIndices, focusMode);
-            
+            const response = await BackendAPI.updateFocusContext(contentPath, selectedIndices, focusMode, epoch);
 
             if (response && response.status === "success") {
-                console.log(`[TTAV] Refine success. Fetching new projection for epoch ${targetEpoch}...`);
+                console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
 
-                // Fetch and commit new epoch data to the store (updateGlobal=true, refineFlag=true)
-                // so the canvas re-renders with the refined projection and neighbors are also
-                // computed from the _refined directory (fixes neighbor preservation metric).
-                const newEpochData = await refreshEpochData(targetEpoch, {
-                    contentPath,
-                    vis_method,
-                    visID: currentVisID,
-                    taskType
-                }, true, true);
+                // After refine, only projection coords and low-D neighbors change.
+                // Re-use originalNeighbors/prediction/background from oldEpochData to skip those requests.
+                const [projResp, projNeighResp] = await Promise.all([
+                    BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true),
+                    BackendAPI.getProjectionNeighbors(contentPath, vis_method, currentVisID, targetEpoch, true),
+                ]);
 
-                // Quality metrics (console-only, no UI impact)
+                const newEpochData = {
+                    ...oldEpochData,
+                    projection: projResp.projection || oldEpochData.projection,
+                    projectionNeighbors: projNeighResp.neighbors || oldEpochData.projectionNeighbors,
+                    indexList: projNeighResp.index_list || oldEpochData.indexList,
+                };
+
+                // Write updated epoch data to store so canvas re-renders
+                const state = useGlobalStore.getState();
+                state.setValue('allEpochData', { ...state.allEpochData, [targetEpoch]: newEpochData });
+
                 await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
-                calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices);
+                calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices, newEpochData.indexList || []);
 
-                message.success(`Epoch ${targetEpoch} refined! Plot updated!`);
+                message.success({ content: `Epoch ${targetEpoch} refined! Plot updated!`, key: REFINE_MSG_KEY });
+            } else {
+                message.error({ content: 'Refinement returned unexpected status.', key: REFINE_MSG_KEY });
             }
         } catch (error) {
             console.error("Update failed:", error);
-            message.error('Failed to update projection.');
-        }
-        finally {
-            hide(); // 2. 无论 try 还是 catch，强制销毁弹窗
+            message.error({ content: 'Failed to update projection.', key: REFINE_MSG_KEY });
+        } finally {
+            isRefining.current = false;
         }
     };
     // 1. 监听全局选点，确保 selectedIndices 响应
