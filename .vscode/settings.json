@@ -36,7 +36,7 @@
 
   // ===== UI =====
   "workbench.startupEditor": "none",
-  "workbench.editor.enablePreview": false,
+  "workbench.editor.enablePreview": true,
 
   // ===== 文件排除 =====
   "files.exclude": {
@@ -54,5 +54,8 @@
       "name": "HTTPS_PROXY",
       "value": "http://127.0.0.1:7897"
     }
-  ]
+  ],
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  }
 }

@@ -104,14 +104,14 @@ const initStaticContext = async (contentPath: string, dataType: string) => {
 };
 
 /**
- * 投影质量评估函数
- * 评估微调（Refine）后的投影在稳定性、保持率和有效性上的表现
+ * Evaluate projection quality after refinement.
+ * Reports focus displacement, global drift, neighbor preservation, and trustworthiness.
  */
 export const evaluateProjectionQuality = async (
     epochNum: number,
     selectedIndices: number[],
-    oldData: any, // 微调前的全量数据快照
-    newData: any  // 微调后的新数据
+    oldData: any, // snapshot before refine
+    newData: any  // data after refine
 ) => {
     console.log(`\n[Quality Evaluation] Starting evaluation for Epoch ${epochNum}...`);
 
@@ -130,8 +130,8 @@ export const evaluateProjectionQuality = async (
     // Helper: convert a raw dataset index to its array position (identity fallback)
     const toPos = (rawIdx: number) => rawToPos.has(rawIdx) ? rawToPos.get(rawIdx)! : rawIdx;
 
-    // --- 维度 1: 焦点位移 (Focus Displacement) ---
-    // 衡量选中的点是否发生了显著移动（体现微调效用）
+    // --- Dim 1: Focus Displacement ---
+    // Average 2D movement of selected (focus) points — measures refinement effect.
     let focusShift = 0;
     selectedIndices.forEach(rawIdx => {
         const pos = toPos(rawIdx);
@@ -144,8 +144,8 @@ export const evaluateProjectionQuality = async (
     });
     const avgFocusShift = focusShift / (selectedIndices.length || 1);
 
-    // --- 维度 2: 全局稳定性 (Global Stability / Drift) ---
-    // 衡量非选中点（背景点）的平均位移（越小越稳）
+    // --- Dim 2: Global Stability (Drift) ---
+    // Average 2D movement of non-selected points — smaller is more stable.
     let globalDrift = 0;
     let nonFocusCount = 0;
     const selectedPosSet = new Set(selectedIndices.map(toPos));
@@ -162,28 +162,38 @@ export const evaluateProjectionQuality = async (
     });
     const avgGlobalDrift = globalDrift / (nonFocusCount || 1);
 
-    // --- 维度 3: 局部保持率变化 (Neighbor Consistency) ---
-    // 比较微调前后低维邻居的一致性（衡量 refine 的稳定性）
-    const oldLowNeighbors = oldData.projectionNeighbors || [];
+    // --- Dim 3: Neighbor Preservation ---
+    // How many of the post-refine low-D neighbors are also high-D neighbors?
+    // Both originalNeighbors and projectionNeighbors store proj-position indices (0..N-1),
+    // because both are built on arrays re-ordered by index.json on the backend.
+    // No rawIdx→pos conversion is needed here.
+    const highNeighborsNC = oldData.originalNeighbors || [];
     const newLowNeighbors = newData.projectionNeighbors || [];
 
+
+
     let neighborConsistency = 0;
+    let ncCount = 0;
     selectedIndices.forEach(rawIdx => {
         const pos = toPos(rawIdx);
-        const oldSet = new Set(oldLowNeighbors[pos] || []);
-        const newSet = new Set(newLowNeighbors[pos] || []);
-        const intersection = [...oldSet].filter(x => newSet.has(x));
-        neighborConsistency += intersection.length / (oldSet.size || 1);
-    });
-    const avgNeighborConsistency = neighborConsistency / (selectedIndices.length || 1);
+        const highList: number[] = highNeighborsNC[pos] || [];
+        const lowList:  number[] = newLowNeighbors[pos] || [];
+        if (highList.length === 0 || lowList.length === 0) return;
 
-    // --- 维度 4: Trustworthiness (局部可信度) ---
-    // 衡量 refine 后低维邻居的准确性：低维邻居有多少在高维也是邻居？
+        const k = Math.min(highList.length, lowList.length);
+        const highSet = new Set(highList.slice(0, k));
+        const intersection = lowList.slice(0, k).filter(p => highSet.has(p));
+        neighborConsistency += intersection.length / k;
+        ncCount++;
+    });
+    const avgNeighborConsistency = ncCount > 0 ? neighborConsistency / ncCount : 0;
+
+    // --- Dim 4: Trustworthiness ---
     // T = 1 - (2 / n·k·(2n-3k-1)) × Σ_i Σ_{j∈U_i} (r(i,j) - k)
-    // 其中 U_i = 低维邻居但不是高维邻居的点集，r(i,j) = j 在 i 高维排名
-    // 这里只在 selectedIndices 上计算局部 trustworthiness
-    const highNeighbors = oldData.originalNeighbors || [];  // 高维邻居，refine 前后不变
-    const lowNeighbors  = newData.projectionNeighbors || []; // refine 后的低维邻居
+    // U_i = points in low-D neighborhood but not in high-D neighborhood.
+    // Both neighbor lists use the same proj-position index space — no conversion needed.
+    const highNeighborsTrust = oldData.originalNeighbors || [];
+    const lowNeighborsTrust  = newData.projectionNeighbors || [];
 
     let trustSum = 0;
     let trustCount = 0;
@@ -191,37 +201,34 @@ export const evaluateProjectionQuality = async (
 
     selectedIndices.forEach(rawIdx => {
         const pos = toPos(rawIdx);
-        const highList: number[] = highNeighbors[pos] || [];
-        const lowList:  number[] = lowNeighbors[pos]  || [];
+        const highList: number[] = highNeighborsTrust[pos] || [];
+        const lowList:  number[] = lowNeighborsTrust[pos]  || [];
         if (highList.length === 0 || lowList.length === 0) return;
 
         const k = Math.min(highList.length, lowList.length);
         const highSet = new Set(highList.slice(0, k));
 
-        // U_i: points that appear in low-D neighborhood but not in high-D neighborhood
+        // Penalty: low-D neighbor j not found in high-D top-k
         let penalty = 0;
         lowList.slice(0, k).forEach(j => {
             if (!highSet.has(j)) {
-                // r(i,j): rank of j in i's high-D neighbor list (1-based, beyond k if not in list)
                 const rank = highList.indexOf(j);
                 const r = rank === -1 ? highList.length + 1 : rank + 1;
                 penalty += (r - k);
             }
         });
 
-        // Normalisation factor for a single point
         const norm = k * (2 * N - 3 * k - 1) / 2;
         trustSum += norm > 0 ? 1 - penalty / norm : 1;
         trustCount++;
     });
     const avgTrustworthiness = trustCount > 0 ? trustSum / trustCount : 1;
 
-    // --- 结果打印 ---
     console.log("-----------------------------------------");
-    console.log(`> Focus Displacement (效用): ${avgFocusShift.toFixed(4)}`);
-    console.log(`> Global Drift (稳定性): ${avgGlobalDrift.toFixed(4)}`);
-    console.log(`> Neighbor Consistency (保持率): ${(avgNeighborConsistency * 100).toFixed(2)}%`);
-    console.log(`> Trustworthiness (局部可信度): ${(avgTrustworthiness * 100).toFixed(2)}%`);
+    console.log(`> Focus Displacement: ${avgFocusShift.toFixed(4)}`);
+    console.log(`> Global Drift: ${avgGlobalDrift.toFixed(4)}`);
+    console.log(`> Neighbor Preservation: ${(avgNeighborConsistency * 100).toFixed(2)}%`);
+    console.log(`> Trustworthiness: ${(avgTrustworthiness * 100).toFixed(2)}%`);
     console.log("-----------------------------------------");
 
     return {
@@ -234,10 +241,7 @@ export const evaluateProjectionQuality = async (
 
 
 /**
- * 计算位移统计指标
- * @param oldProj 原始投影坐标矩阵 [n, 2]
- * @param newProj 微调后的投影坐标矩阵 [n, 2]
- * @param selectedIndices 用户选中的点索引
+ * Compute displacement statistics: focus shift vs global drift.
  */
 export const calculateDisplacementStats = (
     oldProj: number[][],
@@ -262,7 +266,6 @@ export const calculateDisplacementStats = (
     const numFocus = selectedIndices.length;
     const numNonFocus = numTotal - numFocus;
 
-    // 遍历所有点计算欧式距离
     for (let i = 0; i < numTotal; i++) {
         const dx = newProj[i][0] - oldProj[i][0];
         const dy = newProj[i][1] - oldProj[i][1];
@@ -278,14 +281,11 @@ export const calculateDisplacementStats = (
     const avgFocusShift = numFocus > 0 ? focusShiftTotal / numFocus : 0;
     const avgGlobalDrift = numNonFocus > 0 ? globalDriftTotal / numNonFocus : 0;
 
-    // 打印格式化的报告
     console.log(`\n[Displacement Stats]`);
-    console.log(`- Avg Focus Shift (选中点): ${avgFocusShift.toFixed(5)}`);
-    console.log(`- Avg Global Drift (非选中点): ${avgGlobalDrift.toFixed(5)}`);
-    
-    // 计算信噪比：理想情况下 Focus Shift 应远大于 Global Drift
+    console.log(`- Avg Focus Shift: ${avgFocusShift.toFixed(5)}`);
+    console.log(`- Avg Global Drift: ${avgGlobalDrift.toFixed(5)}`);
     const snr = avgGlobalDrift > 0 ? avgFocusShift / avgGlobalDrift : Infinity;
-    console.log(`- Stability Ratio (效用/漂移比): ${snr.toFixed(2)}x`);
+    console.log(`- Stability Ratio: ${snr.toFixed(2)}x`);
 
     return {
         avgFocusShift,
@@ -613,7 +613,15 @@ export function AppCombinedView() {
                 const state = useGlobalStore.getState();
                 state.setValue('allEpochData', { ...state.allEpochData, [targetEpoch]: newEpochData });
 
-                await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
+                const metrics = await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
+                if (metrics) {
+                    useGlobalStore.getState().setValue('refineMetrics', {
+                        focusDisplacement: metrics.avgFocusShift,
+                        globalDrift: metrics.avgGlobalDrift,
+                        neighborPreservation: metrics.avgNeighborConsistency,
+                        trustworthiness: metrics.avgTrustworthiness,
+                    });
+                }
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices, newEpochData.indexList || []);
 
                 message.success({ content: `Epoch ${targetEpoch} refined! Plot updated!`, key: REFINE_MSG_KEY });

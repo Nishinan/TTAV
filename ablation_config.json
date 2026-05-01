@@ -1,0 +1,15 @@
+{
+  "ablation_enabled": true,
+  "n_random_points": 20,
+  "n_steps": 5,
+  "configs": [
+    {"name": "A0_baseline",  "sigma_mode": "uniform",  "lambda_reg": 0.0},
+    {"name": "A1_sigma",     "sigma_mode": "adaptive", "lambda_reg": 0.0},
+    {"name": "B1_lam0.01",   "sigma_mode": "uniform",  "lambda_reg": 0.01},
+    {"name": "B2_lam0.1",    "sigma_mode": "uniform",  "lambda_reg": 0.1},
+    {"name": "B3_lam1.0",    "sigma_mode": "uniform",  "lambda_reg": 1.0},
+    {"name": "C1_full0.01",  "sigma_mode": "adaptive", "lambda_reg": 0.01},
+    {"name": "C2_full0.1",   "sigma_mode": "adaptive", "lambda_reg": 0.1},
+    {"name": "C3_full1.0",   "sigma_mode": "adaptive", "lambda_reg": 1.0}
+  ]
+}

@@ -1,4 +1,4 @@
-import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button } from 'antd';
+import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button, Tooltip } from 'antd';
 import { useDefaultStore,FocusMode } from '../state/state.unified';
 import { useEffect, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
@@ -106,6 +106,7 @@ function hexToRgbArray(hex: string): [number, number, number] {
 export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
     const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode } =
         useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode"]);
+    const { refineMetrics } = useDefaultStore(['refineMetrics']);
     const { revealOriginalNeighbors, revealProjectionNeighbors, setRevealOriginalNeighbors, setRevealProjectionNeighbors } =
         useDefaultStore(["revealOriginalNeighbors", "revealProjectionNeighbors", "setRevealOriginalNeighbors", "setRevealProjectionNeighbors"]);
     const { showIndex, showLabel, showBackground, showTrail, setShowIndex, setShowLabel, setShowBackground, setShowTrail } =
@@ -338,6 +339,47 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
         Update Projection
     </Button>
 </FunctionalBlock>
+            <FunctionalBlock label="Refine Quality">
+                {refineMetrics ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '2px 0' }}>
+                        {[
+                            { label: 'Focus Displacement', value: refineMetrics.focusDisplacement, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of selected focus points after refine. Larger = more effect.' },
+                            { label: 'Global Drift', value: refineMetrics.globalDrift, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of non-focus points. Smaller = more stable.' },
+                            { label: 'Neighbor Preservation', value: refineMetrics.neighborPreservation, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Fraction of post-refine low-D neighbors that are also high-D neighbors. ~5% global avg is normal for 512→2D.' },
+                            { label: 'Trustworthiness', value: refineMetrics.trustworthiness, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'How trustworthy are the low-D neighbors? T=1 means all low-D neighbors are valid high-D neighbors.' },
+                        ].map(({ label, value, format, tip }) => (
+                            <Tooltip key={label} title={tip} placement="left">
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'help' }}>
+                                    <span style={{ fontSize: 11, color: '#666' }}>{label}</span>
+                                    <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'monospace', color: '#1a1a1a' }}>
+                                        {format(value)}
+                                    </span>
+                                </div>
+                            </Tooltip>
+                        ))}
+                        {/* Mini bar: Focus Displacement vs Global Drift ratio */}
+                        <div style={{ marginTop: 4 }}>
+                            <div style={{ fontSize: 10, color: '#999', marginBottom: 2 }}>Focus / Drift ratio</div>
+                            <div style={{ height: 6, background: '#f0f0f0', borderRadius: 3, overflow: 'hidden' }}>
+                                <div style={{
+                                    height: '100%',
+                                    width: `${Math.min(100, refineMetrics.globalDrift > 0 ? Math.min(refineMetrics.focusDisplacement / (refineMetrics.focusDisplacement + refineMetrics.globalDrift) * 100, 100) : 100)}%`,
+                                    background: 'linear-gradient(90deg, #52c41a, #1890ff)',
+                                    borderRadius: 3,
+                                    transition: 'width 0.4s ease',
+                                }} />
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#aaa', marginTop: 1 }}>
+                                <span>focus</span><span>drift</span>
+                            </div>
+                        </div>
+                    </div>
+                ) : (
+                    <div style={{ fontSize: 11, color: '#aaa', textAlign: 'center', padding: '8px 0' }}>
+                        Run Update to see metrics
+                    </div>
+                )}
+            </FunctionalBlock>
             <FunctionalBlock label="Categories">
                 <ComponentBlock>
                     <div className="class-list">

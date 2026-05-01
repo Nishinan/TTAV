@@ -562,6 +562,115 @@ run("metrics cache path helper consistent & readable", test_metrics_cache)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 23. refine() 分层权重形状与范围验证
+# ══════════════════════════════════════════════════════════════════════════════
+def test_refine_edge_weights_shape_and_range():
+    """edge_weights 形状 = [M*k]，值域 (0,1]，焦点边均值 >= 邻居边均值"""
+    from sklearn.metrics import pairwise_distances_argmin_min
+    from sklearn.neighbors import NearestNeighbors as _NNS
+
+    np.random.seed(42)
+    feat = np.random.randn(10, 32).astype(np.float32)
+    n_focus = 2
+    k_local = 3
+    M = len(feat)
+
+    _nbrs = _NNS(n_neighbors=k_local + 1, algorithm='auto').fit(feat)
+    _, _nn_idx = _nbrs.kneighbors(feat, return_distance=True)
+    src_rows = np.repeat(np.arange(M), k_local)
+    tgt_rows = _nn_idx[:, 1:k_local + 1].flatten()
+
+    _, dist_to_focus = pairwise_distances_argmin_min(feat, feat[:n_focus])
+    sigma = float(np.median(dist_to_focus[n_focus:])) + 1e-8
+    node_weights = np.exp(-dist_to_focus / sigma)
+    edge_weights = np.sqrt(node_weights[src_rows] * node_weights[tgt_rows])
+
+    assert edge_weights.shape == (M * k_local,), \
+        f"Expected shape ({M * k_local},), got {edge_weights.shape}"
+    assert np.all(edge_weights > 0) and np.all(edge_weights <= 1.0 + 1e-6), \
+        f"Weights out of (0,1]: min={edge_weights.min():.4f}, max={edge_weights.max():.4f}"
+    # 焦点点发出的边 (src_rows < n_focus) 均值 >= 邻居点发出的边
+    focus_mean = edge_weights[src_rows < n_focus].mean()
+    neighbor_mean = edge_weights[src_rows >= n_focus].mean()
+    assert focus_mean >= neighbor_mean, \
+        f"Focus mean {focus_mean:.3f} should >= neighbor mean {neighbor_mean:.3f}"
+
+run("refine() edge_weights: 形状正确 + 焦点权重 >= 邻居权重", test_refine_edge_weights_shape_and_range)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 24. refine() L2 正则项在参数更新后 > 0
+# ══════════════════════════════════════════════════════════════════════════════
+def test_refine_l2_reg_nonzero_after_update():
+    """Adam 更新一步后参数改变，TemporalLoss 应 > 0"""
+    from visualize_model import VisModel
+    from losses import TemporalLoss
+
+    device = torch.device("cpu")
+    model = VisModel([32, 16, 2], [2, 16, 32])
+
+    # 快照参数（模拟 refine() 开始时的快照）
+    theta_0 = {name: param.data.clone() for name, param in model.named_parameters()}
+    l2_fn = TemporalLoss(theta_0, device)
+
+    # 做一次参数更新
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    x = torch.randn(8, 32)
+    emb_to, emb_from, recon_to, recon_from = model(x, x)
+    fake_loss = recon_to.mean()
+    optimizer.zero_grad()
+    fake_loss.backward()
+    optimizer.step()
+
+    # 参数改变后 L2 正则 > 0
+    l2_val = l2_fn(model)
+    assert l2_val.item() > 0, f"L2 reg should > 0 after update, got {l2_val.item()}"
+
+run("refine() L2 正则项在参数更新后 > 0", test_refine_l2_reg_nonzero_after_update)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 25. 分层权重 + L2 正则联合 backward 不报错
+# ══════════════════════════════════════════════════════════════════════════════
+def test_refine_weighted_l2_backward():
+    """模拟 refine() 完整训练步：分层权重 + L2 约束联合 backward 成功"""
+    from visualize_model import VisModel
+    from losses import SingleVisLoss, UmapLoss, ReconstructionLoss, TemporalLoss
+    from umap.umap_ import find_ab_params
+
+    device = torch.device("cpu")
+    _a, _b = find_ab_params(1.0, 0.1)
+    umap_fn = UmapLoss(5, device, _a, _b, repulsion_strength=1.0)
+    recon_fn = ReconstructionLoss(beta=1.0)
+    criterion = SingleVisLoss(umap_fn, recon_fn, lambd=1.0, negative_sample_rate=5)
+
+    model = VisModel([32, 16, 2], [2, 16, 32])
+    theta_0 = {n: p.data.clone() for n, p in model.named_parameters()}
+    l2_fn = TemporalLoss(theta_0, device)
+
+    B, D = 12, 32
+    edge_to   = torch.randn(B, D)
+    edge_from = torch.randn(B, D)
+    a_dummy   = torch.ones(B, D)
+    # 模拟分层权重：前4条是焦点边 (w≈1.0)，后8条是邻居边 (w 衰减)
+    edge_weights = torch.cat([torch.ones(4), torch.exp(-torch.linspace(0.5, 2.0, 8))])
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    model.train()
+    optimizer.zero_grad()
+    outputs = model(edge_to, edge_from)
+    _, _, loss_local = criterion(edge_to, edge_from, a_dummy, a_dummy, outputs,
+                                 weights=edge_weights)
+    l2_reg = l2_fn(model)
+    loss_total = loss_local + 0.02 * l2_reg
+    loss_total.backward()   # 不应抛出异常
+    optimizer.step()
+    assert loss_total.item() > 0, f"loss_total should > 0, got {loss_total.item()}"
+
+run("分层权重 + L2 正则联合 backward 成功", test_refine_weighted_l2_backward)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "═" * 60)

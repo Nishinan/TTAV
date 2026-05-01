@@ -331,7 +331,7 @@ def update_projection_neighbors_incremental(
     index_dict = load_or_create_index(content_path)
     index_list = index_dict['train'] + index_dict['test']
 
-    # Load the updated refined projection
+    # Load the updated refined projection (already re-ordered by load_projection)
     projection_list = load_projection(content_path, vis_method, vis_id, epoch, refine_flag=True)
     proj = np.array(projection_list, dtype='float32')
 
@@ -348,16 +348,24 @@ def update_projection_neighbors_incremental(
             neighbors = json.load(f)
     else:
         # Baseline cache not ready — fall back to full search (one-time cost)
-        _, all_indices = index.search(proj, max_neighbors + 1)
-        neighbors = [[int(all_indices[i][j]) for j in range(1, max_neighbors + 1)]
+        _, all_nn = index.search(proj, max_neighbors + 1)
+        neighbors = [[int(all_nn[i][j]) for j in range(1, max_neighbors + 1)]
                      for i in range(len(proj))]
 
-    # Patch only patched_indices rows with fresh faiss queries (~8ms for 20 pts)
-    query = proj[patched_indices]
-    _, nn = index.search(query, max_neighbors + 1)
-    for local_i, global_i in enumerate(patched_indices):
-        neighbors[global_i] = [int(nn[local_i][j]) for j in range(1, max_neighbors + 1)
-                                if int(nn[local_i][j]) != global_i][:max_neighbors]
+    # patched_indices are raw data indices (row numbers in the original .npy file).
+    # load_projection re-orders by index_list, so proj[pos] corresponds to
+    # the data point with original index index_list[pos].
+    # Build a reverse map: original_index → position in proj array.
+    orig_to_pos = {orig: pos for pos, orig in enumerate(index_list)}
+
+    # Patch only the rows that changed, translating raw indices → proj positions.
+    proj_positions = [orig_to_pos[gi] for gi in patched_indices if gi in orig_to_pos]
+    if proj_positions:
+        query = proj[proj_positions]
+        _, nn = index.search(query, max_neighbors + 1)
+        for local_i, proj_pos in enumerate(proj_positions):
+            neighbors[proj_pos] = [int(nn[local_i][j]) for j in range(1, max_neighbors + 1)
+                                   if int(nn[local_i][j]) != proj_pos][:max_neighbors]
 
     # Write the patched list to the refined disk cache
     cache_path = _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, True)

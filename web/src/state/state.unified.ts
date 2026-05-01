@@ -86,6 +86,14 @@ export type BaseMutableGlobalStore = {
     rawData: string;
     shownDoc: string;
     shownCode: string;
+
+    // Refine quality metrics (populated after each refine)
+    refineMetrics: {
+        focusDisplacement: number;
+        globalDrift: number;
+        neighborPreservation: number;
+        trustworthiness: number;
+    } | null;
 };
 
 export let initMutableGlobalStore: BaseMutableGlobalStore = {
@@ -151,7 +159,10 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     // Raw data for detail views
     rawData: "",
     shownDoc: '',
-    shownCode: ''
+    shownCode: '',
+
+    // Refine quality metrics
+    refineMetrics: null,
 };
 
 type SetFunction<T> = (setState: (state: T) => T | Partial<T>) => void;

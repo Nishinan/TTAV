@@ -175,6 +175,24 @@ class TimeVis(StrategyAbstractClass):
         if current_epoch is None:
             current_epoch = available_epochs[-1]
 
+        # --- 0. Hot-load ablation config from project root (no server restart) --
+        import json
+        _ablation_cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))), "ablation_config.json"
+        )
+        _ab_sigma_mode = "adaptive"
+        _ab_lambda_reg = None   # None → use _lambda_reg_map defaults below
+        if os.path.exists(_ablation_cfg_path):
+            try:
+                with open(_ablation_cfg_path) as _f:
+                    _ab = json.load(_f)
+                _ab_sigma_mode = _ab.get("sigma_mode", "adaptive")
+                _ab_lambda_reg = _ab.get("lambda_reg", None)
+                print(f"[TimeVis] refine cfg: sigma_mode={_ab_sigma_mode}, lambda_reg={_ab_lambda_reg}")
+            except Exception:
+                pass  # malformed JSON → fall through to defaults
+
         # --- 1. Ensure model weights are loaded (load path) -------------------
         if not hasattr(self, '_model_loaded'):
             model_path = os.path.join(
@@ -218,7 +236,7 @@ class TimeVis(StrategyAbstractClass):
         from sklearn.neighbors import NearestNeighbors as _NNS
         k_local = min(5, len(all_indices) - 1)
         _nbrs = _NNS(n_neighbors=k_local + 1, algorithm='auto').fit(feat)
-        _, _nn_idx = _nbrs.kneighbors(feat)   # shape [M, k_local+1]
+        _dist_mat, _nn_idx = _nbrs.kneighbors(feat, return_distance=True)   # shape [M, k_local+1]
 
         # _nn_idx[:,0] is self → skip; columns 1.. are true neighbors
         src_rows = np.repeat(np.arange(len(all_indices)), k_local)   # [M*k]
@@ -228,16 +246,45 @@ class TimeVis(StrategyAbstractClass):
         edge_from = feat_t[tgt_rows].to(self.device)   # [M*k, D]
         a_dummy   = torch.ones(edge_to.shape[0], edge_to.shape[1], device=self.device)
 
-        # --- 4. Fine-tune with correct local UMAP loss -----------------------
-        # edge_to / edge_from are genuine high-D neighbor pairs → UmapLoss now
-        # produces a meaningful attract/repel gradient for the focus region.
+        # --- Plan A: Hierarchical distance-decay weights ----------------------
+        n_focus = len(focus_indices)
+        if _ab_sigma_mode == "adaptive" and n_focus > 0 and n_focus < len(feat):
+            from sklearn.metrics import pairwise_distances_argmin_min
+            _, dist_to_focus = pairwise_distances_argmin_min(feat, feat[:n_focus])
+            sigma = float(np.median(dist_to_focus[n_focus:])) + 1e-8
+            node_weights = np.exp(-dist_to_focus / sigma)
+        else:
+            node_weights = np.ones(len(feat), dtype=np.float32)   # uniform (ablation baseline)
+        edge_weights   = np.sqrt(node_weights[src_rows] * node_weights[tgt_rows])
+        edge_weights_t = torch.from_numpy(edge_weights.astype(np.float32)).to(self.device)
+
+        # --- Plan B: Normalised L2 parameter drift constraint -----------------
+        theta_0 = {name: param.data.clone()
+                   for name, param in self.visualize_model.named_parameters()}
+        num_params = sum(p.numel() for p in self.visualize_model.parameters())
+        _lambda_reg_map = {"fine": 1.0, "balanced": 0.5, "coarse": 0.1}
+        focus_mode_now = getattr(self, 'ttav_mode', 'coarse')
+        lambda_reg = _ab_lambda_reg if _ab_lambda_reg is not None \
+                     else _lambda_reg_map.get(focus_mode_now, 0.1)
+
+        def _l2_reg():
+            reg = torch.tensor(0., device=self.device)
+            for name, param in self.visualize_model.named_parameters():
+                reg = reg + torch.sum(torch.square(param - theta_0[name]))
+            return reg / num_params 
+
+        # --- 4. Fine-tune with hierarchical weights + L2 constraint ------------
         optimizer = torch.optim.Adam(self.visualize_model.parameters(), lr=0.001)
         self.visualize_model.train()
         for _ in range(5):
             optimizer.zero_grad()
             outputs = self.visualize_model(edge_to, edge_from)
-            _, _, loss = self.criterion(edge_to, edge_from, a_dummy, a_dummy, outputs)
-            loss.backward()
+            _, _, loss_local = self.criterion(
+                edge_to, edge_from, a_dummy, a_dummy, outputs, weights=edge_weights_t
+            )
+            l2_reg = _l2_reg()
+            loss_total = loss_local + lambda_reg * l2_reg
+            loss_total.backward()
             optimizer.step()
             if time.time() - start_time > 0.6:
                 break
@@ -280,36 +327,234 @@ class TimeVis(StrategyAbstractClass):
         # Store all_indices so patch_other_epochs() can reuse them without re-running kNN.
         self._last_refine_indices = all_indices
 
+        # --- 6. Background ablation (non-blocking) ----------------------------
+        if os.path.exists(_ablation_cfg_path):
+            try:
+                with open(_ablation_cfg_path) as _f:
+                    _ab_full = json.load(_f)
+                if _ab_full.get("ablation_enabled", False):
+                    import threading, copy
+                    _ab_model_copy = copy.deepcopy(self.visualize_model)
+                    # Pass full-dataset features and the on-disk baseline projection
+                    _full_feat = self.data_provider.get_representation(current_epoch)
+                    _baseline_proj_path = os.path.join(
+                        content_path, 'visualize', f"{vis_method}_{vis_id}",
+                        'epochs', f'epoch_{current_epoch}', 'projection.npy'
+                    )
+                    _ab_thread = threading.Thread(
+                        target=self._run_ablation_background,
+                        args=(_ab_full, _ab_model_copy, current_epoch,
+                              content_path, _full_feat, _baseline_proj_path,
+                              _ablation_cfg_path),
+                        daemon=True,
+                    )
+                    _ab_thread.start()
+                    print("[TimeVis] Background ablation started.")
+            except Exception as _e:
+                print(f"[TimeVis] Ablation launch failed: {_e}")
+
+    def _run_ablation_background(self, ab_cfg, ab_model, epoch,
+                                 content_path, full_feat, baseline_proj_path, cfg_path):
+        """
+        Run multiple ablation configs in a background thread using an independent
+        model copy. Results are appended to ablation_results.json next to cfg_path.
+
+        full_feat           : full-dataset high-D features  [N, D]
+        baseline_proj_path  : path to the on-disk baseline projection.npy [N, 2]
+                              used as proj_before so global_drift is meaningful.
+        """
+        import json, time, os, traceback
+        import numpy as np
+        import torch
+        from sklearn.neighbors import NearestNeighbors
+        from sklearn.metrics import pairwise_distances_argmin_min
+        try:
+            self.__run_ablation_inner(ab_cfg, ab_model, epoch, content_path,
+                                      full_feat, baseline_proj_path, cfg_path)
+        except Exception:
+            print(f"[Ablation] ERROR:\n{traceback.format_exc()}")
+
+    def __run_ablation_inner(self, ab_cfg, ab_model, epoch,
+                             content_path, full_feat, baseline_proj_path, cfg_path):
+        import json, time, os
+        import numpy as np
+        import torch
+        from sklearn.neighbors import NearestNeighbors
+        from sklearn.metrics import pairwise_distances_argmin_min
+
+        n_pts   = ab_cfg.get("n_random_points", 20)
+        configs = ab_cfg.get("configs", [])
+        if not configs:
+            return
+
+        n_total = len(full_feat)
+
+        # Fix 1: proj_before = on-disk baseline, not model inference
+        # This matches what the real refine() uses as its starting point.
+        if not os.path.exists(baseline_proj_path):
+            print(f"[Ablation] baseline projection not found: {baseline_proj_path}, aborting.")
+            return
+        proj_before = np.load(baseline_proj_path)   # [N, 2]
+
+        # Fix 2: random focus points are global indices into full_feat
+        rng           = np.random.default_rng(seed=42)
+        focus_indices = rng.choice(n_total, size=min(n_pts, n_total),
+                                   replace=False).tolist()
+
+        vis_method = self.config['vis_method']
+        vis_id     = self.config['vis_id']
+        model_path = os.path.join(content_path, 'visualize',
+                                  f"{vis_method}_{vis_id}", 'vis_model.pth')
+
+        # Pre-compute high-D neighbors once (shared across configs)
+        k_m     = 10
+        hd_nbrs = NearestNeighbors(n_neighbors=k_m + 1).fit(full_feat)
+        _, hd_idx = hd_nbrs.kneighbors(full_feat)   # [N, k+1]
+
+        run_results = []
+        for cfg in configs:
+            t0 = time.time()
+
+            # Reset to checkpoint so every config starts from identical weights
+            ckpt = torch.load(model_path, map_location=self.device)
+            ab_model.load_state_dict(ckpt['state_dict'])
+
+            # Build local subset (focus + kNN neighbors) using full_feat
+            k_nb  = min(16, n_total - 1)
+            nbrs  = NearestNeighbors(n_neighbors=k_nb, algorithm='auto').fit(full_feat)
+            _, nn_idx = nbrs.kneighbors(full_feat[focus_indices])
+            collected = set(nn_idx.flatten().tolist()) - set(focus_indices)
+            neighbor_indices = list(collected)[:15 * len(focus_indices)]
+            all_idx  = list(focus_indices) + neighbor_indices
+
+            sub_feat = full_feat[all_idx]             # [M, D]
+            sub_t    = torch.from_numpy(sub_feat).float()
+            k_local  = min(5, len(all_idx) - 1)
+            _nbrs2   = NearestNeighbors(n_neighbors=k_local + 1).fit(sub_feat)
+            _nn_idx2 = _nbrs2.kneighbors(sub_feat, return_distance=False)
+            src_rows = np.repeat(np.arange(len(all_idx)), k_local)
+            tgt_rows = _nn_idx2[:, 1:k_local + 1].flatten()
+
+            edge_to   = sub_t[src_rows].to(self.device)
+            edge_from = sub_t[tgt_rows].to(self.device)
+            a_dummy   = torch.ones(edge_to.shape[0], edge_to.shape[1], device=self.device)
+
+            # Sigma mode (operates on sub_feat local indices — correct)
+            sigma_mode = cfg.get("sigma_mode", "adaptive")
+            n_focus    = len(focus_indices)
+            if sigma_mode == "adaptive" and n_focus > 0 and n_focus < len(sub_feat):
+                _, dist_to_focus = pairwise_distances_argmin_min(sub_feat, sub_feat[:n_focus])
+                sigma        = float(np.median(dist_to_focus[n_focus:])) + 1e-8
+                node_weights = np.exp(-dist_to_focus / sigma)
+            else:
+                node_weights = np.ones(len(sub_feat), dtype=np.float32)
+            edge_w   = np.sqrt(node_weights[src_rows] * node_weights[tgt_rows])
+            edge_w_t = torch.from_numpy(edge_w.astype(np.float32)).to(self.device)
+
+            # Lambda
+            lambda_reg = float(cfg.get("lambda_reg", 0.1))
+            theta_0    = {n: p.data.clone() for n, p in ab_model.named_parameters()}
+            num_params = sum(p.numel() for p in ab_model.parameters())
+
+            def _l2(model=ab_model, t0=theta_0, n=num_params):
+                reg = torch.tensor(0., device=self.device)
+                for name, param in model.named_parameters():
+                    reg = reg + torch.sum(torch.square(param - t0[name]))
+                return reg / n
+
+            n_steps = ab_cfg.get("n_steps", 5)
+            optimizer = torch.optim.Adam(ab_model.parameters(), lr=0.001)
+            ab_model.train()
+            for _ in range(n_steps):
+                optimizer.zero_grad()
+                outputs = ab_model(edge_to, edge_from)
+                _, _, loss_local = self.criterion(
+                    edge_to, edge_from, a_dummy, a_dummy, outputs, weights=edge_w_t
+                )
+                (loss_local + lambda_reg * _l2()).backward()
+                optimizer.step()
+
+            # Full inference on full_feat → proj_after [N, 2]
+            ab_model.eval()
+            with torch.no_grad():
+                proj_after = ab_model.encoder(
+                    torch.from_numpy(full_feat).float().to(self.device)
+                ).cpu().numpy()
+
+            # Metrics (all indices are global into full_feat / proj_*)
+            focus_set    = set(focus_indices)
+            non_focus    = [i for i in range(n_total) if i not in focus_set]
+            focus_disp   = float(np.mean([
+                np.linalg.norm(proj_after[i] - proj_before[i]) for i in focus_indices
+            ]))
+            global_drift = float(np.mean([
+                np.linalg.norm(proj_after[i] - proj_before[i]) for i in non_focus
+            ])) if non_focus else 0.0
+
+            # NP: low-D neighbors from proj_after (global), high-D from full_feat (global)
+            ld_nbrs   = NearestNeighbors(n_neighbors=k_m + 1).fit(proj_after)
+            _, ld_idx = ld_nbrs.kneighbors(proj_after)
+            np_scores = []
+            for i in focus_indices:
+                hd_set  = set(int(hd_idx[i, j]) for j in range(1, k_m + 1))
+                ld_list = [int(ld_idx[i, j]) for j in range(1, k_m + 1)]
+                np_scores.append(len([x for x in ld_list if x in hd_set]) / k_m)
+
+            avg_np  = float(np.mean(np_scores)) * 100
+            elapsed = time.time() - t0
+            run_results.append({
+                "config":               cfg["name"],
+                "sigma_mode":           sigma_mode,
+                "lambda_reg":           lambda_reg,
+                "focus_displacement":   round(focus_disp,   5),
+                "global_drift":         round(global_drift,  5),
+                "neighbor_preservation":round(avg_np,        2),
+                "elapsed_s":            round(elapsed,       2),
+            })
+            print(f"[Ablation] {cfg['name']:20s}  FocusDisp={focus_disp:.4f}  "
+                  f"GlobalDrift={global_drift:.5f}  NP={avg_np:.1f}%  t={elapsed:.1f}s")
+
+        # Write results
+        results_path = os.path.join(os.path.dirname(cfg_path), "ablation_results.json")
+        record = {
+            "timestamp":    time.strftime("%Y-%m-%d %H:%M:%S"),
+            "epoch":        epoch,
+            "n_points":     n_pts,
+            "focus_sample": focus_indices[:10],   # first 10 for reference
+            "runs":         run_results,
+        }
+        existing = []
+        if os.path.exists(results_path):
+            try:
+                with open(results_path) as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = []
+        existing.append(record)
+        with open(results_path, "w") as f:
+            json.dump(existing, f, indent=2)
+        print(f"[Ablation] Results saved → {results_path}")
+
     def _patch_epoch(self, epoch, all_indices):
-        """Write a subset-patched projection for one epoch. Safe to call from background thread."""
+        """Write a full re-projection for one epoch using the current (refined) model weights."""
         import numpy as np, os, torch
 
         vis_method = self.config['vis_method']
         vis_id     = self.config['vis_id']
         content_path = self.config['content_path']
 
-        baseline_path = os.path.join(
-            content_path, 'visualize', f"{vis_method}_{vis_id}",
-            'epochs', f'epoch_{epoch}', 'projection.npy'
-        )
         refined_dir = os.path.join(
             content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
             'epochs', f'epoch_{epoch}'
         )
 
-        if os.path.exists(baseline_path):
-            full_proj = np.load(baseline_path).copy()
-        else:
-            return  # no baseline for this epoch, skip silently
-
         self.visualize_model.eval()
         with torch.no_grad():
-            sub_feat = self.data_provider.get_representation(epoch)[all_indices]
-            sub_emb  = self.visualize_model.encoder(
-                torch.from_numpy(sub_feat).float().to(self.device)
+            full_feat = self.data_provider.get_representation(epoch)
+            full_proj = self.visualize_model.encoder(
+                torch.from_numpy(full_feat).float().to(self.device)
             ).cpu().numpy()
 
-        full_proj[all_indices] = sub_emb
         os.makedirs(refined_dir, exist_ok=True)
         np.save(os.path.join(refined_dir, 'projection.npy'), full_proj)
 

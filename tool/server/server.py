@@ -125,13 +125,12 @@ def update_focus_context():
                 current_epoch=current_epoch,
                 epochs_to_update=10
             )
-            # Incrementally update kNN for only the patched points (~20 pts, ~15ms).
-            # This avoids a full 30k-point recompute while keeping the neighbor list fresh.
+            # Full re-projection: all points may have moved, so invalidate the
+            # projection-neighbor cache so the next request rebuilds it from scratch.
             if current_epoch is not None:
                 vis_id = active_session["vis_id"]
-                patched = getattr(strategy, '_last_refine_indices', selected_indices)
-                update_projection_neighbors_incremental(
-                    content_path, vis_method, vis_id, current_epoch, patched
+                invalidate_projection_neighbors_cache(
+                    content_path, vis_method, vis_id, current_epoch
                 )
             print("Refinement finished. Refined projections saved to _refined directory.")
             # Patch remaining epochs in the background so switching epochs also shows refined results.
