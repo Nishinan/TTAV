@@ -138,7 +138,14 @@ def update_focus_context():
         else:
             visualizer.visualize_all_epochs()
 
-        return jsonify({"status": "success"})
+        # Return backend-computed metrics (full-dataset exact computation)
+        return jsonify({
+            "status": "success",
+            "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
+            "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
+            "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
+            "continuity":            getattr(strategy, '_last_refine_cont',   None),
+        })
 
     except Exception as e:
         import traceback
@@ -622,7 +629,7 @@ if __name__ == "__main__":
 
     if not is_dev_mode:
         # use_reloader=True: werkzeug auto-restarts on any .py file change (no extra deps)
-        app.run(host=host, port=port, threaded=True, use_reloader=True)
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
     else:
         from livereload import Server
         from flask_debugtoolbar import DebugToolbarExtension

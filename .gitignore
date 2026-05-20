@@ -314,6 +314,12 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
+# Ablation experiment outputs (local only, not versioned)
+tests/ablation_config.json
+tests/ablation_results.json
+tests/ablation_plot.png
+tests/ablation_trend.png
+
 # Claude Code / AI tool files
 .claude/
 AGENTS.md
@@ -328,3 +334,10 @@ ppt.md
 ppt_*.md
 prompt.md
 TTAV_*.pdf
+
+/artifacts
+/scripts
+/tests
+en.txt
+environment.txt
+TTAV_Huawei_*.*

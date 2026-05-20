@@ -671,6 +671,133 @@ run("分层权重 + L2 正则联合 backward 成功", test_refine_weighted_l2_ba
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 26. 锚点约束 refine：L_attract + L_repel + L_anchor 联合 backward 不报错
+# ══════════════════════════════════════════════════════════════════════════════
+def test_anchor_constrained_refine_backward():
+    """Simulate the new anchor-constrained refine loop: three-loss backward passes without error."""
+    from visualize_model import VisModel
+
+    device = torch.device("cpu")
+    D, N = 32, 100
+    n_focus, k_hd, n_neg, n_anchors = 3, 5, 20, 30
+
+    model = VisModel([D, 16, 2], [2, 16, D])
+
+    # Freeze all but last 2 linear layers of encoder (mirrors refine logic)
+    encoder_layers = list(model.encoder.children())
+    trainable_params = []
+    linear_count = 0
+    for layer in reversed(encoder_layers):
+        if isinstance(layer, torch.nn.Linear):
+            for p in layer.parameters():
+                p.requires_grad = True
+            trainable_params += list(layer.parameters())
+            linear_count += 1
+            if linear_count >= 2:
+                break
+    for name, param in model.named_parameters():
+        if param.requires_grad and not any(param is tp for tp in trainable_params):
+            param.requires_grad = False
+
+    weight_backup = {id(p): p.data.clone() for p in trainable_params}
+
+    full_feat = torch.randn(N, D)
+    focus_feat_t  = full_feat[:n_focus]
+    anchor_feat_t = full_feat[n_focus:n_focus + n_anchors]
+    anchor_z0_t   = torch.randn(n_anchors, 2)
+    neg_feat_t    = full_feat[n_focus + n_anchors:n_focus + n_anchors + n_neg]
+    focus_hd_nbr_feats = [full_feat[n_focus + n_anchors + n_neg + i*k_hd :
+                                     n_focus + n_anchors + n_neg + (i+1)*k_hd]
+                          for i in range(n_focus)]
+    margin_m = 1.0
+
+    optimizer = torch.optim.Adam(trainable_params, lr=0.005)
+    model.train()
+
+    for step in range(3):
+        optimizer.zero_grad()
+        z_neg     = model.encoder(neg_feat_t)
+        z_anchors = model.encoder(anchor_feat_t)
+        l_attract = torch.tensor(0.)
+        l_repel   = torch.tensor(0.)
+        for idx, fi_nbr in enumerate(focus_hd_nbr_feats):
+            z_i    = model.encoder(focus_feat_t[idx].unsqueeze(0))
+            z_nbrs = model.encoder(fi_nbr)
+            l_attract = l_attract + (z_i - z_nbrs).pow(2).sum(dim=1).mean()
+            dist_repel = (z_i - z_neg).pow(2).sum(dim=1).sqrt()
+            hinge = torch.clamp(margin_m - dist_repel, min=0.0)
+            l_repel = l_repel + hinge.pow(2).mean()
+        l_attract = l_attract / n_focus
+        l_repel   = l_repel   / n_focus
+        l_anchor  = (z_anchors - anchor_z0_t).pow(2).sum(dim=1).mean()
+        loss = l_attract + 1.0 * l_repel + 10.0 * l_anchor
+        loss.backward()
+        optimizer.step()
+
+    assert l_attract.item() >= 0, "L_attract must be non-negative"
+    assert l_anchor.item()  >= 0, "L_anchor must be non-negative"
+
+    # Verify weight restoration works correctly
+    with torch.no_grad():
+        for p in trainable_params:
+            p.data.copy_(weight_backup[id(p)])
+    for param in model.parameters():
+        param.requires_grad = True
+
+    for p, backed in zip(trainable_params, weight_backup.values()):
+        assert torch.allclose(p.data, backed), "Weight restoration failed"
+
+run("锚点约束 refine：三项损失联合 backward + 权重恢复正确", test_anchor_constrained_refine_backward)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 27. 锚点采样：不与焦点邻域重叠
+# ══════════════════════════════════════════════════════════════════════════════
+def test_anchor_sampling_no_overlap():
+    """Anchor indices must not overlap with focus+neighbor indices."""
+    import numpy as np
+    rng = np.random.default_rng(seed=42)
+    N = 500
+    all_indices = list(range(20))   # focus + neighbors
+    exclude_set = set(all_indices)
+    candidates = [i for i in range(N) if i not in exclude_set]
+    anchor_indices = rng.choice(candidates, size=100, replace=False).tolist()
+    assert set(anchor_indices).isdisjoint(exclude_set), \
+        "Anchor set must not overlap with focus neighborhood"
+    assert len(anchor_indices) == 100
+
+run("锚点采样：不与焦点邻域重叠", test_anchor_sampling_no_overlap)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 28. 自适应 margin：单焦点和多焦点两条路径均返回正值
+# ══════════════════════════════════════════════════════════════════════════════
+def test_adaptive_margin_positive():
+    """margin_m must be > 0 for both single and multi-focus cases."""
+    import numpy as np
+    from sklearn.metrics import pairwise_distances
+
+    # Multi-focus case
+    focus_z0 = np.random.randn(5, 2).astype(np.float32)
+    _pdist = pairwise_distances(focus_z0)
+    _upper = _pdist[np.triu_indices(5, k=1)]
+    margin_multi = float(np.median(_upper))
+    margin_multi = max(margin_multi, 0.1)
+    assert margin_multi > 0, f"Multi-focus margin must be > 0, got {margin_multi}"
+
+    # Single-focus case
+    full_proj = np.random.randn(100, 2).astype(np.float32)
+    focus_z0_single = full_proj[0:1]
+    _dists = np.linalg.norm(full_proj - focus_z0_single[0], axis=1)
+    _dists[0] = np.inf
+    margin_single = float(np.sort(_dists)[5])
+    margin_single = max(margin_single, 0.1)
+    assert margin_single > 0, f"Single-focus margin must be > 0, got {margin_single}"
+
+run("自适应 margin：单焦点和多焦点路径均返回正值", test_adaptive_margin_positive)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "═" * 60)

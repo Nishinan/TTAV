@@ -422,7 +422,12 @@ function MessageHandler() {
     ) => {
         try {
             logWithTimestamp(`[TTAV] Start loading visualization: ${visualizationID}`);
-            
+
+            // Clear stale epoch data (e.g. from a previous refine) before loading fresh data.
+            // Without this, the old refined projectionNeighbors remain in the store while epochs
+            // load one-by-one, and the user may interact with stale data mid-load.
+            useGlobalStore.getState().setValue('allEpochData', {});
+
             const staticCtx = await initStaticContext(contentPath, dataType);
 
             // 同步所有静态上下文
@@ -615,11 +620,20 @@ export function AppCombinedView() {
 
                 const metrics = await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
                 if (metrics) {
+                    // All three quality metrics come from the backend — exact computation
+                    // over the full dataset using final encoder weights, not cached neighbors.
+                    const r = response as any;
+                    const backendNP    = r.neighbor_preservation;
+                    const backendMRH   = r.mean_rank_hd;
+                    const backendTrust = r.trustworthiness;
+                    const backendCont  = r.continuity;
                     useGlobalStore.getState().setValue('refineMetrics', {
                         focusDisplacement: metrics.avgFocusShift,
-                        globalDrift: metrics.avgGlobalDrift,
-                        neighborPreservation: metrics.avgNeighborConsistency,
-                        trustworthiness: metrics.avgTrustworthiness,
+                        globalDrift:       metrics.avgGlobalDrift,
+                        neighborPreservation: backendNP    != null ? backendNP    / 100 : metrics.avgNeighborConsistency,
+                        meanRankHD:           backendMRH   != null ? backendMRH          : 0,
+                        trustworthiness:      backendTrust != null ? backendTrust / 100 : metrics.avgTrustworthiness,
+                        continuity:           backendCont  != null ? backendCont  / 100 : 0,
                     });
                 }
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices, newEpochData.indexList || []);

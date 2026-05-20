@@ -244,10 +244,23 @@ export const ChartComponent = memo(() => {
         const idsByPos = prepared.dataPoints.map((p) => p.identifier as number);
         if (!tooltip) return { center: null, original: [], projection: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices } as any;
         const hoverId = tooltip.identifier as number;
+        // originalNeighbors stores raw dataset indices — posMap key is also raw index, direct match.
         const orig = (epochData.originalNeighbors?.[hoverId] ?? []).filter((nid) => posMap.has(nid));
-        const proj = (epochData.projectionNeighbors?.[hoverId] ?? []).filter((nid) => posMap.has(nid));
+        // projectionNeighbors stores array positions (faiss output order), not raw indices.
+        // Convert via indexList: indexList[arrayPos] = rawIdx.
+        const indexList: number[] = epochData.indexList ?? [];
+        const projRaw = (epochData.projectionNeighbors?.[hoverId] ?? []).map(
+            (arrayPos: number) => indexList.length > 0 ? indexList[arrayPos] : arrayPos
+        );
+        const proj = projRaw.filter((rawId: number) => posMap.has(rawId));
+        // After refine, epochData.projection is updated but tooltip.x/y still holds the
+        // stale hover coordinate. Always read the authoritative position from the projection array.
+        const latestCoord = epochData.projection?.[hoverId];
+        const center = latestCoord
+            ? { ...tooltip, x: latestCoord[0], y: latestCoord[1] }
+            : tooltip;
         return {
-            center: tooltip,
+            center,
             original: orig,
             projection: proj,
             dataX: prepared.simpleData.x as Float32Array,
@@ -359,6 +372,8 @@ export const ChartComponent = memo(() => {
                 if (pos == null) return;
                 const x = dataX[pos];
                 const y = dataY[pos];
+        
+
                 const loc = this.proxy.location(x, y);
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
                 line.setAttribute('x1', String(centerLoc.x));

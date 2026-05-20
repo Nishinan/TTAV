@@ -123,19 +123,75 @@ class SingleVisLoss(nn.Module):
         """
         embedding_to, embedding_from, recon_to, recon_from = outputs
 
-        # Standard UMAP loss with negative sampling (returns a scalar)
-        umap_l = self.umap_loss(embedding_to, embedding_from)
-
-        # Attention-weighted reconstruction loss (returns a scalar)
-        recon_l = self.recon_loss(edge_to, edge_from, recon_to, recon_from, a_to, a_from)
-
-        if weights is not None:
-            # TTAV weighted mode: scale by mean batch weight as an approximation,
-            # since UmapLoss and ReconstructionLoss return scalars, not per-sample values.
-            w = weights.mean()
-            loss = w * umap_l + self.lambd * w * recon_l
-        else:
+        # Standard path (no TTAV edge weighting): preserve legacy behavior.
+        if weights is None:
+            umap_l = self.umap_loss(embedding_to, embedding_from)
+            recon_l = self.recon_loss(edge_to, edge_from, recon_to, recon_from, a_to, a_from)
             loss = umap_l + self.lambd * recon_l
+            return umap_l, recon_l, loss
+
+        # Weighted TTAV path: apply true per-edge weighting instead of weights.mean().
+        w = weights.to(device=embedding_to.device, dtype=embedding_to.dtype).reshape(-1)
+        w = torch.clamp(w, min=0.0)
+        w_sum = torch.clamp(w.sum(), min=1e-12)
+
+        # --- Reconstruction: per-edge weighted aggregation ---
+        recon_to_term = torch.mean(
+            torch.multiply(torch.pow((1 + a_to), self.recon_loss._beta), torch.pow(edge_to - recon_to, 2)),
+            dim=1
+        )
+        recon_from_term = torch.mean(
+            torch.multiply(torch.pow((1 + a_from), self.recon_loss._beta), torch.pow(edge_from - recon_from, 2)),
+            dim=1
+        )
+        recon_per_edge = (recon_to_term + recon_from_term) / 2.0
+        recon_l = torch.sum(recon_per_edge * w) / w_sum
+
+        # --- UMAP: per-edge weighted aggregation (positive and negative pairs) ---
+        batch_size = embedding_to.shape[0]
+        neg_rate = self.umap_loss._negative_sample_rate
+
+        embedding_neg_to = torch.repeat_interleave(embedding_to, neg_rate, dim=0)
+        repeat_neg = torch.repeat_interleave(embedding_from, neg_rate, dim=0)
+        randperm = torch.randperm(repeat_neg.shape[0], device=repeat_neg.device)
+        embedding_neg_from = repeat_neg[randperm]
+
+        positive_distance = torch.norm(embedding_to - embedding_from, dim=1)
+        negative_distance = torch.norm(embedding_neg_to - embedding_neg_from, dim=1)
+        distance_embedding = torch.cat((positive_distance, negative_distance), dim=0)
+
+        probabilities_distance = convert_distance_to_probability(
+            distance_embedding, self.umap_loss.a, self.umap_loss.b
+        ).to(embedding_to.device)
+
+        num_neg_samples = embedding_neg_to.shape[0]
+        probabilities_graph = torch.cat(
+            (
+                torch.ones(batch_size, device=embedding_to.device, dtype=probabilities_distance.dtype),
+                torch.zeros(num_neg_samples, device=embedding_to.device, dtype=probabilities_distance.dtype),
+            ),
+            dim=0,
+        )
+
+        (_, _, ce_loss) = compute_cross_entropy(
+            probabilities_graph,
+            probabilities_distance,
+            repulsion_strength=self.umap_loss._repulsion_strength,
+        )
+
+        pos_ce = ce_loss[:batch_size]
+        neg_ce = ce_loss[batch_size:]
+
+        neg_w = torch.repeat_interleave(w, neg_rate, dim=0)
+        all_ce = torch.cat((pos_ce, neg_ce), dim=0)
+        all_w = torch.cat((w, neg_w), dim=0)
+        all_w_sum = torch.clamp(all_w.sum(), min=1e-12)
+        umap_l = torch.sum(all_ce * all_w) / all_w_sum
+
+        margin_loss = F.relu(torch.tensor(0.0, device=embedding_to.device, dtype=embedding_to.dtype) - positive_distance).mean()
+        umap_l = umap_l + margin_loss
+
+        loss = umap_l + self.lambd * recon_l
 
         return umap_l, recon_l, loss
 class HybridLoss(nn.Module):

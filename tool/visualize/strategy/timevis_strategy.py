@@ -143,7 +143,7 @@ class TimeVis(StrategyAbstractClass):
         self.ttav_mask = mask # Boolean mask on GPU
                 
     def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None,
-               current_epoch=None, epochs_to_update=10):
+               current_epoch=None, epochs_to_update=10, _skip_avg_benchmark=False):
         """
         Locally refine projections for a set of focus points.
 
@@ -179,7 +179,7 @@ class TimeVis(StrategyAbstractClass):
         import json
         _ablation_cfg_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))))), "ablation_config.json"
+                os.path.abspath(__file__))))), "tests", "ablation_config.json"
         )
         _ab_sigma_mode = "adaptive"
         _ab_lambda_reg = None   # None → use _lambda_reg_map defaults below
@@ -225,101 +225,303 @@ class TimeVis(StrategyAbstractClass):
 
         all_indices = list(focus_indices) + neighbor_indices
 
-        # --- 3. Gather features and build local high-D neighbor pairs ----------
-        # `feat[i]` is the high-dim representation of all_indices[i].
-        feat = self.data_provider.get_representation(current_epoch)[all_indices]
-        feat_t = torch.from_numpy(feat).float()
+        # --- 3. Gather full-dataset features and baseline projection ------------
+        full_feat = self.data_provider.get_representation(current_epoch)  # [N, D]
+        N = len(full_feat)
 
-        # Build (edge_to, edge_from) pairs from high-dim kNN within the subset.
-        # This gives UmapLoss a meaningful attract signal: pairs that are close
-        # in high-D should also be close in low-D.
-        from sklearn.neighbors import NearestNeighbors as _NNS
-        k_local = min(5, len(all_indices) - 1)
-        _nbrs = _NNS(n_neighbors=k_local + 1, algorithm='auto').fit(feat)
-        _dist_mat, _nn_idx = _nbrs.kneighbors(feat, return_distance=True)   # shape [M, k_local+1]
-
-        # _nn_idx[:,0] is self → skip; columns 1.. are true neighbors
-        src_rows = np.repeat(np.arange(len(all_indices)), k_local)   # [M*k]
-        tgt_rows = _nn_idx[:, 1:k_local + 1].flatten()               # [M*k]
-
-        edge_to   = feat_t[src_rows].to(self.device)   # [M*k, D]
-        edge_from = feat_t[tgt_rows].to(self.device)   # [M*k, D]
-        a_dummy   = torch.ones(edge_to.shape[0], edge_to.shape[1], device=self.device)
-
-        # --- Plan A: Hierarchical distance-decay weights ----------------------
-        n_focus = len(focus_indices)
-        if _ab_sigma_mode == "adaptive" and n_focus > 0 and n_focus < len(feat):
-            from sklearn.metrics import pairwise_distances_argmin_min
-            _, dist_to_focus = pairwise_distances_argmin_min(feat, feat[:n_focus])
-            sigma = float(np.median(dist_to_focus[n_focus:])) + 1e-8
-            node_weights = np.exp(-dist_to_focus / sigma)
-        else:
-            node_weights = np.ones(len(feat), dtype=np.float32)   # uniform (ablation baseline)
-        edge_weights   = np.sqrt(node_weights[src_rows] * node_weights[tgt_rows])
-        edge_weights_t = torch.from_numpy(edge_weights.astype(np.float32)).to(self.device)
-
-        # --- Plan B: Normalised L2 parameter drift constraint -----------------
-        theta_0 = {name: param.data.clone()
-                   for name, param in self.visualize_model.named_parameters()}
-        num_params = sum(p.numel() for p in self.visualize_model.parameters())
-        _lambda_reg_map = {"fine": 1.0, "balanced": 0.5, "coarse": 0.1}
-        focus_mode_now = getattr(self, 'ttav_mode', 'coarse')
-        lambda_reg = _ab_lambda_reg if _ab_lambda_reg is not None \
-                     else _lambda_reg_map.get(focus_mode_now, 0.1)
-
-        def _l2_reg():
-            reg = torch.tensor(0., device=self.device)
-            for name, param in self.visualize_model.named_parameters():
-                reg = reg + torch.sum(torch.square(param - theta_0[name]))
-            return reg / num_params 
-
-        # --- 4. Fine-tune with hierarchical weights + L2 constraint ------------
-        optimizer = torch.optim.Adam(self.visualize_model.parameters(), lr=0.001)
-        self.visualize_model.train()
-        for _ in range(5):
-            optimizer.zero_grad()
-            outputs = self.visualize_model(edge_to, edge_from)
-            _, _, loss_local = self.criterion(
-                edge_to, edge_from, a_dummy, a_dummy, outputs, weights=edge_weights_t
-            )
-            l2_reg = _l2_reg()
-            loss_total = loss_local + lambda_reg * l2_reg
-            loss_total.backward()
-            optimizer.step()
-            if time.time() - start_time > 0.6:
-                break
-
-        # --- 5. Subset-patch projection for current_epoch --------------------
-        # Load the baseline full projection (from the standard non-refined dir).
-        # Then overwrite ONLY the focus+neighbour rows with freshly computed
-        # encoder outputs.  Every other point is untouched → zero global drift.
         baseline_path = os.path.join(
             content_path, 'visualize', f"{vis_method}_{vis_id}",
             'epochs', f'epoch_{current_epoch}', 'projection.npy'
         )
-        refined_dir = os.path.join(
-            content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
-            'epochs', f'epoch_{current_epoch}'
-        )
-
-        # Always seed from the original baseline — never from _refined — to ensure
-        # each refine() call is idempotent and cannot accumulate drift over iterations.
         if os.path.exists(baseline_path):
-            full_proj = np.load(baseline_path).copy()
+            full_proj_baseline = np.load(baseline_path).copy()  # [N, 2]
         else:
-            # No baseline on disk (first-time / DVI per-epoch model not yet saved):
-            # fall back to full inference and warn.
-            print(f"[TimeVis] WARNING: baseline projection not found at {baseline_path}. "
-                  f"Falling back to full encoder inference — this will be slow.")
             self.visualize_model.eval()
             with torch.no_grad():
-                full_feat = self.data_provider.get_representation(current_epoch)
-                full_proj = self.visualize_model.encoder(
+                full_proj_baseline = self.visualize_model.encoder(
                     torch.from_numpy(full_feat).float().to(self.device)
                 ).cpu().numpy()
 
-        # Re-project only the local subset for current_epoch
+        # --- 3a. Load cached high-D neighbors for focus points ----------------
+        import json as _json
+        hd_cache_path = os.path.join(
+            content_path, 'epochs', f'epoch_{current_epoch}', 'hd_neighbors_10.json'
+        )
+        if os.path.exists(hd_cache_path):
+            with open(hd_cache_path) as _f:
+                hd_neighbors_all = _json.load(_f)  # list[list[int]], length N
+        else:
+            # Fallback: compute on-the-fly for focus points only
+            from sklearn.neighbors import NearestNeighbors as _NNS
+            _nbrs = _NNS(n_neighbors=11, algorithm='auto').fit(full_feat)
+            _, _nn_idx = _nbrs.kneighbors(full_feat)
+            hd_neighbors_all = [_nn_idx[i, 1:].tolist() for i in range(N)]
+
+        # Collect all high-D neighbor indices referenced by focus points
+        hd_nbr_set = set()
+        for fi in focus_indices:
+            hd_nbr_set.update(hd_neighbors_all[fi][:10])
+        hd_nbr_set -= set(focus_indices)
+        hd_neighbor_global = list(hd_nbr_set)  # global indices of HD neighbors
+
+        # --- 3b. Sample anchor points (global, excluding focus neighborhood) --
+        n_anchors = min(300, N - len(all_indices) - 1)
+        exclude_set = set(all_indices)
+        candidate_anchors = [i for i in range(N) if i not in exclude_set]
+        rng = np.random.default_rng(seed=42)
+        anchor_indices = rng.choice(candidate_anchors, size=n_anchors, replace=False).tolist()
+        anchor_feat_np = full_feat[anchor_indices]                    # [A, D]
+        anchor_z0      = full_proj_baseline[anchor_indices]           # [A, 2]
+
+        # --- 3c. Sample random negative examples (global, excluding HD neighbors) --
+        k_neg = 10
+        n_neg_per_focus = 5 * k_neg
+        neg_exclude = set(all_indices) | hd_nbr_set
+        neg_candidates = [i for i in range(N) if i not in neg_exclude]
+        n_neg_total = min(n_neg_per_focus * len(focus_indices), len(neg_candidates))
+        neg_indices = rng.choice(neg_candidates, size=n_neg_total, replace=False).tolist()
+        neg_feat_np = full_feat[neg_indices]                          # [n_neg, D]
+
+        # --- 3d. Compute adaptive margin m -----------------------------------
+        # Use the 90th-percentile of each focus point's top-20 LD distances ×1.5.
+        # The 90th-percentile (rather than median) gives a larger clearance so that
+        # non-neighbors must be pushed well beyond the local neighborhood boundary.
+        # A hard lower bound of 0.3 prevents the margin from collapsing in
+        # densely crowded regions, which would cause L_repel and L_attract to
+        # fight each other and prevent convergence.
+        focus_z0 = full_proj_baseline[focus_indices]                  # [|F|, 2]
+        _nbr_dists = []
+        for _fi in focus_indices:
+            _all_dists = np.linalg.norm(full_proj_baseline - full_proj_baseline[_fi], axis=1)
+            _all_dists[_fi] = np.inf
+            _nbr_dists.extend(np.sort(_all_dists)[:20].tolist())
+        margin_m = float(np.percentile(_nbr_dists, 90)) * 1.5
+        margin_m = max(margin_m, 0.3)
+
+        # Convert all feature arrays to tensors once
+        focus_feat_t   = torch.from_numpy(full_feat[focus_indices].copy()).float().to(self.device)
+        anchor_feat_t  = torch.from_numpy(anchor_feat_np).float().to(self.device)
+        anchor_z0_t    = torch.from_numpy(anchor_z0).float().to(self.device)
+        neg_feat_t     = torch.from_numpy(neg_feat_np).float().to(self.device)
+
+        # For each focus point, pre-build tensor of its HD neighbor features
+        # Shape: list of tensors, each [k_hd, D]
+        focus_hd_nbr_feats = []
+        for fi in focus_indices:
+            nbr_idx = hd_neighbors_all[fi][:10]
+            focus_hd_nbr_feats.append(
+                torch.from_numpy(full_feat[nbr_idx].copy()).float().to(self.device)
+            )
+
+        # --- 4. Fine-tune last two encoder layers with anchor constraint -------
+        # Freeze all encoder layers except the last two linear layers.
+        encoder_layers = list(self.visualize_model.encoder.children())
+        trainable_params = []
+        # Walk layers in reverse; collect params from the last 2 Linear layers.
+        linear_count = 0
+        for layer in reversed(encoder_layers):
+            if isinstance(layer, torch.nn.Linear):
+                for p in layer.parameters():
+                    p.requires_grad = True
+                trainable_params += list(layer.parameters())
+                linear_count += 1
+                if linear_count >= 2:
+                    break
+        # Freeze everything else
+        for name, param in self.visualize_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if not any(param is tp for tp in trainable_params):
+                param.requires_grad = False
+
+        # Backup weights of trainable layers for post-refine restoration
+        weight_backup = {id(p): p.data.clone() for p in trainable_params}
+
+        # Pre-batch all focus points and their HD neighbors for efficient forward pass.
+        # focus_hd_nbr_feats[i] has shape [k_hd, D]; stack into [n_focus*k_hd, D].
+        all_nbr_feat_t = torch.cat(focus_hd_nbr_feats, dim=0)  # [n_focus*k_hd, D]
+        k_hd_per_focus = [f.shape[0] for f in focus_hd_nbr_feats]
+
+        optimizer = torch.optim.Adam(trainable_params, lr=0.005)
+        self.visualize_model.train()
+
+        # In crowded regions (small margin) repulsion fights attraction — reduce it.
+        # margin >= 0.5: normal repulsion; margin < 0.3 (clamped floor): disable repulsion.
+        gamma_repel = float(np.clip((margin_m - 0.3) / 0.2, 0.0, 1.0))
+        mu_anchor   = 10.0  # anchor constraint weight
+
+        full_feat_t = torch.from_numpy(full_feat).float().to(self.device)
+
+        # Loss-convergence early stop: track L_attract over a sliding window.
+        # NP is meaningless as a stopping signal when 2-D cannot faithfully
+        # represent high-D neighborhoods (NP stays 0% even while the layout
+        # is genuinely improving). L_attract measures whether HD neighbors are
+        # still being pulled closer, which is the actual optimisation goal.
+        _loss_window  = []   # recent L_attract values
+        _WINDOW       = 20   # check over last 20 steps
+        _MIN_STEPS    = 100  # never stop before this
+        _REL_TOL      = 5e-4 # stop if (max-min)/max < tol over the window
+
+        for step in range(1000):
+            optimizer.zero_grad()
+
+            z_focus   = self.visualize_model.encoder(focus_feat_t)    # [n_focus, 2]
+            z_all_nbr = self.visualize_model.encoder(all_nbr_feat_t)  # [n_focus*k_hd, 2]
+            z_neg     = self.visualize_model.encoder(neg_feat_t)      # [n_neg, 2]
+            z_anchors = self.visualize_model.encoder(anchor_feat_t)   # [A, 2]
+
+            l_attract = torch.tensor(0., device=self.device)
+            l_repel   = torch.tensor(0., device=self.device)
+            nbr_offset = 0
+
+            for idx in range(len(focus_indices)):
+                k_i = k_hd_per_focus[idx]
+                z_i    = z_focus[idx].unsqueeze(0)               # [1, 2]
+                z_nbrs = z_all_nbr[nbr_offset:nbr_offset + k_i] # [k_i, 2]
+                nbr_offset += k_i
+
+                # Attract HD neighbors
+                l_attract = l_attract + (z_i - z_nbrs).pow(2).sum(dim=1).mean()
+
+                # Repel random negatives (fixed set, no full inference in loop)
+                dist_repel = (z_i - z_neg).pow(2).sum(dim=1).sqrt()
+                hinge = torch.clamp(margin_m - dist_repel, min=0.0)
+                l_repel = l_repel + hinge.pow(2).mean()
+
+            n_f = max(len(focus_indices), 1)
+            l_attract = l_attract / n_f
+            l_repel   = l_repel   / n_f
+
+            l_anchor = (z_anchors - anchor_z0_t).pow(2).sum(dim=1).mean()
+
+            loss_total = l_attract + gamma_repel * l_repel + mu_anchor * l_anchor
+            loss_total.backward()
+            optimizer.step()
+
+            _loss_window.append(l_attract.item())
+            if len(_loss_window) > _WINDOW:
+                _loss_window.pop(0)
+
+            if step % 50 == 0:
+                print(f"[TimeVis] step={step:4d}  L_attract={l_attract.item():.4f}  "
+                      f"L_anchor={l_anchor.item():.5f}  "
+                      f"t={time.time()-start_time:.1f}s")
+
+            # Loss-convergence early stop (only after _MIN_STEPS)
+            if step >= _MIN_STEPS and len(_loss_window) == _WINDOW:
+                _w_max = max(_loss_window)
+                _w_min = min(_loss_window)
+                if _w_max > 0 and (_w_max - _w_min) / _w_max < _REL_TOL:
+                    print(f"[TimeVis] Loss converged at step {step}: "
+                          f"L_attract range={_w_max-_w_min:.6f} < tol")
+                    break
+
+            if time.time() - start_time > 60.0:
+                print(f"[TimeVis] Time limit at step {step}")
+                break
+
+        # --- Compute T, C, NP for focus points using full-dataset distances ------
+        # z_eval was computed in the last NP-check iteration inside the loop.
+        # Re-compute here to ensure it uses the final model state.
+        self.visualize_model.eval()
+        with torch.no_grad():
+            z_final = self.visualize_model.encoder(full_feat_t)  # [N, 2]
+        z_np = z_final.cpu().numpy()  # [N, 2]
+
+        trust_sum = 0.0
+        cont_sum  = 0.0
+        np_sum    = 0.0
+        mrh_sum   = 0.0   # Mean Rank of HD neighbors in LD space (lower = better)
+
+        k = 10
+        # Extended neighborhood to compute meaningful ranks: top K_ext points
+        # gives penalty a real range instead of collapsing near zero.
+        K_ext = min(200, N - 1)
+
+        for fi_glob in focus_indices:
+            # High-dim ranks (argsort over all N, excluding self)
+            hd_feat_fi = full_feat[fi_glob]
+            hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
+            hd_dists[fi_glob] = np.inf
+            hd_rank = np.argsort(hd_dists)   # index array: hd_rank[r] = point at rank r
+
+            # Low-dim ranks
+            ld_dists = np.linalg.norm(z_np - z_np[fi_glob], axis=1)
+            ld_dists[fi_glob] = np.inf
+            ld_rank = np.argsort(ld_dists)
+
+            # Build rank lookup: point_idx → 1-based rank (only within K_ext)
+            # Used for T/C penalty computation (capped at K_ext for normalisation).
+            hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
+            ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
+
+            # Full LD rank lookup for MRH — must cover all N points so HD
+            # neighbors that landed far away in 2D get their true rank, not 201.
+            ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
+
+            hd_topk = set(hd_rank[:k].tolist())
+            ld_topk = set(ld_rank[:k].tolist())
+
+            # NP: strict top-k set intersection
+            np_sum += len(hd_topk & ld_topk) / k
+
+            # MRH: average LD rank of the HD top-k neighbors (full-range lookup).
+            # Ideal ≈ 5.5 (perfectly centred in top-10).
+            # Crowded-but-good: MRH ≈ 10–30 (just outside top-10 due to density).
+            # Truly bad projection: MRH >> 100.
+            mrh_sum += float(np.mean([
+                ld_rank_full[j] for j in hd_topk
+            ]))
+
+            # Trustworthiness: penalise fake low-D neighbors (in LD but not HD top-k)
+            # Penalty = HD rank - k; if HD rank > K_ext, use K_ext as conservative bound.
+            t_penalty = 0.0
+            for j in (ld_topk - hd_topk):
+                r_hd = hd_rank_of.get(j, K_ext + 1)
+                t_penalty += max(0, r_hd - k)
+
+            # Continuity: penalise missing HD neighbors (in HD but not LD top-k)
+            c_penalty = 0.0
+            for j in (hd_topk - ld_topk):
+                r_ld = ld_rank_of.get(j, K_ext + 1)
+                c_penalty += max(0, r_ld - k)
+
+            # Normalizer: worst-case penalty for one point with k fake neighbors,
+            # each at rank K_ext.  This gives T/C a meaningful [0,1] range
+            # for a single focus point rather than the global N-point formula.
+            worst = k * (K_ext - k)
+            trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
+            cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
+
+        n_f = max(len(focus_indices), 1)
+        final_np    = np_sum    / n_f * 100.0
+        final_mrh   = mrh_sum   / n_f          # raw rank number, not a percentage
+        final_trust = max(0.0, trust_sum / n_f * 100.0)
+        final_cont  = max(0.0, cont_sum  / n_f * 100.0)
+
+        self._last_refine_np    = final_np
+        self._last_refine_mrh   = final_mrh
+        self._last_refine_trust = final_trust
+        self._last_refine_cont  = final_cont
+
+        print(f"[TimeVis] Anchor-constrained refine done: "
+              f"steps={step+1}  NP={final_np:.1f}%  MRH={final_mrh:.1f}  "
+              f"T={final_trust:.1f}%  C={final_cont:.1f}%  "
+              f"margin={margin_m:.3f}  t={time.time()-start_time:.1f}s")
+
+        # --- 5. Full-inference projection for current_epoch --------------------
+        # Must run BEFORE weight restoration: _patch_epoch uses encoder forward
+        # pass with the currently refined weights to produce the high-NP projection.
         self._patch_epoch(current_epoch, all_indices)
+
+        # Restore trainable layer weights so model stays clean for next refine.
+        # Projection is already written to disk above, so restoration is safe here.
+        with torch.no_grad():
+            for p in trainable_params:
+                p.data.copy_(weight_backup[id(p)])
+        # Re-enable gradients for all parameters
+        for param in self.visualize_model.parameters():
+            param.requires_grad = True
 
         print(f"[TimeVis] Subset-patch refine finished in {time.time() - start_time:.2f}s "
               f"({len(all_indices)} points patched, epoch={current_epoch})")
@@ -352,6 +554,119 @@ class TimeVis(StrategyAbstractClass):
                     print("[TimeVis] Background ablation started.")
             except Exception as _e:
                 print(f"[TimeVis] Ablation launch failed: {_e}")
+
+        # --- 7. Refine-avg benchmark (background, non-blocking) ----------------
+        # Reads tests/refine_avg_config.json. When "enabled" is true, runs
+        # self.refine() independently on each test point (same code path as a
+        # real interactive refine), then writes the per-point NP/T/C and the
+        # running average to tests/refine_avg_results.json.
+        _avg_cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))), "tests", "refine_avg_config.json"
+        )
+        if not _skip_avg_benchmark and os.path.exists(_avg_cfg_path):
+            try:
+                with open(_avg_cfg_path) as _f:
+                    _avg_cfg = json.load(_f)
+                if _avg_cfg.get("enabled", False):
+                    import threading
+                    _avg_thread = threading.Thread(
+                        target=self._run_refine_avg_benchmark,
+                        args=(_avg_cfg, _avg_cfg_path, current_epoch),
+                        daemon=True,
+                    )
+                    _avg_thread.start()
+                    print("[TimeVis] refine-avg benchmark started in background.")
+            except Exception as _e:
+                print(f"[TimeVis] refine-avg launch failed: {_e}")
+
+    def _run_refine_avg_benchmark(self, avg_cfg, cfg_path, epoch):
+        """
+        Background benchmark: call self.refine() on each test point (identical
+        code path to an interactive refine), then write per-point NP/T/C and
+        the running average to the results file.
+        """
+        import json, time, os, traceback
+        import numpy as np
+
+        try:
+            content_path = self.config['content_path']
+            N = len(self.data_provider.get_representation(epoch))
+
+            # Determine test points: config-specified list or random sample
+            test_indices = avg_cfg.get("focus_indices", None)
+            if not test_indices:
+                n_pts = avg_cfg.get("n_points", 10)
+                rng   = np.random.default_rng(seed=avg_cfg.get("seed", 0))
+                test_indices = rng.choice(N, size=min(n_pts, N),
+                                          replace=False).tolist()
+
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))))
+            results_rel  = avg_cfg.get("results_path", "tests/refine_avg_results.json")
+            results_path = os.path.join(project_root, results_rel)
+
+            print(f"[TimeVis] refine-avg: running on {len(test_indices)} points "
+                  f"epoch={epoch} → {results_path}")
+
+            point_rows = []
+            for fi in test_indices:
+                # Call the real refine() for this single focus point.
+                # Weight backup/restore is already inside refine(), so every
+                # point starts from the same clean model state.
+                self.refine(
+                    focus_indices=[fi],
+                    neighbor_indices=[],
+                    current_epoch=epoch,
+                    _skip_avg_benchmark=True,
+                )
+                point_rows.append({
+                    "focus_idx": fi,
+                    "NP":  round(self._last_refine_np,    2),
+                    "MRH": round(self._last_refine_mrh,   2),
+                    "T":   round(self._last_refine_trust,  2),
+                    "C":   round(self._last_refine_cont,   2),
+                })
+                print(f"[TimeVis] refine-avg  point {fi:6d}  "
+                      f"NP={self._last_refine_np:.1f}%  "
+                      f"MRH={self._last_refine_mrh:.1f}  "
+                      f"T={self._last_refine_trust:.1f}%  "
+                      f"C={self._last_refine_cont:.1f}%")
+
+            avg_np  = float(np.mean([r["NP"]  for r in point_rows]))
+            avg_mrh = float(np.mean([r["MRH"] for r in point_rows]))
+            avg_t   = float(np.mean([r["T"]   for r in point_rows]))
+            avg_c   = float(np.mean([r["C"]   for r in point_rows]))
+
+            record = {
+                "timestamp":     time.strftime("%Y-%m-%d %H:%M:%S"),
+                "epoch":         epoch,
+                "focus_indices": test_indices,
+                "per_point":     point_rows,
+                "avg_NP":        round(avg_np,  2),
+                "avg_MRH":       round(avg_mrh, 2),
+                "avg_T":         round(avg_t,   2),
+                "avg_C":         round(avg_c,   2),
+            }
+
+            existing = []
+            if os.path.exists(results_path):
+                try:
+                    with open(results_path) as f:
+                        existing = json.load(f)
+                except Exception:
+                    existing = []
+            existing.append(record)
+            with open(results_path, "w") as f:
+                json.dump(existing, f, indent=2)
+
+            print(f"[TimeVis] refine-avg DONE: "
+                  f"avg NP={avg_np:.1f}%  MRH={avg_mrh:.1f}  "
+                  f"T={avg_t:.1f}%  C={avg_c:.1f}%  "
+                  f"({len(point_rows)} points)  → {results_path}")
+
+        except Exception:
+            print(f"[TimeVis] refine-avg benchmark ERROR:\n{traceback.format_exc()}")
 
     def _run_ablation_background(self, ab_cfg, ab_model, epoch,
                                  content_path, full_feat, baseline_proj_path, cfg_path):
