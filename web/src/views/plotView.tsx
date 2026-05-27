@@ -17,6 +17,45 @@ function logWithTimestamp(message: string): void {
     console.log(`${LOG_PREFIX}[${new Date().toISOString()}] ${message}`);
 }
 
+interface EIFJumpPayload {
+    source?: 'eif';
+    sampleId?: string;
+    contentPath?: string;
+    visMethod?: string;
+    visId?: string;
+    dataType?: 'Text' | 'Image';
+    taskType?: string;
+    selectedIndices?: number[];
+    targetIndex?: number;
+}
+
+function parseEIFJumpPayloadFromLocation(): EIFJumpPayload | null {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    const rawPayload = params.get('eif_jump');
+    if (!rawPayload) return null;
+
+    params.delete('eif_jump');
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+    window.history.replaceState({}, '', nextUrl);
+
+    try {
+        return JSON.parse(rawPayload) as EIFJumpPayload;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeSelectedIndices(value: number[] | undefined): number[] {
+    if (!Array.isArray(value)) return [];
+    const deduped = new Set<number>();
+    value.forEach((idx) => {
+        if (Number.isInteger(idx) && idx >= 0) deduped.add(idx);
+    });
+    return Array.from(deduped).sort((a, b) => a - b);
+}
+
 // // 1. 定义接口，明确告诉 TypeScript 这个组件接受什么属性
 // interface FunctionViewPanelsProps {
 //     onFocusModeChange: (mode: string) => Promise<void>;
@@ -345,11 +384,11 @@ function MessageHandler() {
     const {
         setContentPath, setAvailableEpochs, setDataType, setTaskType,
         setTextData, setTokenList, setInherentLabelData,
-        setColorDict, setLabelDict, setProgress, setValue,
+        setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices,
     } = useDefaultStore([
         'setContentPath', 'setAvailableEpochs', 'setDataType', 'setTaskType',
         'setTextData', 'setTokenList', 'setInherentLabelData',
-        'setColorDict', 'setLabelDict', 'setProgress', 'setValue'
+        'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices'
     ]);
 
     // Start visualizing process
@@ -402,6 +441,8 @@ function MessageHandler() {
             message.success({ content: 'Backend Session Resumed!', key: 'sync_task' });
             // 更新当前路径等基础状态，确保后续 Update 正常
             setContentPath(contentPath);
+            setDataType(dataType as 'Text' | 'Image');
+            setTaskType(taskType);
             setValue('visID', visualizationID);
             setValue('vis_method', visualizationMethod);
         } else {
@@ -422,7 +463,12 @@ function MessageHandler() {
     ) => {
         try {
             logWithTimestamp(`[TTAV] Start loading visualization: ${visualizationID}`);
-            
+
+            // Clear stale epoch data (e.g. from a previous refine) before loading fresh data.
+            // Without this, the old refined projectionNeighbors remain in the store while epochs
+            // load one-by-one, and the user may interact with stale data mid-load.
+            useGlobalStore.getState().setValue('allEpochData', {});
+
             const staticCtx = await initStaticContext(contentPath, dataType);
 
             // 同步所有静态上下文
@@ -450,13 +496,17 @@ function MessageHandler() {
 
             // 5. 更新 store，确保后续 handleUpdate 能拿到正确的 vis_method / visID
             setContentPath(contentPath);
+            setDataType(dataType as 'Text' | 'Image');
+            setTaskType(taskType);
             setValue('vis_method', visualizationMethod);
             setValue('visID', visualizationID);
 
             message.success('Visualization loaded successfully!');
+            return true;
         } catch (error) {
             console.error('Error:', error);
             message.error('Failed to load visualization');
+            return false;
         }
     };
 
@@ -499,6 +549,36 @@ function MessageHandler() {
         window.addEventListener('message', handleMessage);
 
         return () => window.removeEventListener('message', handleMessage);
+    }, []);
+
+    useEffect(() => {
+        const payload = parseEIFJumpPayloadFromLocation();
+        if (!payload?.contentPath) return;
+
+        const contentPath = payload.contentPath;
+        const visMethod = payload.visMethod || 'UMAP';
+        const visId = payload.visId || '1';
+        const dataType = payload.dataType || 'Text';
+        const taskType = payload.taskType || 'Alignment';
+        const selected = normalizeSelectedIndices(payload.selectedIndices);
+
+        void (async () => {
+            const loaded = await handleLoadVisualization(
+                contentPath,
+                visMethod,
+                visId,
+                dataType,
+                taskType,
+                { gpu_id: -1 }
+            );
+            if (!loaded) return;
+            setSelectedIndices(selected);
+            if (payload.targetIndex != null) {
+                setValue('hoveredIndex', payload.targetIndex);
+            }
+            const sampleLabel = payload.sampleId ? ` ${payload.sampleId}` : '';
+            message.success(`EIF jump loaded${sampleLabel}. ${selected.length} token(s) selected.`);
+        })();
     }, []);
 
     return <></>;
@@ -615,11 +695,20 @@ export function AppCombinedView() {
 
                 const metrics = await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
                 if (metrics) {
+                    // All three quality metrics come from the backend — exact computation
+                    // over the full dataset using final encoder weights, not cached neighbors.
+                    const r = response as any;
+                    const backendNP    = r.neighbor_preservation;
+                    const backendMRH   = r.mean_rank_hd;
+                    const backendTrust = r.trustworthiness;
+                    const backendCont  = r.continuity;
                     useGlobalStore.getState().setValue('refineMetrics', {
                         focusDisplacement: metrics.avgFocusShift,
-                        globalDrift: metrics.avgGlobalDrift,
-                        neighborPreservation: metrics.avgNeighborConsistency,
-                        trustworthiness: metrics.avgTrustworthiness,
+                        globalDrift:       metrics.avgGlobalDrift,
+                        neighborPreservation: backendNP    != null ? backendNP    / 100 : metrics.avgNeighborConsistency,
+                        meanRankHD:           backendMRH   != null ? backendMRH          : 0,
+                        trustworthiness:      backendTrust != null ? backendTrust / 100 : metrics.avgTrustworthiness,
+                        continuity:           backendCont  != null ? backendCont  / 100 : 0,
                     });
                 }
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices, newEpochData.indexList || []);

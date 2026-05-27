@@ -1,5 +1,9 @@
 import os
 import sys
+import shutil
+import json
+from pathlib import Path
+import numpy as np
 # from llm_agent import call_llm_agent
 from run_visualization import visualize_run, init_visualize_component
 
@@ -39,6 +43,9 @@ active_session = {
     "vis_config": {}
 }
 
+EIF_BUNDLE_ROOT = Path("/root/project/Dataset/eif_bundles")
+EIF_STATIC_SESSION = "EIF_STATIC_BUNDLE"
+
 def update_active_session(config, visualizer, strategy):
     """统一更新 Session 的工具函数"""
     global active_session
@@ -56,6 +63,19 @@ def sync_session():
     """新接口：允许前端 Load 时同步 Session"""
     req = request.get_json()
     try:
+        info_path = os.path.join(req['content_path'], 'dataset', 'info.json')
+        dataset_info = read_file_as_json(info_path) or {}
+        if dataset_info.get("eif_bundle"):
+            active_session.update({
+                "strategy": EIF_STATIC_SESSION,
+                "visualizer": None,
+                "content_path": req.get("content_path"),
+                "vis_id": req.get("vis_id", "0"),
+                "vis_method": req.get("vis_method"),
+                "vis_config": req.get("vis_config", {}),
+            })
+            return jsonify({"status": "success", "message": "EIF static bundle session synced"})
+
         config = initialize_config(
             req['content_path'], 
             req['vis_method'], 
@@ -98,6 +118,12 @@ def update_focus_context():
               ", path:", active_session["content_path"], "content path:", content_path)
         return jsonify({"status": "error", "message": "No active session"}), 400
 
+    if active_session["strategy"] == EIF_STATIC_SESSION:
+        return jsonify({
+            "status": "error",
+            "message": "EIF static bundles do not support refinement yet"
+        }), 400
+
     # Reject concurrent refine requests immediately rather than queueing them.
     if not _refine_lock.acquire(blocking=False):
         return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
@@ -138,7 +164,14 @@ def update_focus_context():
         else:
             visualizer.visualize_all_epochs()
 
-        return jsonify({"status": "success"})
+        # Return backend-computed metrics (full-dataset exact computation)
+        return jsonify({
+            "status": "success",
+            "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
+            "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
+            "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
+            "continuity":            getattr(strategy, '_last_refine_cont',   None),
+        })
 
     except Exception as e:
         import traceback
@@ -185,7 +218,7 @@ def start_visualizing():
     
 @app.route("/", methods=["GET", "POST"])
 def GUI():
-    return send_from_directory('../../web/dist', 'index.html')
+    return send_from_directory('../../web/dist/configs/plotView', 'index.html')
 
 
 """
@@ -299,14 +332,135 @@ def get_all_text():
     content_path = req['content_path']
 
     text_list = get_all_texts(content_path)
+    token_list_path = os.path.join(content_path, 'dataset', 'token_list.json')
+    text_data_path = os.path.join(content_path, 'dataset', 'text_data.json')
+    token_list = read_file_as_json(token_list_path) if os.path.exists(token_list_path) else text_list
+    text_data = read_file_as_json(text_data_path) if os.path.exists(text_data_path) else text_list
 
     if text_list is None:
         return make_response(jsonify({'error_message': "getting all texts failed"}), 400)
 
     result = jsonify({
-        'text_list': text_list
+        'text_list': text_list,
+        'text_data': text_data,
+        'token_list': token_list,
     })
     return make_response(result, 200)
+
+
+@app.route('/registerEIFBundle', methods=['POST'])
+@cross_origin()
+def register_eif_bundle():
+    req = request.get_json()
+    if not req:
+        return jsonify({"status": "error", "message": "Missing JSON body"}), 400
+
+    sample_id = str(req.get("sample_id", "")).strip()
+    bundle = req.get("bundle")
+    vis_method = str(req.get("vis_method", "TimeVis")).strip() or "TimeVis"
+    vis_id = str(req.get("vis_id", "1")).strip() or "1"
+    overwrite = bool(req.get("overwrite", True))
+
+    if not sample_id:
+        return jsonify({"status": "error", "message": "sample_id is required"}), 400
+    if not isinstance(bundle, dict):
+        return jsonify({"status": "error", "message": "bundle must be an object"}), 400
+
+    labels = bundle.get("labels")
+    text_list = bundle.get("text_list")
+    embeddings = bundle.get("embeddings")
+    projection = bundle.get("projection")
+
+    if not isinstance(labels, list) or not isinstance(text_list, list):
+        return jsonify({"status": "error", "message": "bundle.labels and bundle.text_list must be lists"}), 400
+    if not isinstance(embeddings, list) or not isinstance(projection, list):
+        return jsonify({"status": "error", "message": "bundle.embeddings and bundle.projection must be lists"}), 400
+
+    num_points = len(labels)
+    if len(text_list) != num_points or len(embeddings) != num_points or len(projection) != num_points:
+        return jsonify({"status": "error", "message": "All bundle arrays must have the same length"}), 400
+
+    target_dir = EIF_BUNDLE_ROOT / sample_id
+    if target_dir.exists() and not overwrite:
+        return jsonify({
+            "status": "success",
+            "sample_id": sample_id,
+            "content_path": str(target_dir),
+            "num_points": num_points,
+            "vis_method": vis_method,
+            "vis_id": vis_id,
+            "cached": True,
+        })
+    if target_dir.exists() and overwrite:
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_dir = target_dir / "dataset"
+    epoch_dir = target_dir / "epochs" / "epoch_1"
+    vis_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}" / "epochs" / "epoch_1"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    classes = bundle.get("classes") or ["prompt", "output"]
+    dataset_info = {
+        "model": bundle.get("model", "EIFTokenBundle"),
+        "classes": classes,
+        "eif_bundle": True,
+        "sample_id": sample_id,
+        "prompt_len": bundle.get("prompt_len"),
+    }
+
+    with open(dataset_dir / "info.json", "w", encoding="utf-8") as f:
+        json.dump(dataset_info, f, indent=2, ensure_ascii=False)
+
+    np.save(dataset_dir / "labels.npy", np.asarray(labels, dtype=np.int64))
+    with open(dataset_dir / "index.json", "w", encoding="utf-8") as f:
+        json.dump(bundle.get("index", {"train": list(range(num_points)), "test": []}), f, indent=2)
+
+    with open(dataset_dir / "text.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(str(x) for x in text_list))
+
+    token_list = bundle.get("token_list", text_list)
+    text_data = bundle.get("text_data", text_list)
+    with open(dataset_dir / "token_list.json", "w", encoding="utf-8") as f:
+        json.dump(token_list, f, ensure_ascii=False)
+    with open(dataset_dir / "text_data.json", "w", encoding="utf-8") as f:
+        json.dump(text_data, f, ensure_ascii=False)
+
+    align = bundle.get("align")
+    if align is not None:
+        with open(dataset_dir / "align.json", "w", encoding="utf-8") as f:
+            json.dump(align, f, indent=2, ensure_ascii=False)
+
+    predictions = bundle.get("predictions")
+    if predictions is not None:
+        np.save(epoch_dir / "predictions.npy", np.asarray(predictions, dtype=np.float32))
+
+    np.save(epoch_dir / "embeddings.npy", np.asarray(embeddings, dtype=np.float32))
+    np.save(vis_dir / "projection.npy", np.asarray(projection, dtype=np.float32))
+
+    vis_info = {
+        "content_path": str(target_dir),
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "data_type": "Text",
+        "task_type": "Alignment",
+        "vis_config": req.get("vis_config", {"gpu_id": -1}),
+        "sample_id": sample_id,
+        "eif_bundle": True,
+    }
+    with open(target_dir / "visualize" / f"{vis_method}_{vis_id}" / "info.json", "w", encoding="utf-8") as f:
+        json.dump(vis_info, f, indent=2, ensure_ascii=False)
+
+    return jsonify({
+        "status": "success",
+        "sample_id": sample_id,
+        "content_path": str(target_dir),
+        "num_points": num_points,
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+    })
 
 @app.route('/getAlignment', methods = ["POST"])
 def get_alignment():
@@ -622,7 +776,7 @@ if __name__ == "__main__":
 
     if not is_dev_mode:
         # use_reloader=True: werkzeug auto-restarts on any .py file change (no extra deps)
-        app.run(host=host, port=port, threaded=True, use_reloader=True)
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
     else:
         from livereload import Server
         from flask_debugtoolbar import DebugToolbarExtension

@@ -10,8 +10,8 @@ const methodOptions = [
 ];
 
 export default function WebSideBar() {
-  const [contentPath, setContentPath] = useState('/home/shinan/Dataset/backdoor');
-  const [visualizationID, setVisualizationID] = useState('');
+  const [contentPath, setContentPath] = useState('/root/project/Dataset/backdoor');
+  const [visualizationID, setVisualizationID] = useState('1');
   const [visualizationMethod, setVisualizationMethod] = useState('TimeVis');
   const [dataType, setDataType] = useState<'Image' | 'Text'>('Image');
   const [taskType, setTaskType] = useState<'Classification' | 'Alignment'>('Classification');

@@ -10,7 +10,8 @@ Usage:
 import argparse, json, os, sys
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 METRICS = [
     ("focus_displacement",    "Focus Displacement",    "↓ smaller = more local"),
@@ -20,7 +21,7 @@ METRICS = [
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--results", default=os.path.join(ROOT, "ablation_results.json"))
+parser.add_argument("--results", default=os.path.join(TESTS_DIR, "ablation_results.json"))
 parser.add_argument("--last", action="store_true", help="Show only the most recent run")
 parser.add_argument("--no-plot", action="store_true", help="Print table only, skip matplotlib")
 args = parser.parse_args()
@@ -138,7 +139,7 @@ fig.legend(handles=legend_handles, loc="lower center", ncol=3,
            fontsize=8.5, framealpha=0.8, bbox_to_anchor=(0.5, -0.04))
 
 plt.tight_layout()
-out = os.path.join(ROOT, "ablation_plot.png")
+out = os.path.join(TESTS_DIR, "ablation_plot.png")
 plt.savefig(out, dpi=150, bbox_inches="tight")
 print(f"\n[Plot saved] → {out}")
 
@@ -159,6 +160,6 @@ if len(all_records) > 1:
         ax.grid(linestyle="--", alpha=0.4)
 
     plt.tight_layout()
-    out2 = os.path.join(ROOT, "ablation_trend.png")
+    out2 = os.path.join(TESTS_DIR, "ablation_trend.png")
     plt.savefig(out2, dpi=150, bbox_inches="tight")
     print(f"[Trend plot saved] → {out2}")

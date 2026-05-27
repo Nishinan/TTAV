@@ -1,7 +1,7 @@
 import axios, { AxiosResponse } from 'axios';
 
 // Backend server configuration
-const DEFAULT_HOST = 'http://localhost:5050';
+const DEFAULT_HOST = '';
 
 interface NetworkOptions {
     host?: string;
