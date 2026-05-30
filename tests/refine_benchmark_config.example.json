@@ -1,0 +1,15 @@
+{
+  "content_path": "/home/yilu/workspace/Dataset/backdoor",
+  "baseline_vis_id": "1",
+  "epoch": 10,
+  "seeds": [10975, 11490, 17685],
+  "bbox": {
+    "x_min": 3.577545,
+    "x_max": 3.653369,
+    "y_min": 1.164337,
+    "y_max": 1.236651
+  },
+  "hd_k": 15,
+  "focus_mode": "balanced",
+  "blend_decay_ratio": 0.35
+}
