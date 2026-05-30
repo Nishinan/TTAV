@@ -381,7 +381,10 @@ def register_eif_bundle():
         return jsonify({"status": "error", "message": "All bundle arrays must have the same length"}), 400
 
     target_dir = EIF_BUNDLE_ROOT / sample_id
-    if target_dir.exists() and not overwrite:
+    method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}"
+    refined_method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}_refined"
+
+    if method_dir.exists() and not overwrite:
         return jsonify({
             "status": "success",
             "sample_id": sample_id,
@@ -391,9 +394,14 @@ def register_eif_bundle():
             "vis_id": vis_id,
             "cached": True,
         })
-    if target_dir.exists() and overwrite:
-        shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    if overwrite:
+        invalidate_bundle_neighbor_caches(str(target_dir))
+        if method_dir.exists():
+            shutil.rmtree(method_dir)
+        if refined_method_dir.exists():
+            shutil.rmtree(refined_method_dir)
 
     dataset_dir = target_dir / "dataset"
     epoch_dir = target_dir / "epochs" / "epoch_1"

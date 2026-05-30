@@ -15,7 +15,7 @@ class DynaVisRunner:
         self.vis_config = vis_config or {}
 
         defaults = {
-            "D": 512,
+            "D": 128,
             "d": 2,
             "bs": 32,
             "lr_ae": 1e-3,

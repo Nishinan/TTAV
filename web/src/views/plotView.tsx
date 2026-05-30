@@ -27,6 +27,7 @@ interface EIFJumpPayload {
     taskType?: string;
     selectedIndices?: number[];
     targetIndex?: number;
+    selectedSourceIndex?: number;
 }
 
 function parseEIFJumpPayloadFromLocation(): EIFJumpPayload | null {
@@ -384,11 +385,11 @@ function MessageHandler() {
     const {
         setContentPath, setAvailableEpochs, setDataType, setTaskType,
         setTextData, setTokenList, setInherentLabelData,
-        setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices,
+        setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices, setHoveredIndex,
     } = useDefaultStore([
         'setContentPath', 'setAvailableEpochs', 'setDataType', 'setTaskType',
         'setTextData', 'setTokenList', 'setInherentLabelData',
-        'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices'
+        'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices', 'setHoveredIndex'
     ]);
 
     // Start visualizing process
@@ -510,12 +511,27 @@ function MessageHandler() {
         }
     };
 
+    const applyEIFHighlightUpdate = (payload: EIFJumpPayload) => {
+        const selected = normalizeSelectedIndices(payload.selectedIndices);
+        setSelectedIndices(selected);
+        setHoveredIndex(typeof payload.targetIndex === 'number' ? payload.targetIndex : undefined);
+    };
+
     // 增加一个 Ref 锁，防止同一 ID 的任务被重复触发
     const processingMessageIds = useRef(new Set<string>());
 
     const handleMessage = async (event: MessageEvent) => {
         const { command, data } = event.data;
         console.log('Received message from extension:', event);
+
+        if (command === 'eifHighlightUpdate') {
+            const currentContentPath = useGlobalStore.getState().contentPath;
+            if (!data?.contentPath || (currentContentPath && data.contentPath !== currentContentPath)) {
+                return;
+            }
+            applyEIFHighlightUpdate(data as EIFJumpPayload);
+            return;
+        }
 
         // 如果插件没传 id，可以用 command + contentPath 组合成简单锁
         const lockKey = `${command}-${data?.contentPath}`;
@@ -572,10 +588,7 @@ function MessageHandler() {
                 { gpu_id: -1 }
             );
             if (!loaded) return;
-            setSelectedIndices(selected);
-            if (payload.targetIndex != null) {
-                setValue('hoveredIndex', payload.targetIndex);
-            }
+            applyEIFHighlightUpdate(payload);
             const sampleLabel = payload.sampleId ? ` ${payload.sampleId}` : '';
             message.success(`EIF jump loaded${sampleLabel}. ${selected.length} token(s) selected.`);
         })();

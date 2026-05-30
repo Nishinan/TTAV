@@ -317,6 +317,30 @@ def invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, epoc
     key = (content_path, vis_method, vis_id, epoch, True)
     _faiss_index_cache.pop(key, None)
 
+
+def invalidate_bundle_neighbor_caches(content_path):
+    """Delete stale neighbor caches for a bundle after the on-disk files are replaced."""
+    if not os.path.exists(content_path):
+        return
+
+    for root, _, files in os.walk(content_path):
+        for file_name in files:
+            if (
+                file_name.startswith("proj_neighbors_")
+                and file_name.endswith(".json")
+            ) or (
+                file_name.startswith("hd_neighbors_")
+                and file_name.endswith(".json")
+            ):
+                try:
+                    os.remove(os.path.join(root, file_name))
+                except FileNotFoundError:
+                    pass
+
+    stale_keys = [key for key in _faiss_index_cache.keys() if key[0] == content_path]
+    for key in stale_keys:
+        _faiss_index_cache.pop(key, None)
+
 def update_projection_neighbors_incremental(
     content_path, vis_method, vis_id, epoch, patched_indices, max_neighbors=10
 ):

@@ -519,70 +519,112 @@ export const ChartComponent = memo(() => {
             });
             this.svg.appendChild(selectedGroup);
 
-            if (this.props.showLabel || this.props.showIndex) {
+            if (this.props.showLabel || this.props.showIndex || selectedSet.size > 0) {
                 const textGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-                
-                // Store occupied bounding boxes
                 const occupiedBoxes: { x: number, y: number, width: number, height: number }[] = [];
-                const padding = 2; // Padding between labels
-                const charWidth = 6; // Approximate width per character for font-size 10 monospace
-                const charHeight = 10; // Approximate height for font-size 10
+                const padding = 2;
+                const baseCharWidth = 6;
+                const baseCharHeight = 10;
+
+                const renderLabel = (id: number, loc: { x: number; y: number }, content: string, forceVisible: boolean) => {
+                    const fontSize = forceVisible ? 13 : 10;
+                    const charWidth = forceVisible ? 7.5 : baseCharWidth;
+                    const charHeight = forceVisible ? 13 : baseCharHeight;
+                    const boxWidth = content.length * charWidth;
+                    const boxHeight = charHeight;
+                    const baseOffset = pointSize + 2;
+                    const candidateOffsets = forceVisible
+                        ? [
+                            { dx: baseOffset, dy: -baseOffset },
+                            { dx: baseOffset, dy: charHeight + 4 },
+                            { dx: -(boxWidth + baseOffset), dy: -baseOffset },
+                            { dx: -(boxWidth + baseOffset), dy: charHeight + 4 },
+                            { dx: -(boxWidth / 2), dy: -(pointSize + 10) },
+                            { dx: -(boxWidth / 2), dy: charHeight + pointSize + 6 },
+                        ]
+                        : [
+                            { dx: baseOffset, dy: -baseOffset },
+                        ];
+
+                    let chosen: { labelX: number; labelY: number; boxX: number; boxY: number } | null = null;
+
+                    for (const candidate of candidateOffsets) {
+                        const labelX = loc.x + candidate.dx;
+                        const labelY = loc.y + candidate.dy;
+                        const boxX = labelX;
+                        const boxY = labelY - charHeight;
+
+                        let collision = false;
+                        for (const box of occupiedBoxes) {
+                            if (
+                                boxX < box.x + box.width + padding &&
+                                boxX + boxWidth + padding > box.x &&
+                                boxY < box.y + box.height + padding &&
+                                boxY + boxHeight + padding > box.y
+                            ) {
+                                collision = true;
+                                break;
+                            }
+                        }
+
+                        if (!collision) {
+                            chosen = { labelX, labelY, boxX, boxY };
+                            break;
+                        }
+                    }
+
+                    if (!chosen) {
+                        if (!forceVisible) return;
+                        const fallbackLabelX = loc.x + baseOffset;
+                        const fallbackLabelY = loc.y - baseOffset;
+                        chosen = {
+                            labelX: fallbackLabelX,
+                            labelY: fallbackLabelY,
+                            boxX: fallbackLabelX,
+                            boxY: fallbackLabelY - charHeight,
+                        };
+                    }
+
+                    const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    textEl.setAttribute('x', String(chosen.labelX));
+                    textEl.setAttribute('y', String(chosen.labelY));
+                    textEl.setAttribute('fill', forceVisible ? '#111827' : '#000');
+                    textEl.setAttribute('font-size', String(fontSize));
+                    textEl.setAttribute('font-family', 'Console, monospace');
+                    if (forceVisible) {
+                        textEl.setAttribute('font-weight', '700');
+                        textEl.setAttribute('paint-order', 'stroke');
+                        textEl.setAttribute('stroke', '#ffffff');
+                        textEl.setAttribute('stroke-width', '3');
+                        textEl.setAttribute('stroke-linejoin', 'round');
+                    }
+                    textEl.textContent = content;
+                    textGroup.appendChild(textEl);
+                    occupiedBoxes.push({ x: chosen.boxX, y: chosen.boxY, width: boxWidth, height: boxHeight });
+                };
+
+                selectedSet.forEach((selectedId: number) => {
+                    const pos = this.props.posMap.get(selectedId);
+                    if (pos == null) return;
+                    const x = this.props.dataX[pos];
+                    const y = this.props.dataY[pos];
+                    const loc = this.proxy.location(x, y);
+                    const labelTextData = this.props.textData && this.props.textData[selectedId] ? this.props.textData[selectedId] : (this.props.labelDict?.get(this.props.inherentLabelData[selectedId]) ?? '');
+                    const content = formatPointLabel(selectedId, labelTextData, true, true);
+                    if (!content) return;
+                    renderLabel(selectedId, loc, content, true);
+                });
 
                 for (let i = 0; i < this.props.dataX.length; i++) {
                     const id = this.props.idsByPos[i];
+                    if (selectedSet.has(id)) continue;
                     const x = this.props.dataX[i];
                     const y = this.props.dataY[i];
                     const loc = this.proxy.location(x, y);
                     const labelTextData = this.props.textData && this.props.textData[id] ? this.props.textData[id] : (this.props.labelDict?.get(this.props.inherentLabelData[id]) ?? '');
                     const content = formatPointLabel(id, labelTextData, this.props.showLabel, this.props.showIndex);
                     if (!content) continue;
-
-                    // Calculate label bounding box
-                    const labelX = loc.x + (pointSize + 2);
-                    const labelY = loc.y - (pointSize + 2); // This is roughly the bottom-left corner of the text? No, SVG text y is baseline.
-                    // Let's assume y is baseline. The text will extend upwards by charHeight.
-                    // Actually, to make collision detection easier, let's treat (labelX, labelY) as the top-left corner for calculation purposes,
-                    // but we need to adjust for SVG text rendering which uses baseline.
-                    // Standard SVG text y is the baseline. So the box top is y - charHeight.
-                    
-                    const boxX = labelX;
-                    const boxY = labelY - charHeight; 
-                    const boxWidth = content.length * charWidth;
-                    const boxHeight = charHeight;
-
-                    // Check for collision
-                    let collision = false;
-                    // Check against canvas boundaries
-                    if (boxX < 0 || boxY < 0 || boxX + boxWidth > this.props.proxy.width || boxY + boxHeight > this.props.proxy.height) {
-                         // Optional: we might want to allow labels to be slightly out or just clip them. 
-                         // But usually we want to avoid drawing them if they are cut off? 
-                         // For now let's just check against other labels.
-                    }
-
-                    for (const box of occupiedBoxes) {
-                        if (
-                            boxX < box.x + box.width + padding &&
-                            boxX + boxWidth + padding > box.x &&
-                            boxY < box.y + box.height + padding &&
-                            boxY + boxHeight + padding > box.y
-                        ) {
-                            collision = true;
-                            break;
-                        }
-                    }
-
-                    if (!collision) {
-                        const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                        textEl.setAttribute('x', String(labelX));
-                        textEl.setAttribute('y', String(labelY));
-                        textEl.setAttribute('fill', '#000');
-                        textEl.setAttribute('font-size', '10');
-                        textEl.setAttribute('font-family', 'Console, monospace');
-                        textEl.textContent = content;
-                        textGroup.appendChild(textEl);
-
-                        occupiedBoxes.push({ x: boxX, y: boxY, width: boxWidth, height: boxHeight });
-                    }
+                    renderLabel(id, loc, content, false);
                 }
                 this.svg.appendChild(textGroup);
             }
@@ -657,8 +699,6 @@ export const ChartComponent = memo(() => {
                     const ids = points.map(p => p.identifier as number);
                     console.log("[TTAV] Selection Sync to Store:", ids);
                     setSelectedIndices(ids);
-                } else {
-                    setSelectedIndices([]);
                 }
             }}
         />
