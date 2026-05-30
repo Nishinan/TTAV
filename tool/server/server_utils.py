@@ -25,29 +25,8 @@ from visualize.training_event import TrainingEventDetector
 from influence_function.IF import EmpiricalIF, PairWiseEmpiricalIF
 from influence_function.CustomEncoderModel import CustomEncoderModel
 
-
-def normalize_content_path(content_path):
-    """Map historical machine-specific paths to an accessible local dataset path."""
-    if not content_path:
-        return content_path
-
-    raw = os.path.abspath(os.path.expanduser(str(content_path)))
-    candidates = [raw]
-    for src, dst in (
-        ("/root/project/", "/home/shinan/"),
-        ("/home/yilu/workspace/", "/home/shinan/"),
-    ):
-        if raw.startswith(src):
-            candidates.append(raw.replace(src, dst, 1))
-
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return candidates[-1]
-
 # Func: infer available epochs files, return a list of available epochs
 def infer_epoch_structure(content_path):
-    content_path = normalize_content_path(content_path)
     epochs_dir = os.path.join(content_path, 'epochs')
     available_epochs = []
     if os.path.exists(epochs_dir) and os.path.isdir(epochs_dir):
@@ -62,30 +41,12 @@ def infer_epoch_structure(content_path):
     available_epochs.sort()
     return available_epochs
 
-
 # Func: get coloring list
 def get_coloring_list(class_num):
-    """Return one RGB color per class.
-
-    Keep the familiar tab10 palette for small classification tasks. When the
-    class count exceeds tab10, sample the HSV color wheel evenly so labels do
-    not collapse to repeated colors.
-    """
-    class_num = int(class_num or 0)
-    if class_num <= 0:
-        return []
-
-    if class_num <= 10:
-        color_map = plt.get_cmap('tab10')
-        color = color_map(range(class_num))
-    else:
-        color_map = plt.get_cmap('hsv')
-        hue_positions = np.linspace(0, 1, class_num, endpoint=False)
-        color = color_map(hue_positions)
-        # The raw HSV colormap can be too bright for yellow/cyan on a white UI.
-        color[:, :3] = 0.82 * color[:, :3] + 0.08
-
-    color_255 = np.clip(color[:, :3] * 255, 0, 255).astype(np.uint8)
+    # color = get_standard_classes_color(class_num) * 255
+    color_map = plt.get_cmap('tab10')
+    color = color_map(range(class_num))
+    color_255 = (color[:, :3] * 255).astype(np.uint8)
     return color_255.tolist()
 
 # Func: load projection of certain epoch
@@ -95,7 +56,6 @@ def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
     :param refine_flag: 如果为 True，优先从带有 _refined 后缀的文件夹读取；
                         若 _refined 文件不存在则回退到原始路径（graceful fallback）
     """
-    content_path = normalize_content_path(content_path)
     def _proj_path(folder):
         return os.path.join(content_path, "visualize", folder,
                             "epochs", f"epoch_{epoch}", "projection.npy")
@@ -123,156 +83,6 @@ def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
     projection_list = [projection_list[i] for i in all_indices]
 
     return projection_list
-
-
-def _distance_to_bbox(x, y, bbox):
-    dx = bbox["x_min"] - x if x < bbox["x_min"] else (x - bbox["x_max"] if x > bbox["x_max"] else 0.0)
-    dy = bbox["y_min"] - y if y < bbox["y_min"] else (y - bbox["y_max"] if y > bbox["y_max"] else 0.0)
-    return math.sqrt(dx * dx + dy * dy)
-
-
-def build_runtime_blended_projection(content_path, vis_method, vis_id, epoch, blend_bbox, decay_ratio=0.35, focus_indices=None):
-    content_path = normalize_content_path(content_path)
-    baseline = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False), dtype=np.float32)
-    refined = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=True), dtype=np.float32)
-
-    if baseline.shape != refined.shape:
-        return refined.tolist()
-
-    focus_indices = [int(i) for i in (focus_indices or []) if 0 <= int(i) < len(baseline)]
-    bbox_width = 1e-6
-    bbox_height = 1e-6
-    if blend_bbox is not None:
-        bbox_width = max(abs(float(blend_bbox["x_max"]) - float(blend_bbox["x_min"])), 1e-6)
-        bbox_height = max(abs(float(blend_bbox["y_max"]) - float(blend_bbox["y_min"])), 1e-6)
-    bbox_decay = max(math.sqrt(bbox_width * bbox_width + bbox_height * bbox_height) * float(decay_ratio), 1e-6)
-
-    focus_weights = np.zeros(len(baseline), dtype=np.float32)
-    if focus_indices:
-        focus_coords = baseline[np.array(focus_indices)]
-        if len(focus_coords) == 1:
-            focus_decay = bbox_decay
-        else:
-            focus_center = focus_coords.mean(axis=0)
-            focus_radius = np.linalg.norm(focus_coords - focus_center, axis=1)
-            focus_decay = max(float(np.percentile(focus_radius, 75)) * 1.5, bbox_decay * 0.5, 1e-6)
-        nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(focus_coords)
-        dists, _ = nbrs.kneighbors(baseline)
-        focus_weights = np.exp(-(dists[:, 0] / focus_decay)).astype(np.float32)
-        focus_weights[np.array(focus_indices)] = 1.0
-
-    blended = np.empty_like(baseline)
-    for idx, base in enumerate(baseline):
-        refined_pt = refined[idx]
-        bbox_weight = 0.0
-        if blend_bbox is not None:
-            dist = _distance_to_bbox(float(base[0]), float(base[1]), blend_bbox)
-            bbox_weight = 1.0 if dist <= 1e-12 else math.exp(-dist / bbox_decay)
-        weight = max(float(focus_weights[idx]), float(bbox_weight))
-        blended[idx] = base * (1.0 - weight) + refined_pt * weight
-    return blended.tolist()
-
-def load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_flag=False):
-    """Load raw projection.npy without train/test reordering."""
-    content_path = normalize_content_path(content_path)
-    suffix = "_refined" if refine_flag else ""
-    projection_path = os.path.join(
-        content_path,
-        "visualize",
-        f"{vis_method}_{vis_id}{suffix}",
-        "epochs",
-        f"epoch_{epoch}",
-        "projection.npy",
-    )
-
-    if refine_flag and not os.path.exists(projection_path):
-        projection_path = os.path.join(
-            content_path,
-            "visualize",
-            f"{vis_method}_{vis_id}",
-            "epochs",
-            f"epoch_{epoch}",
-            "projection.npy",
-        )
-
-    if not os.path.exists(projection_path):
-        raise FileNotFoundError(f"Projection not found: {projection_path}")
-    return np.load(projection_path)
-
-
-def build_focus_set(
-    content_path,
-    vis_method,
-    vis_id,
-    epoch,
-    seed_indices,
-    zoom_bbox=None,
-    hd_k=15,
-    strategy="seeds_plus_hd",
-):
-    """Construct the runtime focus_set according to the configured strategy."""
-    content_path = normalize_content_path(content_path)
-    seed_set = {int(i) for i in seed_indices if isinstance(i, (int, np.integer)) or str(i).isdigit()}
-    bbox_set = set()
-    hd_set = set()
-
-    if epoch is None:
-        focus_indices = sorted(seed_set)
-        return focus_indices, {
-            "seed_count": len(seed_set),
-            "bbox_count": 0,
-            "hd_neighbor_count": 0,
-            "focus_set_size": len(focus_indices),
-            "used_bbox": False,
-            "focus_set_strategy": strategy,
-        }
-
-    if zoom_bbox:
-        proj = load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_flag=False)
-        if proj.ndim == 2 and proj.shape[1] >= 2:
-            x_min = min(float(zoom_bbox["x_min"]), float(zoom_bbox["x_max"]))
-            x_max = max(float(zoom_bbox["x_min"]), float(zoom_bbox["x_max"]))
-            y_min = min(float(zoom_bbox["y_min"]), float(zoom_bbox["y_max"]))
-            y_max = max(float(zoom_bbox["y_min"]), float(zoom_bbox["y_max"]))
-            mask = (
-                (proj[:, 0] >= x_min) & (proj[:, 0] <= x_max) &
-                (proj[:, 1] >= y_min) & (proj[:, 1] <= y_max)
-            )
-            bbox_set = set(np.where(mask)[0].tolist())
-
-    emb_path = os.path.join(content_path, "epochs", f"epoch_{epoch}", "embeddings.npy")
-    if os.path.exists(emb_path):
-        features = np.load(emb_path)
-        n = len(features)
-        valid_seeds = sorted(i for i in seed_set if 0 <= i < n)
-        if valid_seeds and n > 1:
-            k = min(max(hd_k + 1, 2), n)
-            nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(features)
-            _, nn_idx = nbrs.kneighbors(features[valid_seeds])
-            hd_set = set(nn_idx.flatten().tolist())
-            hd_set -= set(valid_seeds)
-            seed_set = set(valid_seeds)
-
-    if strategy == "seeds_only":
-        focus_indices = sorted(seed_set)
-    elif strategy == "seeds_plus_hd":
-        focus_indices = sorted(seed_set | hd_set)
-    elif strategy == "seeds_plus_bbox":
-        focus_indices = sorted(seed_set | bbox_set)
-    elif strategy == "seeds_plus_bbox_plus_hd":
-        focus_indices = sorted(seed_set | bbox_set | hd_set)
-    else:
-        raise ValueError(f"Unsupported focus_set strategy: {strategy}")
-
-    return focus_indices, {
-        "seed_count": len(seed_set),
-        "bbox_count": len(bbox_set),
-        "bbox_indices": sorted(bbox_set),
-        "hd_neighbor_count": len(hd_set),
-        "focus_set_size": len(focus_indices),
-        "used_bbox": zoom_bbox is not None,
-        "focus_set_strategy": strategy,
-    }
 
 # Func: load one sample from content_path
 def load_one_sample(config, content_path, index):
@@ -309,7 +119,6 @@ def load_one_sample(config, content_path, index):
 
 # Func: load all text samples
 def get_all_texts(content_path, from_file=True):
-    content_path = normalize_content_path(content_path)
     text_list = []
     
     if from_file:
@@ -334,7 +143,6 @@ def get_all_texts(content_path, from_file=True):
     return text_list
 
 def get_alignment_data(content_path):
-    content_path = normalize_content_path(content_path)
     alignment_path = os.path.join(content_path, "dataset", "align.json")
     if not os.path.exists(alignment_path):
         return []
@@ -448,7 +256,6 @@ def get_filter_result(config, content_path, epoch, filters):
     return result,''
 
 def load_background(content_path, vis_method,vis_id, epoch):
-    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'visualize',f"{vis_method}_{vis_id}",'epochs',f'epoch_{epoch}', 'background.png')
     if os.path.exists(file_path):
         return convert_to_base64(file_path)
@@ -460,12 +267,10 @@ def convert_to_base64(image_path):
     return base64_image
 
 def load_one_image(content_path, index):
-    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'dataset', 'image', f'{index}.png')
     return convert_to_base64(file_path)
 
 def load_one_text(content_path, index):
-    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'dataset', 'text.txt')
     with open(file_path, 'r') as f:
         content = f.read()
@@ -476,7 +281,6 @@ def load_one_text(content_path, index):
         return ""
 
 def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
-    content_path = normalize_content_path(content_path)
     # Cache to disk: high-D neighbors never change after training completes.
     cache_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}',
                               f'hd_neighbors_{max_neighbors}.json')
@@ -500,7 +304,6 @@ def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
     return neighbors
 
 def _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, refine_flag):
-    content_path = normalize_content_path(content_path)
     suffix = "_refined" if refine_flag else ""
     folder = os.path.join(content_path, "visualize", f"{vis_method}_{vis_id}{suffix}",
                           "epochs", f"epoch_{epoch}")
@@ -517,7 +320,6 @@ def invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, epoc
 
 def invalidate_bundle_neighbor_caches(content_path):
     """Delete stale neighbor caches for a bundle after the on-disk files are replaced."""
-    content_path = normalize_content_path(content_path)
     if not os.path.exists(content_path):
         return
 
@@ -597,18 +399,6 @@ def update_projection_neighbors_incremental(
 
     return neighbors, index_list
 
-def _search_projection_neighbors(proj, max_neighbors):
-    try:
-        import faiss
-        index = faiss.IndexFlatL2(proj.shape[1])
-        index.add(proj)
-        _, indices = index.search(proj, max_neighbors + 1)
-        return indices
-    except Exception:
-        nbrs = NearestNeighbors(n_neighbors=max_neighbors + 1, algorithm='auto').fit(proj)
-        _, indices = nbrs.kneighbors(proj)
-        return indices.astype(np.int64)
-
 # In-process faiss index cache: key → (faiss_index, projection_array)
 # Avoids rebuilding the index on every /getProjectionNeighbors call.
 _faiss_index_cache: dict = {}
@@ -628,98 +418,7 @@ def _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag):
     _faiss_index_cache[key] = (index, proj)
     return index, proj
 
-def calculate_projection_neighbors_for_projection(content_path, projection_list, max_neighbors=10):
-    content_path = normalize_content_path(content_path)
-    index_dict = load_or_create_index(content_path)
-    index_list = index_dict['train'] + index_dict['test']
-    proj = np.array(projection_list, dtype='float32')
-    indices = _search_projection_neighbors(proj, max_neighbors)
-    neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)] for i in range(len(proj))]
-    return neighbors, index_list
-
-
-def load_reordered_representation_array(content_path, epoch):
-    content_path = normalize_content_path(content_path)
-    features_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}', 'embeddings.npy')
-    if not os.path.exists(features_path):
-        raise FileNotFoundError(f"Representation not found: {features_path}")
-    features = np.load(features_path)
-    index_dict = load_or_create_index(content_path)
-    index_list = index_dict['train'] + index_dict['test']
-    return np.array(features[index_list], dtype=np.float32), index_list
-
-
-def calculate_refine_metrics_for_projection(content_path, epoch, projection_list, focus_indices, k=10, k_ext=200):
-    content_path = normalize_content_path(content_path)
-    proj = np.array(projection_list, dtype=np.float32)
-    features, index_list = load_reordered_representation_array(content_path, epoch)
-    if len(proj) != len(features):
-        raise ValueError("Projection/features length mismatch when computing refine metrics")
-
-    orig_to_pos = {orig: pos for pos, orig in enumerate(index_list)}
-    focus_positions = sorted({orig_to_pos[i] for i in focus_indices if i in orig_to_pos})
-    if not focus_positions:
-        return {
-            "neighbor_preservation": 0.0,
-            "mean_rank_hd": 0.0,
-            "trustworthiness": 0.0,
-            "continuity": 0.0,
-            "focus_count": 0,
-        }
-
-    n_total = len(features)
-    k = min(max(int(k), 1), max(n_total - 1, 1))
-    k_ext = min(max(int(k_ext), k), max(n_total - 1, 1))
-
-    np_sum = 0.0
-    mrh_sum = 0.0
-    trust_sum = 0.0
-    cont_sum = 0.0
-
-    for pos in focus_positions:
-        hd_dists = np.linalg.norm(features - features[pos], axis=1)
-        hd_dists[pos] = np.inf
-        hd_rank = np.argsort(hd_dists)
-
-        ld_dists = np.linalg.norm(proj - proj[pos], axis=1)
-        ld_dists[pos] = np.inf
-        ld_rank = np.argsort(ld_dists)
-
-        hd_topk = set(int(x) for x in hd_rank[:k])
-        ld_topk = set(int(x) for x in ld_rank[:k])
-        np_sum += len(hd_topk & ld_topk) / k
-
-        ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(n_total - 1)}
-        mrh_sum += float(np.mean([ld_rank_full[j] for j in hd_topk]))
-
-        hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(k_ext)}
-        ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(k_ext)}
-
-        t_penalty = 0.0
-        for j in (ld_topk - hd_topk):
-            r_hd = hd_rank_of.get(int(j), k_ext + 1)
-            t_penalty += max(0, r_hd - k)
-
-        c_penalty = 0.0
-        for j in (hd_topk - ld_topk):
-            r_ld = ld_rank_of.get(int(j), k_ext + 1)
-            c_penalty += max(0, r_ld - k)
-
-        worst = k * (k_ext - k)
-        trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
-        cont_sum += 1.0 - c_penalty / worst if worst > 0 else 1.0
-
-    n_focus = len(focus_positions)
-    return {
-        "neighbor_preservation": np_sum / n_focus * 100.0,
-        "mean_rank_hd": mrh_sum / n_focus,
-        "trustworthiness": max(0.0, trust_sum / n_focus * 100.0),
-        "continuity": max(0.0, cont_sum / n_focus * 100.0),
-        "focus_count": n_focus,
-    }
-
 def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10, refine_flag=False):
-    content_path = normalize_content_path(content_path)
     index_dict = load_or_create_index(content_path)
     index_list = index_dict['train'] + index_dict['test']
 
@@ -729,14 +428,9 @@ def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_
         with open(cache_path, 'r') as f:
             return json.load(f), index_list
 
-    # --- build via faiss when available, otherwise fall back to sklearn ---
-    try:
-        faiss_index, proj = _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag)
-        _, indices = faiss_index.search(proj, max_neighbors + 1)  # +1 to skip self
-    except Exception:
-        projection_list = load_projection(content_path, vis_method, vis_id, epoch, refine_flag)
-        proj = np.array(projection_list, dtype='float32')
-        indices = _search_projection_neighbors(proj, max_neighbors)
+    # --- build via faiss (fast, result cached in memory too) ---
+    faiss_index, proj = _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag)
+    _, indices = faiss_index.search(proj, max_neighbors + 1)  # +1 to skip self
 
     neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)]
                  for i in range(len(proj))]
@@ -750,7 +444,6 @@ def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_
 
 # Func: Load a single attribute from a file based on the configuration and epoch
 def load_single_attribute(content_path, epoch, attribute):
-    content_path = normalize_content_path(content_path)
     if attribute == 'label':
         file_path = os.path.join(content_path, 'dataset', 'labels.npy')
         attr_data = read_label_file(file_path)
@@ -811,7 +504,6 @@ def read_file_as_json(file_path: str):
         return json.load(f)
 
 def load_or_create_index(content_path):
-    content_path = normalize_content_path(content_path)
     index_file_path = os.path.join(content_path, 'dataset', 'index.json')
     if os.path.exists(index_file_path):
         with open(index_file_path, 'r') as f:
@@ -899,7 +591,6 @@ def _compute_trustworthiness_continuity(high_neighbors, low_neighbors):
 
 def _metrics_cache_path(content_path, vis_method, vis_id):
     """Return the path of the per-visualisation metrics cache JSON."""
-    content_path = normalize_content_path(content_path)
     return os.path.join(
         content_path, 'visualize',
         f"{vis_method}_{vis_id}",
@@ -913,7 +604,6 @@ def calculate_visualize_metrics(content_path, vis_method, vis_id, epoch):
     Results are cached to disk (metrics_cache.json) to avoid re-computation
     across server restarts and repeated API calls for the same epoch.
     """
-    content_path = normalize_content_path(content_path)
     cache_path = _metrics_cache_path(content_path, vis_method, vis_id)
     epoch_key = str(epoch)
 
