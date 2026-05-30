@@ -1,4 +1,3 @@
-// ChartComponent.tsx
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { EmbeddingView, type EmbeddingViewProps, type DataPoint, type ViewportState } from 'embedding-atlas/react';
 import { useDefaultStore } from "../state/state.unified";
@@ -61,6 +60,7 @@ export const ChartComponent = memo(() => {
     const { availableEpochs } = useDefaultStore(["availableEpochs"]);
     const { showTrail } = useDefaultStore(["showTrail"]);
     const { setSelectedIndices } = useDefaultStore(["setSelectedIndices"]);
+    const { setCurrentViewportBBox } = useDefaultStore(["setCurrentViewportBBox"]);
 
     const epochData = allEpochData[epoch];
 
@@ -125,6 +125,26 @@ export const ChartComponent = memo(() => {
 
     }, [globalBounds]);
 
+    useEffect(() => {
+        if (!viewportState || dimensions.width <= 0 || dimensions.height <= 0) {
+            setCurrentViewportBBox(null);
+            return;
+        }
+
+        const safeScale = viewportState.scale && viewportState.scale > 0
+            ? viewportState.scale
+            : 1;
+        const aspect = dimensions.height > 0 ? dimensions.width / dimensions.height : 1;
+        const halfHeight = 1 / safeScale;
+        const halfWidth = aspect / safeScale;
+
+        setCurrentViewportBBox({
+            xMin: viewportState.x - halfWidth,
+            xMax: viewportState.x + halfWidth,
+            yMin: viewportState.y - halfHeight,
+            yMax: viewportState.y + halfHeight,
+        });
+    }, [dimensions.height, dimensions.width, setCurrentViewportBBox, viewportState]);
 
     // filter dataIndices
     const filteredIndices = useMemo(() => {
@@ -519,70 +539,112 @@ export const ChartComponent = memo(() => {
             });
             this.svg.appendChild(selectedGroup);
 
-            if (this.props.showLabel || this.props.showIndex) {
+            if (this.props.showLabel || this.props.showIndex || selectedSet.size > 0) {
                 const textGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-                
-                // Store occupied bounding boxes
                 const occupiedBoxes: { x: number, y: number, width: number, height: number }[] = [];
-                const padding = 2; // Padding between labels
-                const charWidth = 6; // Approximate width per character for font-size 10 monospace
-                const charHeight = 10; // Approximate height for font-size 10
+                const padding = 2;
+                const baseCharWidth = 6;
+                const baseCharHeight = 10;
+
+                const renderLabel = (id: number, loc: { x: number; y: number }, content: string, forceVisible: boolean) => {
+                    const fontSize = forceVisible ? 13 : 10;
+                    const charWidth = forceVisible ? 7.5 : baseCharWidth;
+                    const charHeight = forceVisible ? 13 : baseCharHeight;
+                    const boxWidth = content.length * charWidth;
+                    const boxHeight = charHeight;
+                    const baseOffset = pointSize + 2;
+                    const candidateOffsets = forceVisible
+                        ? [
+                            { dx: baseOffset, dy: -baseOffset },
+                            { dx: baseOffset, dy: charHeight + 4 },
+                            { dx: -(boxWidth + baseOffset), dy: -baseOffset },
+                            { dx: -(boxWidth + baseOffset), dy: charHeight + 4 },
+                            { dx: -(boxWidth / 2), dy: -(pointSize + 10) },
+                            { dx: -(boxWidth / 2), dy: charHeight + pointSize + 6 },
+                        ]
+                        : [
+                            { dx: baseOffset, dy: -baseOffset },
+                        ];
+
+                    let chosen: { labelX: number; labelY: number; boxX: number; boxY: number } | null = null;
+
+                    for (const candidate of candidateOffsets) {
+                        const labelX = loc.x + candidate.dx;
+                        const labelY = loc.y + candidate.dy;
+                        const boxX = labelX;
+                        const boxY = labelY - charHeight;
+
+                        let collision = false;
+                        for (const box of occupiedBoxes) {
+                            if (
+                                boxX < box.x + box.width + padding &&
+                                boxX + boxWidth + padding > box.x &&
+                                boxY < box.y + box.height + padding &&
+                                boxY + boxHeight + padding > box.y
+                            ) {
+                                collision = true;
+                                break;
+                            }
+                        }
+
+                        if (!collision) {
+                            chosen = { labelX, labelY, boxX, boxY };
+                            break;
+                        }
+                    }
+
+                    if (!chosen) {
+                        if (!forceVisible) return;
+                        const fallbackLabelX = loc.x + baseOffset;
+                        const fallbackLabelY = loc.y - baseOffset;
+                        chosen = {
+                            labelX: fallbackLabelX,
+                            labelY: fallbackLabelY,
+                            boxX: fallbackLabelX,
+                            boxY: fallbackLabelY - charHeight,
+                        };
+                    }
+
+                    const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    textEl.setAttribute('x', String(chosen.labelX));
+                    textEl.setAttribute('y', String(chosen.labelY));
+                    textEl.setAttribute('fill', forceVisible ? '#111827' : '#000');
+                    textEl.setAttribute('font-size', String(fontSize));
+                    textEl.setAttribute('font-family', 'Console, monospace');
+                    if (forceVisible) {
+                        textEl.setAttribute('font-weight', '700');
+                        textEl.setAttribute('paint-order', 'stroke');
+                        textEl.setAttribute('stroke', '#ffffff');
+                        textEl.setAttribute('stroke-width', '3');
+                        textEl.setAttribute('stroke-linejoin', 'round');
+                    }
+                    textEl.textContent = content;
+                    textGroup.appendChild(textEl);
+                    occupiedBoxes.push({ x: chosen.boxX, y: chosen.boxY, width: boxWidth, height: boxHeight });
+                };
+
+                selectedSet.forEach((selectedId: number) => {
+                    const pos = this.props.posMap.get(selectedId);
+                    if (pos == null) return;
+                    const x = this.props.dataX[pos];
+                    const y = this.props.dataY[pos];
+                    const loc = this.proxy.location(x, y);
+                    const labelTextData = this.props.textData && this.props.textData[selectedId] ? this.props.textData[selectedId] : (this.props.labelDict?.get(this.props.inherentLabelData[selectedId]) ?? '');
+                    const content = formatPointLabel(selectedId, labelTextData, true, true);
+                    if (!content) return;
+                    renderLabel(selectedId, loc, content, true);
+                });
 
                 for (let i = 0; i < this.props.dataX.length; i++) {
                     const id = this.props.idsByPos[i];
+                    if (selectedSet.has(id)) continue;
                     const x = this.props.dataX[i];
                     const y = this.props.dataY[i];
                     const loc = this.proxy.location(x, y);
                     const labelTextData = this.props.textData && this.props.textData[id] ? this.props.textData[id] : (this.props.labelDict?.get(this.props.inherentLabelData[id]) ?? '');
                     const content = formatPointLabel(id, labelTextData, this.props.showLabel, this.props.showIndex);
                     if (!content) continue;
-
-                    // Calculate label bounding box
-                    const labelX = loc.x + (pointSize + 2);
-                    const labelY = loc.y - (pointSize + 2); // This is roughly the bottom-left corner of the text? No, SVG text y is baseline.
-                    // Let's assume y is baseline. The text will extend upwards by charHeight.
-                    // Actually, to make collision detection easier, let's treat (labelX, labelY) as the top-left corner for calculation purposes,
-                    // but we need to adjust for SVG text rendering which uses baseline.
-                    // Standard SVG text y is the baseline. So the box top is y - charHeight.
-                    
-                    const boxX = labelX;
-                    const boxY = labelY - charHeight; 
-                    const boxWidth = content.length * charWidth;
-                    const boxHeight = charHeight;
-
-                    // Check for collision
-                    let collision = false;
-                    // Check against canvas boundaries
-                    if (boxX < 0 || boxY < 0 || boxX + boxWidth > this.props.proxy.width || boxY + boxHeight > this.props.proxy.height) {
-                         // Optional: we might want to allow labels to be slightly out or just clip them. 
-                         // But usually we want to avoid drawing them if they are cut off? 
-                         // For now let's just check against other labels.
-                    }
-
-                    for (const box of occupiedBoxes) {
-                        if (
-                            boxX < box.x + box.width + padding &&
-                            boxX + boxWidth + padding > box.x &&
-                            boxY < box.y + box.height + padding &&
-                            boxY + boxHeight + padding > box.y
-                        ) {
-                            collision = true;
-                            break;
-                        }
-                    }
-
-                    if (!collision) {
-                        const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                        textEl.setAttribute('x', String(labelX));
-                        textEl.setAttribute('y', String(labelY));
-                        textEl.setAttribute('fill', '#000');
-                        textEl.setAttribute('font-size', '10');
-                        textEl.setAttribute('font-family', 'Console, monospace');
-                        textEl.textContent = content;
-                        textGroup.appendChild(textEl);
-
-                        occupiedBoxes.push({ x: boxX, y: boxY, width: boxWidth, height: boxHeight });
-                    }
+                    renderLabel(id, loc, content, false);
                 }
                 this.svg.appendChild(textGroup);
             }
@@ -657,8 +719,371 @@ export const ChartComponent = memo(() => {
                     const ids = points.map(p => p.identifier as number);
                     console.log("[TTAV] Selection Sync to Store:", ids);
                     setSelectedIndices(ids);
-                } else {
-                    setSelectedIndices([]);
+                }
+            }}
+        />
+    ) : null;
+
+    return (
+        <div
+            ref={atlasRef}
+            style={{
+                display: 'flex',
+                flexDirection: 'column',
+                width: '100%',
+                height: '100%',
+            }}
+        >
+            <div style={{ position: 'relative', flex: 1 }}>
+                {content ?? <div style={{ width: '100%', height: '100%' }} />}
+            </div>
+        </div>
+    );
+});
+
+export default ChartComponent;
+NeighborOverlay {
+        private el: HTMLDivElement | null = null;
+        private svg: SVGSVGElement | null = null;
+        private props: any;
+        private proxy: any;
+        private handleClickBound: any;
+        private defs: SVGDefsElement | null = null;
+        constructor(target: HTMLDivElement, props: any) {
+            this.el = target;
+            this.props = props;
+            this.proxy = props.proxy;
+            this.handleClickBound = this.handleClick.bind(this);
+            this.mount();
+        }
+        mount() {
+            if (!this.el) return;
+            this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            this.svg.setAttribute('width', String(this.proxy.width));
+            this.svg.setAttribute('height', String(this.proxy.height));
+            this.el.appendChild(this.svg);
+            this.svg.addEventListener('click', this.handleClickBound);
+            this.defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+            const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+            marker.setAttribute('id', 'trail-arrow');
+            marker.setAttribute('viewBox', '0 0 10 10');
+            marker.setAttribute('markerUnits', 'userSpaceOnUse');
+            marker.setAttribute('markerWidth', '10');
+            marker.setAttribute('markerHeight', '10');
+            marker.setAttribute('refX', '8');
+            marker.setAttribute('refY', '5');
+            marker.setAttribute('orient', 'auto');
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
+            path.setAttribute('fill', '#7F8C8D');
+            marker.appendChild(path);
+            this.defs.appendChild(marker);
+            this.svg.appendChild(this.defs);
+            this.render();
+        }
+        clear() {
+            if (this.svg) {
+                const children = Array.from(this.svg.childNodes);
+                for (const child of children) {
+                    if ((child as Element).nodeName.toLowerCase() !== 'defs') {
+                        this.svg.removeChild(child);
+                    }
+                }
+            }
+        }
+        handleClick(e: MouseEvent) {
+            if (!this.svg) return;
+            const rect = this.svg.getBoundingClientRect();
+            const sx = e.clientX - rect.left;
+            const sy = e.clientY - rect.top;
+            let minD2 = Infinity;
+            let minIdx = -1;
+            for (let i = 0; i < this.props.dataX.length; i++) {
+                const x = this.props.dataX[i];
+                const y = this.props.dataY[i];
+                const loc = this.proxy.location(x, y);
+                const dx = loc.x - sx;
+                const dy = loc.y - sy;
+                const d2 = dx * dx + dy * dy;
+                if (d2 < minD2) {
+                    minD2 = d2;
+                    minIdx = i;
+                }
+            }
+            const threshold = 100;
+            if (minIdx >= 0 && minD2 <= threshold) {
+                const id = this.props.idsByPos[minIdx];
+                if (this.props.setSelectedIndices) {
+                    console.log(`Click on id ${id}`);
+                    this.props.setSelectedIndices([id]);
+                }
+            }
+        }
+        render() {
+            if (!this.svg) return;
+            this.clear();
+            const { center, original, projection, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
+            const centerLoc = center ? this.proxy.location(center.x, center.y) : null;
+            const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            const drawNeighbor = (nid: number, color: string) => {
+                const pos = this.props.posMap.get(nid);
+                if (pos == null) return;
+                const x = dataX[pos];
+                const y = dataY[pos];
+        
+
+                const loc = this.proxy.location(x, y);
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', String(centerLoc.x));
+                line.setAttribute('y1', String(centerLoc.y));
+                line.setAttribute('x2', String(loc.x));
+                line.setAttribute('y2', String(loc.y));
+                line.setAttribute('stroke', color);
+                line.setAttribute('stroke-width', '1.5');
+                line.setAttribute('stroke-linecap', 'round');
+                neighborGroup.appendChild(line);
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', String(loc.x));
+                circle.setAttribute('cy', String(loc.y));
+                circle.setAttribute('r', String(pointSize + 1.5));
+                circle.setAttribute('fill', 'none');
+                circle.setAttribute('stroke', color);
+                circle.setAttribute('stroke-width', '2');
+                neighborGroup.appendChild(circle);
+            };
+            const COLOR_ORIG = '#E74C3C';
+            const COLOR_PROJ = '#2E86DE';
+            if (centerLoc) {
+                if (revealOriginalNeighbors) {
+                    original.forEach((nid: number) => drawNeighbor(nid, COLOR_ORIG));
+                }
+                if (revealProjectionNeighbors) {
+                    projection.forEach((nid: number) => drawNeighbor(nid, COLOR_PROJ));
+                }
+                this.svg.appendChild(neighborGroup);
+                const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                centerCircle.setAttribute('cx', String(centerLoc.x));
+                centerCircle.setAttribute('cy', String(centerLoc.y));
+                centerCircle.setAttribute('r', String(pointSize + 2));
+                centerCircle.setAttribute('fill', 'none');
+                centerCircle.setAttribute('stroke', '#666');
+                centerCircle.setAttribute('stroke-width', '2');
+                this.svg.appendChild(centerCircle);
+                if (this.props.showTrail) {
+                    const trailGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                    const epochs = this.props.availableEpochs || [];
+                    const currentIdx = epochs.indexOf(this.props.currentEpoch);
+                    const centerId = this.props.center?.identifier as number;
+                    if (typeof centerId === 'number') {
+                        const points: { x: number; y: number }[] = [];
+                        for (let i = 0; i <= currentIdx; i++) {
+                            const ep = epochs[i];
+                            const epData = this.props.allEpochData?.[ep];
+                            const coord = epData?.projection?.[centerId];
+                            if (!coord) continue;
+                            const locp = this.proxy.location(coord[0], coord[1]);
+                            points.push({ x: locp.x, y: locp.y });
+                        }
+                        for (let i = 0; i < points.length; i++) {
+                        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                        c.setAttribute('cx', String(points[i].x));
+                        c.setAttribute('cy', String(points[i].y));
+                        c.setAttribute('r', String(Math.max(3, pointSize + 1)));
+                        c.setAttribute('fill', '#7F8C8D');
+                        c.setAttribute('fill-opacity', '0.85');
+                        c.setAttribute('stroke', '#7F8C8D');
+                        c.setAttribute('stroke-width', '0.5');
+                        trailGroup.appendChild(c);
+                        }
+                        for (let i = 1; i < points.length; i++) {
+                            const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                            l.setAttribute('x1', String(points[i - 1].x));
+                            l.setAttribute('y1', String(points[i - 1].y));
+                            l.setAttribute('x2', String(points[i].x));
+                            l.setAttribute('y2', String(points[i].y));
+                            l.setAttribute('stroke', '#7F8C8D');
+                            l.setAttribute('stroke-width', '2');
+                            l.setAttribute('stroke-dasharray', '6 3');
+                            l.setAttribute('stroke-linecap', 'round');
+                            l.setAttribute('stroke-opacity', '0.9');
+                            l.setAttribute('marker-end', 'url(#trail-arrow)');
+                            trailGroup.appendChild(l);
+                        }
+                    }
+                    this.svg.appendChild(trailGroup);
+                }
+            } else {
+                this.svg.appendChild(neighborGroup);
+            }
+
+            const selectedGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            const selectedSet = new Set<number>(this.props.selectedIndices ?? []);
+            selectedSet.forEach((selectedId: number) => {
+                const pos = this.props.posMap.get(selectedId);
+                if (pos == null) return;
+                const x = dataX[pos];
+                const y = dataY[pos];
+                const loc = this.proxy.location(x, y);
+                const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                ring.setAttribute('cx', String(loc.x));
+                ring.setAttribute('cy', String(loc.y));
+                ring.setAttribute('r', String(pointSize + 3));
+                ring.setAttribute('fill', 'none');
+                ring.setAttribute('stroke', selectedId === this.props.center?.identifier ? '#111827' : '#f59e0b');
+                ring.setAttribute('stroke-width', selectedId === this.props.center?.identifier ? '2.5' : '2');
+                selectedGroup.appendChild(ring);
+            });
+            this.svg.appendChild(selectedGroup);
+
+            if (this.props.showLabel || this.props.showIndex || selectedSet.size > 0) {
+                const textGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                const occupiedBoxes: { x: number, y: number, width: number, height: number }[] = [];
+                const padding = 2;
+                const baseCharWidth = 6;
+                const baseCharHeight = 10;
+
+                const renderLabel = (id: number, loc: { x: number; y: number }, content: string, forceVisible: boolean) => {
+                    const fontSize = forceVisible ? 13 : 10;
+                    const charWidth = forceVisible ? 7.5 : baseCharWidth;
+                    const charHeight = forceVisible ? 13 : baseCharHeight;
+                    const labelX = loc.x + (pointSize + 2);
+                    const labelY = loc.y - (pointSize + 2);
+                    const boxX = labelX;
+                    const boxY = labelY - charHeight;
+                    const boxWidth = content.length * charWidth;
+                    const boxHeight = charHeight;
+
+                    let collision = false;
+                    if (!forceVisible) {
+                        for (const box of occupiedBoxes) {
+                            if (
+                                boxX < box.x + box.width + padding &&
+                                boxX + boxWidth + padding > box.x &&
+                                boxY < box.y + box.height + padding &&
+                                boxY + boxHeight + padding > box.y
+                            ) {
+                                collision = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (collision) return;
+
+                    const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    textEl.setAttribute('x', String(labelX));
+                    textEl.setAttribute('y', String(labelY));
+                    textEl.setAttribute('fill', forceVisible ? '#111827' : '#000');
+                    textEl.setAttribute('font-size', String(fontSize));
+                    textEl.setAttribute('font-family', 'Console, monospace');
+                    if (forceVisible) {
+                        textEl.setAttribute('font-weight', '700');
+                        textEl.setAttribute('paint-order', 'stroke');
+                        textEl.setAttribute('stroke', '#ffffff');
+                        textEl.setAttribute('stroke-width', '3');
+                        textEl.setAttribute('stroke-linejoin', 'round');
+                    }
+                    textEl.textContent = content;
+                    textGroup.appendChild(textEl);
+                    occupiedBoxes.push({ x: boxX, y: boxY, width: boxWidth, height: boxHeight });
+                };
+
+                selectedSet.forEach((selectedId: number) => {
+                    const pos = this.props.posMap.get(selectedId);
+                    if (pos == null) return;
+                    const x = this.props.dataX[pos];
+                    const y = this.props.dataY[pos];
+                    const loc = this.proxy.location(x, y);
+                    const labelTextData = this.props.textData && this.props.textData[selectedId] ? this.props.textData[selectedId] : (this.props.labelDict?.get(this.props.inherentLabelData[selectedId]) ?? '');
+                    const content = formatPointLabel(selectedId, labelTextData, true, true);
+                    if (!content) return;
+                    renderLabel(selectedId, loc, content, true);
+                });
+
+                for (let i = 0; i < this.props.dataX.length; i++) {
+                    const id = this.props.idsByPos[i];
+                    if (selectedSet.has(id)) continue;
+                    const x = this.props.dataX[i];
+                    const y = this.props.dataY[i];
+                    const loc = this.proxy.location(x, y);
+                    const labelTextData = this.props.textData && this.props.textData[id] ? this.props.textData[id] : (this.props.labelDict?.get(this.props.inherentLabelData[id]) ?? '');
+                    const content = formatPointLabel(id, labelTextData, this.props.showLabel, this.props.showIndex);
+                    if (!content) continue;
+                    renderLabel(id, loc, content, false);
+                }
+                this.svg.appendChild(textGroup);
+            }
+
+            
+        }
+        update(nextProps: Partial<any>) {
+            this.props = { ...this.props, ...nextProps };
+            if (this.svg) {
+                this.svg.setAttribute('width', String(this.props.proxy.width));
+                this.svg.setAttribute('height', String(this.props.proxy.height));
+            }
+            this.render();
+        }
+        destroy() {
+            if (this.svg && this.el) {
+                this.el.removeChild(this.svg);
+            }
+            if (this.svg) {
+                this.svg.removeEventListener('click', this.handleClickBound);
+            }
+            this.defs = null;
+            this.svg = null;
+            this.el = null;
+        }
+    }
+
+    // find selected datapoint
+    async function querySelection(x: number, y: number, unitDistance: number): Promise<DataPoint | null> {
+        if (!prepared) {
+            return null;
+        }
+        let simpleData = prepared.simpleData;
+        let minDistance2: number | null = null;
+        let minIndex: number | null = null;
+        for (let i = 0; i < simpleData.x.length; i++) {
+        let d2 = (simpleData.x[i] - x) * (simpleData.x[i] - x) + (simpleData.y[i] - y) * (simpleData.y[i] - y);
+        if (minDistance2 == null || d2 < minDistance2) {
+            minDistance2 = d2;
+            minIndex = i;
+        }
+        }
+        if (minIndex == null || minDistance2 == null || Math.sqrt(minDistance2) > unitDistance * 10) {
+            return null;
+        }
+        return prepared.dataPoints[minIndex];
+    }
+
+    const content = prepared ? (
+        <EmbeddingView
+            data={prepared.simpleData}
+            categoryColors={prepared.categoryColors}
+            width={dimensions.width || undefined}
+            height={dimensions.height || undefined}
+            config={{ mode: mode, colorScheme: 'light', pointSize: pointSize }}
+            tooltip={tooltip}
+            onTooltip={(v) => {
+                setHoveredIndex(v ? v.identifier as number : undefined);
+                setTooltip(v);
+            }}
+            viewportState={viewportState}
+            onViewportState={(v) => setViewportState(v)}
+            querySelection={ querySelection }
+            customOverlay={{
+                class: NeighborOverlay as any,
+                props: { ...neighborOverlayProps, posMap }
+            }}
+            // [确定性逻辑 3]：确保 EmbeddingView 的选中事件同步到全局 Store
+            onSelection={(points) => {
+                if (points && points.length > 0) {
+                    // 从 DataPoint 对象中提取出我们之前存入的 identifier (即原始索引)
+                    const ids = points.map(p => p.identifier as number);
+                    console.log("[TTAV] Selection Sync to Store:", ids);
+                    setSelectedIndices(ids);
                 }
             }}
         />

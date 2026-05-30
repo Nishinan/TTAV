@@ -1,0 +1,52 @@
+{
+  "phase": "phase2_blending",
+  "content_path": "/home/yilu/workspace/Dataset/backdoor",
+  "baseline_vis_id": "1",
+  "epoch": 10,
+  "bbox": {
+    "x_min": 3.577545,
+    "x_max": 3.653369,
+    "y_min": 1.164337,
+    "y_max": 1.236651
+  },
+  "decay_ratio": 0.35,
+  "rows": [
+    {
+      "candidate": "seeds_only",
+      "focus_set_size": 3,
+      "direct_focus_shift": 0.025798887014389038,
+      "blended_focus_shift": 0.025798887014389038,
+      "direct_global_drift": 0.014542465098202229,
+      "blended_global_drift": 0.00015019362035673112,
+      "decay_ratio": 0.35
+    },
+    {
+      "candidate": "seeds_plus_hd",
+      "focus_set_size": 48,
+      "direct_focus_shift": 0.048094820231199265,
+      "blended_focus_shift": 0.016360273584723473,
+      "direct_global_drift": 0.013647782616317272,
+      "blended_global_drift": 0.00018681856454350054,
+      "decay_ratio": 0.35
+    },
+    {
+      "candidate": "seeds_plus_bbox",
+      "focus_set_size": 44,
+      "direct_focus_shift": 0.05846455320715904,
+      "blended_focus_shift": 0.05846455320715904,
+      "direct_global_drift": 0.009998675435781479,
+      "blended_global_drift": 0.00020209673675708473,
+      "decay_ratio": 0.35
+    },
+    {
+      "candidate": "seeds_plus_bbox_plus_hd",
+      "focus_set_size": 75,
+      "direct_focus_shift": 0.04154643788933754,
+      "blended_focus_shift": 0.022475475445389748,
+      "direct_global_drift": 0.010870715603232384,
+      "blended_global_drift": 0.00016084006347227842,
+      "decay_ratio": 0.35
+    }
+  ],
+  "source_phase1b_metrics": "/home/yilu/workspace/time-travelling-visualizer/refine_validation_results/phase1b_refine_compare/metrics_20260530_095238.json"
+}

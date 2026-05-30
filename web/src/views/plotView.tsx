@@ -10,6 +10,7 @@ import * as BackendAPI from '../communication/backend';
 
 import "../index.css";
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { REFINE_DEFAULTS } from '../config/refine';
 
 const LOG_PREFIX = '[TTVisualizer]';
 
@@ -27,6 +28,7 @@ interface EIFJumpPayload {
     taskType?: string;
     selectedIndices?: number[];
     targetIndex?: number;
+    selectedSourceIndex?: number;
 }
 
 function parseEIFJumpPayloadFromLocation(): EIFJumpPayload | null {
@@ -101,6 +103,64 @@ interface FunctionViewPanelsProps {
         }
         return data;
     };
+
+const DEFAULT_BLEND_DECAY_RATIO = REFINE_DEFAULTS.blendDecayRatio;
+
+function distanceToBBox(x: number, y: number, bbox: { xMin: number; xMax: number; yMin: number; yMax: number }): number {
+    const dx = x < bbox.xMin ? bbox.xMin - x : (x > bbox.xMax ? x - bbox.xMax : 0);
+    const dy = y < bbox.yMin ? bbox.yMin - y : (y > bbox.yMax ? y - bbox.yMax : 0);
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function buildBlendedProjection(
+    baselineProjection: number[][],
+    refinedProjection: number[][],
+    bbox: { xMin: number; xMax: number; yMin: number; yMax: number } | null,
+    focusIndices: number[] = [],
+    decayRatio: number = DEFAULT_BLEND_DECAY_RATIO,
+): number[][] {
+    if (baselineProjection.length !== refinedProjection.length) {
+        return refinedProjection;
+    }
+
+    const bboxWidth = bbox ? Math.max(Math.abs(bbox.xMax - bbox.xMin), 1e-6) : 1e-6;
+    const bboxHeight = bbox ? Math.max(Math.abs(bbox.yMax - bbox.yMin), 1e-6) : 1e-6;
+    const bboxDecay = Math.max(Math.sqrt(bboxWidth * bboxWidth + bboxHeight * bboxHeight) * decayRatio, 1e-6);
+
+    const validFocusIndices = focusIndices.filter((idx) => idx >= 0 && idx < baselineProjection.length);
+    const focusCoords = validFocusIndices.map((idx) => baselineProjection[idx]);
+    let focusDecay = bboxDecay;
+    if (focusCoords.length > 1) {
+        const center = focusCoords.reduce(
+            (acc, point) => [acc[0] + point[0], acc[1] + point[1]],
+            [0, 0]
+        ).map((v) => v / focusCoords.length) as [number, number];
+        const radii = focusCoords.map((point) => Math.hypot(point[0] - center[0], point[1] - center[1]));
+        const sorted = [...radii].sort((a, b) => a - b);
+        const q75 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))] ?? 0;
+        focusDecay = Math.max(q75 * 1.5, bboxDecay * 0.5, 1e-6);
+    }
+
+    return baselineProjection.map((baselinePoint, idx) => {
+        const refinedPoint = refinedProjection[idx] ?? baselinePoint;
+        const bboxWeight = bbox
+            ? (() => {
+                const d = distanceToBBox(baselinePoint[0], baselinePoint[1], bbox);
+                return d <= 1e-12 ? 1 : Math.exp(-d / bboxDecay);
+            })()
+            : 0;
+        const focusWeight = validFocusIndices.length > 0
+            ? (validFocusIndices.includes(idx)
+                ? 1
+                : Math.exp(-Math.min(...focusCoords.map((point) => Math.hypot(baselinePoint[0] - point[0], baselinePoint[1] - point[1]))) / focusDecay))
+            : 0;
+        const weight = Math.max(bboxWeight, focusWeight);
+        return [
+            baselinePoint[0] * (1 - weight) + refinedPoint[0] * weight,
+            baselinePoint[1] * (1 - weight) + refinedPoint[1] * weight,
+        ];
+    });
+}
 
 const initStaticContext = async (contentPath: string, dataType: string) => {
     // 1. 获取训练进程的基础信息
@@ -236,6 +296,8 @@ export const evaluateProjectionQuality = async (
 
     let trustSum = 0;
     let trustCount = 0;
+    let continuitySum = 0;
+    let continuityCount = 0;
     const N = newProj.length;
 
     selectedIndices.forEach(rawIdx => {
@@ -260,14 +322,27 @@ export const evaluateProjectionQuality = async (
         const norm = k * (2 * N - 3 * k - 1) / 2;
         trustSum += norm > 0 ? 1 - penalty / norm : 1;
         trustCount++;
+
+        let continuityPenalty = 0;
+        highList.slice(0, k).forEach(j => {
+            if (!lowList.slice(0, k).includes(j)) {
+                const rank = lowList.indexOf(j);
+                const r = rank === -1 ? lowList.length + 1 : rank + 1;
+                continuityPenalty += (r - k);
+            }
+        });
+        continuitySum += norm > 0 ? 1 - continuityPenalty / norm : 1;
+        continuityCount++;
     });
     const avgTrustworthiness = trustCount > 0 ? trustSum / trustCount : 1;
+    const avgContinuity = continuityCount > 0 ? continuitySum / continuityCount : 1;
 
     console.log("-----------------------------------------");
     console.log(`> Focus Displacement: ${avgFocusShift.toFixed(4)}`);
     console.log(`> Global Drift: ${avgGlobalDrift.toFixed(4)}`);
     console.log(`> Neighbor Preservation: ${(avgNeighborConsistency * 100).toFixed(2)}%`);
     console.log(`> Trustworthiness: ${(avgTrustworthiness * 100).toFixed(2)}%`);
+    console.log(`> Continuity: ${(avgContinuity * 100).toFixed(2)}%`);
     console.log("-----------------------------------------");
 
     return {
@@ -275,6 +350,7 @@ export const evaluateProjectionQuality = async (
         avgGlobalDrift,
         avgNeighborConsistency,
         avgTrustworthiness,
+        avgContinuity,
     };
 };
 
@@ -384,11 +460,11 @@ function MessageHandler() {
     const {
         setContentPath, setAvailableEpochs, setDataType, setTaskType,
         setTextData, setTokenList, setInherentLabelData,
-        setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices,
+        setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices, setHoveredIndex,
     } = useDefaultStore([
         'setContentPath', 'setAvailableEpochs', 'setDataType', 'setTaskType',
         'setTextData', 'setTokenList', 'setInherentLabelData',
-        'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices'
+        'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices', 'setHoveredIndex'
     ]);
 
     // Start visualizing process
@@ -510,12 +586,27 @@ function MessageHandler() {
         }
     };
 
+    const applyEIFHighlightUpdate = (payload: EIFJumpPayload) => {
+        const selected = normalizeSelectedIndices(payload.selectedIndices);
+        setSelectedIndices(selected);
+        setHoveredIndex(typeof payload.targetIndex === 'number' ? payload.targetIndex : undefined);
+    };
+
     // 增加一个 Ref 锁，防止同一 ID 的任务被重复触发
     const processingMessageIds = useRef(new Set<string>());
 
     const handleMessage = async (event: MessageEvent) => {
         const { command, data } = event.data;
         console.log('Received message from extension:', event);
+
+        if (command === 'eifHighlightUpdate') {
+            const currentContentPath = useGlobalStore.getState().contentPath;
+            if (!data?.contentPath || (currentContentPath && data.contentPath !== currentContentPath)) {
+                return;
+            }
+            applyEIFHighlightUpdate(data as EIFJumpPayload);
+            return;
+        }
 
         // 如果插件没传 id，可以用 command + contentPath 组合成简单锁
         const lockKey = `${command}-${data?.contentPath}`;
@@ -572,10 +663,7 @@ function MessageHandler() {
                 { gpu_id: -1 }
             );
             if (!loaded) return;
-            setSelectedIndices(selected);
-            if (payload.targetIndex != null) {
-                setValue('hoveredIndex', payload.targetIndex);
-            }
+            applyEIFHighlightUpdate(payload);
             const sampleLabel = payload.sampleId ? ` ${payload.sampleId}` : '';
             message.success(`EIF jump loaded${sampleLabel}. ${selected.length} token(s) selected.`);
         })();
@@ -597,6 +685,7 @@ export function AppCombinedView() {
         taskType,
         setValue,
         focusMode,
+        currentViewportBBox,
     } = useDefaultStore([
         'contentPath',
         'selectedIndices',
@@ -606,6 +695,7 @@ export function AppCombinedView() {
         'taskType',
         'setValue',
         'focusMode',
+        'currentViewportBBox',
     ]);
 // 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
     const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
@@ -670,50 +760,72 @@ export function AppCombinedView() {
 
         try {
             const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
-            const response = await BackendAPI.updateFocusContext(contentPath, selectedIndices, focusMode, epoch);
+            const response = await BackendAPI.updateFocusContext(
+                contentPath,
+                selectedIndices,
+                focusMode,
+                epoch,
+                currentViewportBBox
+            );
 
             if (response && response.status === "success") {
                 console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
 
                 // After refine, only projection coords and low-D neighbors change.
                 // Re-use originalNeighbors/prediction/background from oldEpochData to skip those requests.
-                const [projResp, projNeighResp] = await Promise.all([
-                    BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true),
-                    BackendAPI.getProjectionNeighbors(contentPath, vis_method, currentVisID, targetEpoch, true),
-                ]);
+                const focusIndices = Array.isArray((response as any).focus_indices)
+                    ? (response as any).focus_indices as number[]
+                    : selectedIndices;
+
+                const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
+                const refinedProjection = projResp.projection || oldEpochData.projection;
+                const projNeighResp = await BackendAPI.getProjectionNeighbors(
+                    contentPath,
+                    vis_method,
+                    currentVisID,
+                    targetEpoch,
+                    true,
+                    currentViewportBBox,
+                    focusIndices,
+                    DEFAULT_BLEND_DECAY_RATIO,
+                );
+                const blendedProjection = buildBlendedProjection(
+                    oldEpochData.projection,
+                    refinedProjection,
+                    currentViewportBBox,
+                    focusIndices,
+                );
 
                 const newEpochData = {
                     ...oldEpochData,
-                    projection: projResp.projection || oldEpochData.projection,
+                    projection: blendedProjection,
                     projectionNeighbors: projNeighResp.neighbors || oldEpochData.projectionNeighbors,
                     indexList: projNeighResp.index_list || oldEpochData.indexList,
                 };
 
                 // Write updated epoch data to store so canvas re-renders
                 const state = useGlobalStore.getState();
+                state.setValue('focusIndices', focusIndices);
                 state.setValue('allEpochData', { ...state.allEpochData, [targetEpoch]: newEpochData });
 
-                const metrics = await evaluateProjectionQuality(epoch, selectedIndices, oldEpochData, newEpochData);
+                const metrics = await evaluateProjectionQuality(epoch, focusIndices, oldEpochData, newEpochData);
                 if (metrics) {
                     // All three quality metrics come from the backend — exact computation
                     // over the full dataset using final encoder weights, not cached neighbors.
                     const r = response as any;
-                    const backendNP    = r.neighbor_preservation;
-                    const backendMRH   = r.mean_rank_hd;
-                    const backendTrust = r.trustworthiness;
-                    const backendCont  = r.continuity;
+                    const backendMRH = r.mean_rank_hd;
                     useGlobalStore.getState().setValue('refineMetrics', {
                         focusDisplacement: metrics.avgFocusShift,
                         globalDrift:       metrics.avgGlobalDrift,
-                        neighborPreservation: backendNP    != null ? backendNP    / 100 : metrics.avgNeighborConsistency,
-                        meanRankHD:           backendMRH   != null ? backendMRH          : 0,
-                        trustworthiness:      backendTrust != null ? backendTrust / 100 : metrics.avgTrustworthiness,
-                        continuity:           backendCont  != null ? backendCont  / 100 : 0,
+                        neighborPreservation: metrics.avgNeighborConsistency,
+                        meanRankHD:           backendMRH != null ? backendMRH : 0,
+                        trustworthiness:      metrics.avgTrustworthiness,
+                        continuity:           metrics.avgContinuity,
                     });
                 }
-                calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, selectedIndices, newEpochData.indexList || []);
+                calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, focusIndices, newEpochData.indexList || []);
 
-                message.success({ content: `Epoch ${targetEpoch} refined! Plot updated!`, key: REFINE_MSG_KEY });
+                message.success({ content: `Epoch ${targetEpoch} refined! Blended view updated!`, key: REFINE_MSG_KEY });
             } else {
                 message.error({ content: 'Refinement returned unexpected status.', key: REFINE_MSG_KEY });
             }

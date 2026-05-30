@@ -16,6 +16,7 @@ sys.path.append('../..')
 sys.path.append('../visualize')
 
 from server_utils import *
+from refine_runtime_config import REFINE_RUNTIME_DEFAULTS
 
 # flask for API server
 app = Flask(__name__)
@@ -111,6 +112,7 @@ def update_focus_context():
     selected_indices = req.get("selected_indices", [])
     focus_mode = req.get("focus_mode", "balanced")
     current_epoch = req.get("current_epoch", None)  # epoch currently viewed by user
+    zoom_bbox = req.get("zoom_bbox")
 
     # Check if a session is active
     if active_session["strategy"] is None:
@@ -134,10 +136,31 @@ def update_focus_context():
     try:
         print(f"Starting refinement: mode={focus_mode}, selected_points={selected_indices}")
 
-        mask = strategy.get_focus_mask(selected_indices)
-        strategy.update_ttav_context(selected_indices, focus_mode, mask)
-
         vis_method = active_session["vis_method"]
+        focus_indices = selected_indices
+        focus_summary = {
+            "seed_count": len(selected_indices),
+            "bbox_count": 0,
+            "hd_neighbor_count": 0,
+            "focus_set_size": len(selected_indices),
+            "used_bbox": False,
+        }
+
+        if vis_method == "TimeVis":
+            hd_k = int(active_session.get("vis_config", {}).get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+            focus_indices, focus_summary = build_focus_set(
+                content_path=content_path,
+                vis_method=vis_method,
+                vis_id=active_session["vis_id"],
+                epoch=current_epoch,
+                seed_indices=selected_indices,
+                zoom_bbox=zoom_bbox,
+                hd_k=hd_k,
+            )
+
+        mask = strategy.get_focus_mask(focus_indices)
+        strategy.update_ttav_context(focus_indices, focus_mode, mask)
+
         if vis_method == "DynaVis":
             strategy.refine_train(focus_mode=focus_mode)
             print("Start generating DynaVis visualization results...")
@@ -146,7 +169,7 @@ def update_focus_context():
         elif vis_method in ("DVI", "TimeVis"):
             print("Start refining visualization model...")
             strategy.refine(
-                focus_indices=selected_indices,
+                focus_indices=focus_indices,
                 neighbor_indices=[],
                 current_epoch=current_epoch,
                 epochs_to_update=10
@@ -171,6 +194,11 @@ def update_focus_context():
             "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
             "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
             "continuity":            getattr(strategy, '_last_refine_cont',   None),
+            "focus_set_size":        focus_summary["focus_set_size"],
+            "focus_seed_count":      focus_summary["seed_count"],
+            "focus_bbox_count":      focus_summary["bbox_count"],
+            "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
+            "focus_indices":         focus_indices,
         })
 
     except Exception as e:
@@ -381,7 +409,10 @@ def register_eif_bundle():
         return jsonify({"status": "error", "message": "All bundle arrays must have the same length"}), 400
 
     target_dir = EIF_BUNDLE_ROOT / sample_id
-    if target_dir.exists() and not overwrite:
+    method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}"
+    refined_method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}_refined"
+
+    if method_dir.exists() and not overwrite:
         return jsonify({
             "status": "success",
             "sample_id": sample_id,
@@ -391,9 +422,14 @@ def register_eif_bundle():
             "vis_id": vis_id,
             "cached": True,
         })
-    if target_dir.exists() and overwrite:
-        shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    if overwrite:
+        invalidate_bundle_neighbor_caches(str(target_dir))
+        if method_dir.exists():
+            shutil.rmtree(method_dir)
+        if refined_method_dir.exists():
+            shutil.rmtree(refined_method_dir)
 
     dataset_dir = target_dir / "dataset"
     epoch_dir = target_dir / "epochs" / "epoch_1"
@@ -676,9 +712,27 @@ def get_projection_neighbors():
     vis_method = req['vis_method']
     # Support refine_flag so the caller can request neighbors from the refined projection
     refine_flag = bool(req.get('refine_flag', False))
+    blend_bbox = req.get('blend_bbox')
+    blend_decay_ratio = float(req.get('blend_decay_ratio', REFINE_RUNTIME_DEFAULTS['blend_decay_ratio']))
+    blend_focus_indices = req.get('blend_focus_indices') or []
 
     try:
-        neighbors, index_list = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, refine_flag=refine_flag)
+        if blend_bbox is not None or blend_focus_indices:
+            blended_projection = build_runtime_blended_projection(
+                content_path,
+                vis_method,
+                vis_id,
+                epoch,
+                blend_bbox,
+                decay_ratio=blend_decay_ratio,
+                focus_indices=blend_focus_indices,
+            )
+            neighbors, index_list = calculate_projection_neighbors_for_projection(
+                content_path,
+                blended_projection,
+            )
+        else:
+            neighbors, index_list = calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, refine_flag=refine_flag)
         result = jsonify({
             'neighbors': neighbors,
             'index_list': index_list,

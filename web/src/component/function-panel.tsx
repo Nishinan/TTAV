@@ -1,6 +1,6 @@
 import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button, Tooltip } from 'antd';
 import { useDefaultStore,FocusMode } from '../state/state.unified';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
 import { SyncOutlined } from '@ant-design/icons';
@@ -104,8 +104,8 @@ function hexToRgbArray(hex: string): [number, number, number] {
 }
 
 export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
-    const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode } =
-        useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode"]);
+    const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode, epoch, allEpochData } =
+        useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode", "epoch", "allEpochData"]);
     const { refineMetrics } = useDefaultStore(['refineMetrics']);
     const { revealOriginalNeighbors, revealProjectionNeighbors, setRevealOriginalNeighbors, setRevealProjectionNeighbors } =
         useDefaultStore(["revealOriginalNeighbors", "revealProjectionNeighbors", "setRevealOriginalNeighbors", "setRevealProjectionNeighbors"]);
@@ -238,6 +238,44 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
             title: tokenList ? tokenList[num] ?? '' : ''
         })));
     }, [selectedIndices, tokenList]);
+
+    const selectedRelations = useMemo(() => {
+        const epochData = allEpochData[epoch];
+        if (!epochData || selectedIndices.length < 2) return [];
+
+        const relations: Array<{
+            key: string;
+            left: SampleTag;
+            right: SampleTag;
+            hdMutual: boolean;
+            hdOneWay: boolean;
+            ldMutual: boolean;
+            ldOneWay: boolean;
+        }> = [];
+
+        for (let i = 0; i < selectedItems.length; i++) {
+            for (let j = i + 1; j < selectedItems.length; j++) {
+                const left = selectedItems[i];
+                const right = selectedItems[j];
+                const leftHd = epochData.originalNeighbors?.[left.num]?.includes(right.num) ?? false;
+                const rightHd = epochData.originalNeighbors?.[right.num]?.includes(left.num) ?? false;
+                const leftLd = epochData.projectionNeighbors?.[left.num]?.includes(right.num) ?? false;
+                const rightLd = epochData.projectionNeighbors?.[right.num]?.includes(left.num) ?? false;
+
+                relations.push({
+                    key: `${left.num}-${right.num}`,
+                    left,
+                    right,
+                    hdMutual: leftHd && rightHd,
+                    hdOneWay: (leftHd || rightHd) && !(leftHd && rightHd),
+                    ldMutual: leftLd && rightLd,
+                    ldOneWay: (leftLd || rightLd) && !(leftLd && rightLd),
+                });
+            }
+        }
+
+        return relations;
+    }, [allEpochData, epoch, selectedIndices, selectedItems]);
 
     return (
         <div className="info-column">
@@ -404,6 +442,18 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
             </FunctionalBlock>
             <FunctionalBlock label="Selected">
                 <ComponentBlock>
+                    {selectedItems.length > 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                            <span style={{ fontSize: 12, color: '#666' }}>{selectedItems.length} selected</span>
+                            <Button
+                                size="small"
+                                danger
+                                onClick={() => setSelectedIndices([])}
+                            >
+                                Clear All
+                            </Button>
+                        </div>
+                    )}
                     <div className="tag-list">
                         {
                             selectedItems.length
@@ -428,6 +478,25 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
                                 <div className='alt-text placeholder-block'>No selected item</div>
                         }
                     </div>
+                    {selectedRelations.length > 0 && (
+                        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            <div style={{ fontSize: 12, color: '#666', fontWeight: 600 }}>Selected Relations</div>
+                            {selectedRelations.map((relation) => (
+                                <div key={relation.key} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 12 }}>
+                                    <span style={{ color: '#1f2937' }}>{relation.left.num}</span>
+                                    <span style={{ color: '#9ca3af' }}>↔</span>
+                                    <span style={{ color: '#1f2937' }}>{relation.right.num}</span>
+                                    {relation.hdMutual && <Tag color="red">HD↔</Tag>}
+                                    {relation.hdOneWay && <Tag color="volcano">HD→</Tag>}
+                                    {relation.ldMutual && <Tag color="blue">LD↔</Tag>}
+                                    {relation.ldOneWay && <Tag color="geekblue">LD→</Tag>}
+                                    {!relation.hdMutual && !relation.hdOneWay && !relation.ldMutual && !relation.ldOneWay && (
+                                        <Tag>None</Tag>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </ComponentBlock>
             </FunctionalBlock>
             <FunctionalBlock label="Settings">

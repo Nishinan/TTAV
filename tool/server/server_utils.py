@@ -84,6 +84,131 @@ def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
 
     return projection_list
 
+
+def _distance_to_bbox(x, y, bbox):
+    dx = bbox["x_min"] - x if x < bbox["x_min"] else (x - bbox["x_max"] if x > bbox["x_max"] else 0.0)
+    dy = bbox["y_min"] - y if y < bbox["y_min"] else (y - bbox["y_max"] if y > bbox["y_max"] else 0.0)
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def build_runtime_blended_projection(content_path, vis_method, vis_id, epoch, blend_bbox, decay_ratio=0.35, focus_indices=None):
+    baseline = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False), dtype=np.float32)
+    refined = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=True), dtype=np.float32)
+
+    if baseline.shape != refined.shape:
+        return refined.tolist()
+
+    focus_indices = [int(i) for i in (focus_indices or []) if 0 <= int(i) < len(baseline)]
+    bbox_width = 1e-6
+    bbox_height = 1e-6
+    if blend_bbox is not None:
+        bbox_width = max(abs(float(blend_bbox["x_max"]) - float(blend_bbox["x_min"])), 1e-6)
+        bbox_height = max(abs(float(blend_bbox["y_max"]) - float(blend_bbox["y_min"])), 1e-6)
+    bbox_decay = max(math.sqrt(bbox_width * bbox_width + bbox_height * bbox_height) * float(decay_ratio), 1e-6)
+
+    focus_weights = np.zeros(len(baseline), dtype=np.float32)
+    if focus_indices:
+        focus_coords = baseline[np.array(focus_indices)]
+        if len(focus_coords) == 1:
+            focus_decay = bbox_decay
+        else:
+            focus_center = focus_coords.mean(axis=0)
+            focus_radius = np.linalg.norm(focus_coords - focus_center, axis=1)
+            focus_decay = max(float(np.percentile(focus_radius, 75)) * 1.5, bbox_decay * 0.5, 1e-6)
+        nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(focus_coords)
+        dists, _ = nbrs.kneighbors(baseline)
+        focus_weights = np.exp(-(dists[:, 0] / focus_decay)).astype(np.float32)
+        focus_weights[np.array(focus_indices)] = 1.0
+
+    blended = np.empty_like(baseline)
+    for idx, base in enumerate(baseline):
+        refined_pt = refined[idx]
+        bbox_weight = 0.0
+        if blend_bbox is not None:
+            dist = _distance_to_bbox(float(base[0]), float(base[1]), blend_bbox)
+            bbox_weight = 1.0 if dist <= 1e-12 else math.exp(-dist / bbox_decay)
+        weight = max(float(focus_weights[idx]), float(bbox_weight))
+        blended[idx] = base * (1.0 - weight) + refined_pt * weight
+    return blended.tolist()
+
+def load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_flag=False):
+    """Load raw projection.npy without train/test reordering."""
+    suffix = "_refined" if refine_flag else ""
+    projection_path = os.path.join(
+        content_path,
+        "visualize",
+        f"{vis_method}_{vis_id}{suffix}",
+        "epochs",
+        f"epoch_{epoch}",
+        "projection.npy",
+    )
+
+    if refine_flag and not os.path.exists(projection_path):
+        projection_path = os.path.join(
+            content_path,
+            "visualize",
+            f"{vis_method}_{vis_id}",
+            "epochs",
+            f"epoch_{epoch}",
+            "projection.npy",
+        )
+
+    if not os.path.exists(projection_path):
+        raise FileNotFoundError(f"Projection not found: {projection_path}")
+    return np.load(projection_path)
+
+
+def build_focus_set(content_path, vis_method, vis_id, epoch, seed_indices, zoom_bbox=None, hd_k=15):
+    """Construct Phase-1 focus_set = seeds ∪ bbox points ∪ high-D neighbors."""
+    seed_set = {int(i) for i in seed_indices if isinstance(i, (int, np.integer)) or str(i).isdigit()}
+    bbox_set = set()
+    hd_set = set()
+
+    if epoch is None:
+        focus_indices = sorted(seed_set)
+        return focus_indices, {
+            "seed_count": len(seed_set),
+            "bbox_count": 0,
+            "hd_neighbor_count": 0,
+            "focus_set_size": len(focus_indices),
+            "used_bbox": False,
+        }
+
+    if zoom_bbox:
+        proj = load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_flag=False)
+        if proj.ndim == 2 and proj.shape[1] >= 2:
+            x_min = min(float(zoom_bbox["x_min"]), float(zoom_bbox["x_max"]))
+            x_max = max(float(zoom_bbox["x_min"]), float(zoom_bbox["x_max"]))
+            y_min = min(float(zoom_bbox["y_min"]), float(zoom_bbox["y_max"]))
+            y_max = max(float(zoom_bbox["y_min"]), float(zoom_bbox["y_max"]))
+            mask = (
+                (proj[:, 0] >= x_min) & (proj[:, 0] <= x_max) &
+                (proj[:, 1] >= y_min) & (proj[:, 1] <= y_max)
+            )
+            bbox_set = set(np.where(mask)[0].tolist())
+
+    emb_path = os.path.join(content_path, "epochs", f"epoch_{epoch}", "embeddings.npy")
+    if os.path.exists(emb_path):
+        features = np.load(emb_path)
+        n = len(features)
+        valid_seeds = sorted(i for i in seed_set if 0 <= i < n)
+        if valid_seeds and n > 1:
+            k = min(max(hd_k + 1, 2), n)
+            nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(features)
+            _, nn_idx = nbrs.kneighbors(features[valid_seeds])
+            hd_set = set(nn_idx.flatten().tolist())
+            hd_set -= set(valid_seeds)
+            seed_set = set(valid_seeds)
+
+    focus_indices = sorted(seed_set | bbox_set | hd_set)
+    return focus_indices, {
+        "seed_count": len(seed_set),
+        "bbox_count": len(bbox_set),
+        "hd_neighbor_count": len(hd_set),
+        "focus_set_size": len(focus_indices),
+        "used_bbox": zoom_bbox is not None,
+    }
+
 # Func: load one sample from content_path
 def load_one_sample(config, content_path, index):
     attributes = config['dataset']['attributes']
@@ -317,6 +442,30 @@ def invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, epoc
     key = (content_path, vis_method, vis_id, epoch, True)
     _faiss_index_cache.pop(key, None)
 
+
+def invalidate_bundle_neighbor_caches(content_path):
+    """Delete stale neighbor caches for a bundle after the on-disk files are replaced."""
+    if not os.path.exists(content_path):
+        return
+
+    for root, _, files in os.walk(content_path):
+        for file_name in files:
+            if (
+                file_name.startswith("proj_neighbors_")
+                and file_name.endswith(".json")
+            ) or (
+                file_name.startswith("hd_neighbors_")
+                and file_name.endswith(".json")
+            ):
+                try:
+                    os.remove(os.path.join(root, file_name))
+                except FileNotFoundError:
+                    pass
+
+    stale_keys = [key for key in _faiss_index_cache.keys() if key[0] == content_path]
+    for key in stale_keys:
+        _faiss_index_cache.pop(key, None)
+
 def update_projection_neighbors_incremental(
     content_path, vis_method, vis_id, epoch, patched_indices, max_neighbors=10
 ):
@@ -375,6 +524,18 @@ def update_projection_neighbors_incremental(
 
     return neighbors, index_list
 
+def _search_projection_neighbors(proj, max_neighbors):
+    try:
+        import faiss
+        index = faiss.IndexFlatL2(proj.shape[1])
+        index.add(proj)
+        _, indices = index.search(proj, max_neighbors + 1)
+        return indices
+    except Exception:
+        nbrs = NearestNeighbors(n_neighbors=max_neighbors + 1, algorithm='auto').fit(proj)
+        _, indices = nbrs.kneighbors(proj)
+        return indices.astype(np.int64)
+
 # In-process faiss index cache: key → (faiss_index, projection_array)
 # Avoids rebuilding the index on every /getProjectionNeighbors call.
 _faiss_index_cache: dict = {}
@@ -394,6 +555,14 @@ def _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag):
     _faiss_index_cache[key] = (index, proj)
     return index, proj
 
+def calculate_projection_neighbors_for_projection(content_path, projection_list, max_neighbors=10):
+    index_dict = load_or_create_index(content_path)
+    index_list = index_dict['train'] + index_dict['test']
+    proj = np.array(projection_list, dtype='float32')
+    indices = _search_projection_neighbors(proj, max_neighbors)
+    neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)] for i in range(len(proj))]
+    return neighbors, index_list
+
 def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10, refine_flag=False):
     index_dict = load_or_create_index(content_path)
     index_list = index_dict['train'] + index_dict['test']
@@ -404,9 +573,14 @@ def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_
         with open(cache_path, 'r') as f:
             return json.load(f), index_list
 
-    # --- build via faiss (fast, result cached in memory too) ---
-    faiss_index, proj = _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag)
-    _, indices = faiss_index.search(proj, max_neighbors + 1)  # +1 to skip self
+    # --- build via faiss when available, otherwise fall back to sklearn ---
+    try:
+        faiss_index, proj = _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag)
+        _, indices = faiss_index.search(proj, max_neighbors + 1)  # +1 to skip self
+    except Exception:
+        projection_list = load_projection(content_path, vis_method, vis_id, epoch, refine_flag)
+        proj = np.array(projection_list, dtype='float32')
+        indices = _search_projection_neighbors(proj, max_neighbors)
 
     neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)]
                  for i in range(len(proj))]

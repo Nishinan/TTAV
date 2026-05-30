@@ -7,6 +7,13 @@ interface NetworkOptions {
     host?: string;
 }
 
+export interface ViewportBBox {
+    xMin: number;
+    xMax: number;
+    yMin: number;
+    yMax: number;
+}
+
 /**
  * Interfaces
  */
@@ -57,6 +64,7 @@ export function updateFocusContext(
     selectedIndices: number[],
     focusMode: string,
     currentEpoch?: number,
+    zoomBBox?: ViewportBBox | null,
     options?: NetworkOptions
 ) {
     const data: Record<string, any> = {
@@ -66,6 +74,14 @@ export function updateFocusContext(
     };
     if (currentEpoch !== undefined) {
         data["current_epoch"] = currentEpoch;
+    }
+    if (zoomBBox) {
+        data["zoom_bbox"] = {
+            "x_min": zoomBBox.xMin,
+            "x_max": zoomBBox.xMax,
+            "y_min": zoomBBox.yMin,
+            "y_max": zoomBBox.yMax,
+        };
     }
     return basicPostWithJsonResponse('/updateFocusContext', data, options);
 }
@@ -161,15 +177,32 @@ export function getProjectionNeighbors(
     vis_id: string,
     epoch: number,
     refineFlag: boolean = false,
+    blendBBox?: ViewportBBox | null,
+    blendFocusIndices?: number[] | null,
+    blendDecayRatio?: number,
     options?: NetworkOptions
 ) {
-    const data = {
+    const data: Record<string, any> = {
         "content_path": contentPath,
         "vis_method": vis_method,
         "vis_id": vis_id,
         "epoch": epoch,
         "refine_flag": refineFlag
     };
+    if (blendBBox) {
+        data["blend_bbox"] = {
+            "x_min": blendBBox.xMin,
+            "x_max": blendBBox.xMax,
+            "y_min": blendBBox.yMin,
+            "y_max": blendBBox.yMax,
+        };
+    }
+    if (blendFocusIndices && blendFocusIndices.length > 0) {
+        data["blend_focus_indices"] = blendFocusIndices;
+    }
+    if (blendDecayRatio !== undefined) {
+        data["blend_decay_ratio"] = blendDecayRatio;
+    }
     return basicPostWithJsonResponse('/getProjectionNeighbors', data, options);
 }
 

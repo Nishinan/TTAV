@@ -8,6 +8,12 @@ import { SelectedListener } from "../state/types";
 import { TrainingEvent, InfluenceSample } from "../component/types";
 // 1. Define FocusMode type
 export type FocusMode = "coarse" | "balanced" | "fine";
+export type ViewportBBox = {
+    xMin: number;
+    xMax: number;
+    yMin: number;
+    yMax: number;
+};
 // Types from plotView
 export type EpochData = {
     projection: number[][];
@@ -34,6 +40,7 @@ export type BaseMutableGlobalStore = {
     epoch: number;
     availableEpochs: number[];
     globalBounds: { minX:number; maxX:number; minY:number; maxY:number } | null;
+    currentViewportBBox: ViewportBBox | null;
     
     // Color and label mappings
     colorDict: Map<number, [number, number, number]>;
@@ -110,6 +117,7 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     epoch: 1,
     availableEpochs: [],
     globalBounds: null,
+    currentViewportBBox: null,
     
     // Color and label mappings
     colorDict: new Map(),

@@ -1,0 +1,21 @@
+{
+  "phase": "phase3_local_visualizer",
+  "content_path": "/home/yilu/workspace/Dataset/backdoor",
+  "source_vis_id": "1",
+  "temp_vis_id": "phase3_20260530_101636",
+  "epoch": 10,
+  "focus_indices": [
+    10975,
+    11490,
+    17685
+  ],
+  "global_model_unchanged_max_abs": 0.0,
+  "local_vs_global_embed_max_abs": 0.04240107536315918,
+  "focus_projection_shift_mean": 0.025798887014389038,
+  "refine_metrics": {
+    "neighbor_preservation": 10.000000000000002,
+    "mean_rank_hd": 186.4333333333333,
+    "trustworthiness": 33.29824561403509,
+    "continuity": 46.473684210526315
+  }
+}

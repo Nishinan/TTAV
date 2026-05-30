@@ -1,5 +1,6 @@
 import os
 import shutil
+import copy
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -236,7 +237,7 @@ class TimeVis(StrategyAbstractClass):
         if os.path.exists(baseline_path):
             full_proj_baseline = np.load(baseline_path).copy()  # [N, 2]
         else:
-            self.visualize_model.eval()
+            local_visualizer.eval()
             with torch.no_grad():
                 full_proj_baseline = self.visualize_model.encoder(
                     torch.from_numpy(full_feat).float().to(self.device)
@@ -313,11 +314,12 @@ class TimeVis(StrategyAbstractClass):
                 torch.from_numpy(full_feat[nbr_idx].copy()).float().to(self.device)
             )
 
-        # --- 4. Fine-tune last two encoder layers with anchor constraint -------
-        # Freeze all encoder layers except the last two linear layers.
-        encoder_layers = list(self.visualize_model.encoder.children())
+        # --- 4. Fine-tune a dedicated local visualizer copy ---------------------
+        # Keep the global visualizer untouched; the copied local visualizer is
+        # trained only for the current refine request and used to patch outputs.
+        local_visualizer = copy.deepcopy(self.visualize_model).to(self.device)
+        encoder_layers = list(local_visualizer.encoder.children())
         trainable_params = []
-        # Walk layers in reverse; collect params from the last 2 Linear layers.
         linear_count = 0
         for layer in reversed(encoder_layers):
             if isinstance(layer, torch.nn.Linear):
@@ -327,15 +329,11 @@ class TimeVis(StrategyAbstractClass):
                 linear_count += 1
                 if linear_count >= 2:
                     break
-        # Freeze everything else
-        for name, param in self.visualize_model.named_parameters():
+        for _, param in local_visualizer.named_parameters():
             if not param.requires_grad:
                 continue
             if not any(param is tp for tp in trainable_params):
                 param.requires_grad = False
-
-        # Backup weights of trainable layers for post-refine restoration
-        weight_backup = {id(p): p.data.clone() for p in trainable_params}
 
         # Pre-batch all focus points and their HD neighbors for efficient forward pass.
         # focus_hd_nbr_feats[i] has shape [k_hd, D]; stack into [n_focus*k_hd, D].
@@ -343,7 +341,7 @@ class TimeVis(StrategyAbstractClass):
         k_hd_per_focus = [f.shape[0] for f in focus_hd_nbr_feats]
 
         optimizer = torch.optim.Adam(trainable_params, lr=0.005)
-        self.visualize_model.train()
+        local_visualizer.train()
 
         # In crowded regions (small margin) repulsion fights attraction — reduce it.
         # margin >= 0.5: normal repulsion; margin < 0.3 (clamped floor): disable repulsion.
@@ -365,10 +363,10 @@ class TimeVis(StrategyAbstractClass):
         for step in range(1000):
             optimizer.zero_grad()
 
-            z_focus   = self.visualize_model.encoder(focus_feat_t)    # [n_focus, 2]
-            z_all_nbr = self.visualize_model.encoder(all_nbr_feat_t)  # [n_focus*k_hd, 2]
-            z_neg     = self.visualize_model.encoder(neg_feat_t)      # [n_neg, 2]
-            z_anchors = self.visualize_model.encoder(anchor_feat_t)   # [A, 2]
+            z_focus   = local_visualizer.encoder(focus_feat_t)    # [n_focus, 2]
+            z_all_nbr = local_visualizer.encoder(all_nbr_feat_t)  # [n_focus*k_hd, 2]
+            z_neg     = local_visualizer.encoder(neg_feat_t)      # [n_neg, 2]
+            z_anchors = local_visualizer.encoder(anchor_feat_t)   # [A, 2]
 
             l_attract = torch.tensor(0., device=self.device)
             l_repel   = torch.tensor(0., device=self.device)
@@ -425,7 +423,7 @@ class TimeVis(StrategyAbstractClass):
         # Re-compute here to ensure it uses the final model state.
         self.visualize_model.eval()
         with torch.no_grad():
-            z_final = self.visualize_model.encoder(full_feat_t)  # [N, 2]
+            z_final = local_visualizer.encoder(full_feat_t)  # [N, 2]
         z_np = z_final.cpu().numpy()  # [N, 2]
 
         trust_sum = 0.0
@@ -510,18 +508,10 @@ class TimeVis(StrategyAbstractClass):
               f"margin={margin_m:.3f}  t={time.time()-start_time:.1f}s")
 
         # --- 5. Full-inference projection for current_epoch --------------------
-        # Must run BEFORE weight restoration: _patch_epoch uses encoder forward
-        # pass with the currently refined weights to produce the high-NP projection.
-        self._patch_epoch(current_epoch, all_indices)
-
-        # Restore trainable layer weights so model stays clean for next refine.
-        # Projection is already written to disk above, so restoration is safe here.
-        with torch.no_grad():
-            for p in trainable_params:
-                p.data.copy_(weight_backup[id(p)])
-        # Re-enable gradients for all parameters
-        for param in self.visualize_model.parameters():
-            param.requires_grad = True
+        # Patch using the trained local visualizer while keeping the global
+        # visualizer untouched for future sessions.
+        self._patch_epoch(current_epoch, all_indices, model=local_visualizer)
+        self._last_local_visualizer = local_visualizer
 
         print(f"[TimeVis] Subset-patch refine finished in {time.time() - start_time:.2f}s "
               f"({len(all_indices)} points patched, epoch={current_epoch})")
@@ -535,7 +525,7 @@ class TimeVis(StrategyAbstractClass):
                 with open(_ablation_cfg_path) as _f:
                     _ab_full = json.load(_f)
                 if _ab_full.get("ablation_enabled", False):
-                    import threading, copy
+                    import threading
                     _ab_model_copy = copy.deepcopy(self.visualize_model)
                     # Pass full-dataset features and the on-disk baseline projection
                     _full_feat = self.data_provider.get_representation(current_epoch)
@@ -850,23 +840,24 @@ class TimeVis(StrategyAbstractClass):
             json.dump(existing, f, indent=2)
         print(f"[Ablation] Results saved → {results_path}")
 
-    def _patch_epoch(self, epoch, all_indices):
-        """Write a full re-projection for one epoch using the current (refined) model weights."""
+    def _patch_epoch(self, epoch, all_indices, model=None):
+        """Write a full re-projection for one epoch using the provided local visualizer."""
         import numpy as np, os, torch
 
         vis_method = self.config['vis_method']
         vis_id     = self.config['vis_id']
         content_path = self.config['content_path']
+        patch_model = model if model is not None else self.visualize_model
 
         refined_dir = os.path.join(
             content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
             'epochs', f'epoch_{epoch}'
         )
 
-        self.visualize_model.eval()
+        patch_model.eval()
         with torch.no_grad():
             full_feat = self.data_provider.get_representation(epoch)
-            full_proj = self.visualize_model.encoder(
+            full_proj = patch_model.encoder(
                 torch.from_numpy(full_feat).float().to(self.device)
             ).cpu().numpy()
 
@@ -874,10 +865,11 @@ class TimeVis(StrategyAbstractClass):
         np.save(os.path.join(refined_dir, 'projection.npy'), full_proj)
 
     def patch_other_epochs(self, skip_epoch):
-        """Patch all available epochs except skip_epoch using the last refine indices."""
+        """Patch all available epochs except skip_epoch using the last local visualizer."""
         import threading
         all_indices = getattr(self, '_last_refine_indices', None)
-        if not all_indices:
+        local_visualizer = getattr(self, '_last_local_visualizer', None)
+        if not all_indices or local_visualizer is None:
             return
         available_epochs = self.config['available_epochs']
         other_epochs = [e for e in available_epochs if e != skip_epoch]
@@ -885,7 +877,7 @@ class TimeVis(StrategyAbstractClass):
         def _run():
             for e in other_epochs:
                 try:
-                    self._patch_epoch(e, all_indices)
+                    self._patch_epoch(e, all_indices, model=local_visualizer)
                 except Exception as ex:
                     print(f"[TimeVis] Background patch epoch {e} failed: {ex}")
             print(f"[TimeVis] Background patch complete for {len(other_epochs)} other epochs.")

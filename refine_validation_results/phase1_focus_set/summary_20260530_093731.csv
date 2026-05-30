@@ -1,0 +1,5 @@
+candidate,focus_set_size,seed_overlap,bbox_overlap,hd_overlap,seed_coverage,bbox_coverage,hd_coverage,bbox_ratio,hd_ratio
+seeds_only,3,3,3,0,1.0,0.06818181818181818,0.0,1.0,0.0
+seeds_plus_hd,48,3,17,45,1.0,0.38636363636363635,1.0,0.3541666666666667,0.9375
+seeds_plus_bbox,44,3,44,14,1.0,1.0,0.3111111111111111,1.0,0.3181818181818182
+seeds_plus_bbox_plus_hd,75,3,44,45,1.0,1.0,1.0,0.5866666666666667,0.6
