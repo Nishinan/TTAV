@@ -263,6 +263,43 @@ export function getVisualizeMetrics(
     return basicPostWithJsonResponse('/getVisualizeMetrics', data, options);
 }
 
+export function getRefineMetrics(
+    contentPath: string,
+    vis_method: string,
+    vis_id: string,
+    epoch: number,
+    focusIndices: number[],
+    refineFlag: boolean = false,
+    blendBBox?: ViewportBBox | null,
+    blendFocusIndices?: number[] | null,
+    blendDecayRatio?: number,
+    options?: NetworkOptions
+) {
+    const data: Record<string, any> = {
+        "content_path": contentPath,
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "epoch": epoch,
+        "focus_indices": focusIndices,
+        "refine_flag": refineFlag,
+    };
+    if (blendBBox) {
+        data["blend_bbox"] = {
+            "x_min": blendBBox.xMin,
+            "x_max": blendBBox.xMax,
+            "y_min": blendBBox.yMin,
+            "y_max": blendBBox.yMax,
+        };
+    }
+    if (blendFocusIndices && blendFocusIndices.length > 0) {
+        data["blend_focus_indices"] = blendFocusIndices;
+    }
+    if (blendDecayRatio !== undefined) {
+        data["blend_decay_ratio"] = blendDecayRatio;
+    }
+    return basicPostWithJsonResponse('/getRefineMetrics', data, options);
+}
+
 export function getInfluenceSamples(
     contentPath: string,  
     epoch: number, 

@@ -203,8 +203,8 @@ const initStaticContext = async (contentPath: string, dataType: string) => {
 };
 
 /**
- * Evaluate projection quality after refinement.
- * Reports focus displacement, global drift, neighbor preservation, and trustworthiness.
+ * Evaluate displacement-oriented quality on the currently displayed view.
+ * Structural metrics are computed by the backend against the same projection.
  */
 export const evaluateProjectionQuality = async (
     epochNum: number,
@@ -261,96 +261,14 @@ export const evaluateProjectionQuality = async (
     });
     const avgGlobalDrift = globalDrift / (nonFocusCount || 1);
 
-    // --- Dim 3: Neighbor Preservation ---
-    // How many of the post-refine low-D neighbors are also high-D neighbors?
-    // Both originalNeighbors and projectionNeighbors store proj-position indices (0..N-1),
-    // because both are built on arrays re-ordered by index.json on the backend.
-    // No rawIdx→pos conversion is needed here.
-    const highNeighborsNC = oldData.originalNeighbors || [];
-    const newLowNeighbors = newData.projectionNeighbors || [];
-
-
-
-    let neighborConsistency = 0;
-    let ncCount = 0;
-    selectedIndices.forEach(rawIdx => {
-        const pos = toPos(rawIdx);
-        const highList: number[] = highNeighborsNC[pos] || [];
-        const lowList:  number[] = newLowNeighbors[pos] || [];
-        if (highList.length === 0 || lowList.length === 0) return;
-
-        const k = Math.min(highList.length, lowList.length);
-        const highSet = new Set(highList.slice(0, k));
-        const intersection = lowList.slice(0, k).filter(p => highSet.has(p));
-        neighborConsistency += intersection.length / k;
-        ncCount++;
-    });
-    const avgNeighborConsistency = ncCount > 0 ? neighborConsistency / ncCount : 0;
-
-    // --- Dim 4: Trustworthiness ---
-    // T = 1 - (2 / n·k·(2n-3k-1)) × Σ_i Σ_{j∈U_i} (r(i,j) - k)
-    // U_i = points in low-D neighborhood but not in high-D neighborhood.
-    // Both neighbor lists use the same proj-position index space — no conversion needed.
-    const highNeighborsTrust = oldData.originalNeighbors || [];
-    const lowNeighborsTrust  = newData.projectionNeighbors || [];
-
-    let trustSum = 0;
-    let trustCount = 0;
-    let continuitySum = 0;
-    let continuityCount = 0;
-    const N = newProj.length;
-
-    selectedIndices.forEach(rawIdx => {
-        const pos = toPos(rawIdx);
-        const highList: number[] = highNeighborsTrust[pos] || [];
-        const lowList:  number[] = lowNeighborsTrust[pos]  || [];
-        if (highList.length === 0 || lowList.length === 0) return;
-
-        const k = Math.min(highList.length, lowList.length);
-        const highSet = new Set(highList.slice(0, k));
-
-        // Penalty: low-D neighbor j not found in high-D top-k
-        let penalty = 0;
-        lowList.slice(0, k).forEach(j => {
-            if (!highSet.has(j)) {
-                const rank = highList.indexOf(j);
-                const r = rank === -1 ? highList.length + 1 : rank + 1;
-                penalty += (r - k);
-            }
-        });
-
-        const norm = k * (2 * N - 3 * k - 1) / 2;
-        trustSum += norm > 0 ? 1 - penalty / norm : 1;
-        trustCount++;
-
-        let continuityPenalty = 0;
-        highList.slice(0, k).forEach(j => {
-            if (!lowList.slice(0, k).includes(j)) {
-                const rank = lowList.indexOf(j);
-                const r = rank === -1 ? lowList.length + 1 : rank + 1;
-                continuityPenalty += (r - k);
-            }
-        });
-        continuitySum += norm > 0 ? 1 - continuityPenalty / norm : 1;
-        continuityCount++;
-    });
-    const avgTrustworthiness = trustCount > 0 ? trustSum / trustCount : 1;
-    const avgContinuity = continuityCount > 0 ? continuitySum / continuityCount : 1;
-
     console.log("-----------------------------------------");
     console.log(`> Focus Displacement: ${avgFocusShift.toFixed(4)}`);
     console.log(`> Global Drift: ${avgGlobalDrift.toFixed(4)}`);
-    console.log(`> Neighbor Preservation: ${(avgNeighborConsistency * 100).toFixed(2)}%`);
-    console.log(`> Trustworthiness: ${(avgTrustworthiness * 100).toFixed(2)}%`);
-    console.log(`> Continuity: ${(avgContinuity * 100).toFixed(2)}%`);
     console.log("-----------------------------------------");
 
     return {
         avgFocusShift,
         avgGlobalDrift,
-        avgNeighborConsistency,
-        avgTrustworthiness,
-        avgContinuity,
     };
 };
 
@@ -776,6 +694,19 @@ export function AppCombinedView() {
                 const focusIndices = Array.isArray((response as any).focus_indices)
                     ? (response as any).focus_indices as number[]
                     : selectedIndices;
+                const trainingContextIndices = Array.isArray((response as any).training_context_indices)
+                    ? (response as any).training_context_indices as number[]
+                    : [];
+                const patchIndices = Array.isArray((response as any).patch_indices)
+                    ? (response as any).patch_indices as number[]
+                    : [];
+                console.log("[TTAV] Refine sets:", {
+                    focusCount: focusIndices.length,
+                    trainingContextCount: trainingContextIndices.length,
+                    patchCount: patchIndices.length,
+                    focusSetStrategy: (response as any).focus_set_strategy,
+                    timings: (response as any).timings ?? null,
+                });
 
                 const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
                 const refinedProjection = projResp.projection || oldEpochData.projection;
@@ -795,7 +726,6 @@ export function AppCombinedView() {
                     currentViewportBBox,
                     focusIndices,
                 );
-
                 const newEpochData = {
                     ...oldEpochData,
                     projection: blendedProjection,
@@ -810,17 +740,29 @@ export function AppCombinedView() {
 
                 const metrics = await evaluateProjectionQuality(epoch, focusIndices, oldEpochData, newEpochData);
                 if (metrics) {
-                    // All three quality metrics come from the backend — exact computation
-                    // over the full dataset using final encoder weights, not cached neighbors.
-                    const r = response as any;
-                    const backendMRH = r.mean_rank_hd;
+                    let backendMetrics: any = null;
+                    try {
+                        backendMetrics = await BackendAPI.getRefineMetrics(
+                            contentPath,
+                            vis_method,
+                            currentVisID,
+                            targetEpoch,
+                            focusIndices,
+                            true,
+                            currentViewportBBox,
+                            focusIndices,
+                            DEFAULT_BLEND_DECAY_RATIO,
+                        );
+                    } catch (metricError) {
+                        console.error("[TTAV] Failed to fetch refine metrics; projection update will continue.", metricError);
+                    }
                     useGlobalStore.getState().setValue('refineMetrics', {
                         focusDisplacement: metrics.avgFocusShift,
                         globalDrift:       metrics.avgGlobalDrift,
-                        neighborPreservation: metrics.avgNeighborConsistency,
-                        meanRankHD:           backendMRH != null ? backendMRH : 0,
-                        trustworthiness:      metrics.avgTrustworthiness,
-                        continuity:           metrics.avgContinuity,
+                        neighborPreservation: backendMetrics?.neighbor_preservation != null ? backendMetrics.neighbor_preservation / 100 : 0,
+                        meanRankHD:           backendMetrics?.mean_rank_hd != null ? backendMetrics.mean_rank_hd : 0,
+                        trustworthiness:      backendMetrics?.trustworthiness != null ? backendMetrics.trustworthiness / 100 : 0,
+                        continuity:           backendMetrics?.continuity != null ? backendMetrics.continuity / 100 : 0,
                     });
                 }
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, focusIndices, newEpochData.indexList || []);
@@ -830,7 +772,7 @@ export function AppCombinedView() {
                 message.error({ content: 'Refinement returned unexpected status.', key: REFINE_MSG_KEY });
             }
         } catch (error) {
-            console.error("Update failed:", error);
+            console.error("[TTAV] Update failed with details:", error);
             message.error({ content: 'Failed to update projection.', key: REFINE_MSG_KEY });
         } finally {
             isRefining.current = false;

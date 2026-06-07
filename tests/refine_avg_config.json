@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "results_path": "tests/refine_avg_results.json",
+
+  "focus_indices": null,
+  "n_points": 10,
+  "seed": 42,
+
+  "note": "When enabled=true, the next interactive Refine triggers a background benchmark: self.refine() is called once per test point (same code path as a real refine), results written to results_path. Set focus_indices to a list like [0,100,500] to use fixed points, or null to draw n_points randomly with the given seed."
+}

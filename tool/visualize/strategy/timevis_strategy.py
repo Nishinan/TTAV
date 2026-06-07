@@ -149,12 +149,14 @@ class TimeVis(StrategyAbstractClass):
         Locally refine projections for a set of focus points.
 
         Key design decisions for speed and global stability:
-        1. Freeze encoder — only decoder weights are updated, so the global
-           embedding topology cannot drift.
-        2. Subset inference — after fine-tuning, only the focus + neighbor
-           subset is re-projected; all other points keep their original
-           coordinates (patch strategy).
-        3. Single-epoch write — only `current_epoch` is updated immediately;
+        1. Keep the global visualizer frozen and train only the last encoder
+           layers of a copied local visualizer.
+        2. Separate user focus, training context, and patch set so runtime
+           semantics match the refine design docs.
+        3. Subset inference — after fine-tuning, only the configured patch
+           set is re-projected; all other points keep their original
+           coordinates.
+        4. Single-epoch write — only `current_epoch` is updated immediately;
            the caller may trigger background updates for other epochs separately.
         """
         import torch
@@ -162,15 +164,26 @@ class TimeVis(StrategyAbstractClass):
         import time
         import os
 
+        stage_clock = time.time()
+        stage_timings = {}
+
+        def _mark_stage(name):
+            nonlocal stage_clock
+            now = time.time()
+            stage_timings[name] = now - stage_clock
+            stage_clock = now
+
         # Normalise focus list
         if focus_indices is None:
             focus_indices = [focus_index] if focus_index is not None else []
+        focus_indices = sorted({int(i) for i in focus_indices})
 
         start_time = time.time()
         vis_method = self.config['vis_method']
         vis_id    = self.config['vis_id']
         content_path = self.config['content_path']
         available_epochs = self.config['available_epochs']
+        vis_cfg = self.config.get('vis_config', {})
 
         # Default current_epoch to the last available epoch
         if current_epoch is None:
@@ -205,7 +218,10 @@ class TimeVis(StrategyAbstractClass):
                 self.visualize_model.to(self.device)
             self._model_loaded = True
 
-        # --- 2. Build neighbour list ------------------------------------------
+        # --- 2. Build patch-support neighbours ---------------------------------
+        # These neighbors expand the subset we will patch/write back after
+        # training, but they are not the primary focus set used for quality
+        # metrics or blend centers.
         if not neighbor_indices:
             if hasattr(self, 'data_handler'):
                 all_edges_to   = self.data_handler.edge_to
@@ -223,8 +239,7 @@ class TimeVis(StrategyAbstractClass):
                 _, nn_idx = nbrs.kneighbors(feats[focus_indices])
                 collected = set(nn_idx.flatten().tolist()) - set(focus_indices)
                 neighbor_indices = list(collected)[:15 * max(len(focus_indices), 1)]
-
-        all_indices = list(focus_indices) + neighbor_indices
+        patch_support_indices = sorted({int(i) for i in neighbor_indices if int(i) not in set(focus_indices)})
 
         # --- 3. Gather full-dataset features and baseline projection ------------
         full_feat = self.data_provider.get_representation(current_epoch)  # [N, D]
@@ -237,11 +252,10 @@ class TimeVis(StrategyAbstractClass):
         if os.path.exists(baseline_path):
             full_proj_baseline = np.load(baseline_path).copy()  # [N, 2]
         else:
-            local_visualizer.eval()
-            with torch.no_grad():
-                full_proj_baseline = self.visualize_model.encoder(
-                    torch.from_numpy(full_feat).float().to(self.device)
-                ).cpu().numpy()
+            raise FileNotFoundError(
+                f"Baseline projection required for refine was not found: {baseline_path}"
+            )
+        _mark_stage("prepare_baseline")
 
         # --- 3a. Load cached high-D neighbors for focus points ----------------
         import json as _json
@@ -258,30 +272,45 @@ class TimeVis(StrategyAbstractClass):
             _, _nn_idx = _nbrs.kneighbors(full_feat)
             hd_neighbors_all = [_nn_idx[i, 1:].tolist() for i in range(N)]
 
-        # Collect all high-D neighbor indices referenced by focus points
+        # Collect all high-D neighbor indices referenced by focus points.
+        # This is the actual local training context used by the attract loss.
         hd_nbr_set = set()
         for fi in focus_indices:
             hd_nbr_set.update(hd_neighbors_all[fi][:10])
         hd_nbr_set -= set(focus_indices)
-        hd_neighbor_global = list(hd_nbr_set)  # global indices of HD neighbors
+        training_context_indices = sorted(set(focus_indices) | hd_nbr_set)
+        patch_indices = sorted(set(training_context_indices) | set(patch_support_indices))
+        self._last_focus_indices = focus_indices
+        self._last_training_context_indices = training_context_indices
+        self._last_patch_indices = patch_indices
 
-        # --- 3b. Sample anchor points (global, excluding focus neighborhood) --
-        n_anchors = min(300, N - len(all_indices) - 1)
-        exclude_set = set(all_indices)
+        # --- 3b. Sample anchor points (global, excluding patch region) ---------
+        exclude_set = set(patch_indices)
         candidate_anchors = [i for i in range(N) if i not in exclude_set]
         rng = np.random.default_rng(seed=42)
-        anchor_indices = rng.choice(candidate_anchors, size=n_anchors, replace=False).tolist()
-        anchor_feat_np = full_feat[anchor_indices]                    # [A, D]
-        anchor_z0      = full_proj_baseline[anchor_indices]           # [A, 2]
+        n_anchors = min(300, len(candidate_anchors))
+        if n_anchors > 0:
+            anchor_indices = rng.choice(candidate_anchors, size=n_anchors, replace=False).tolist()
+            anchor_feat_np = full_feat[anchor_indices]                # [A, D]
+            anchor_z0      = full_proj_baseline[anchor_indices]       # [A, 2]
+        else:
+            anchor_indices = []
+            anchor_feat_np = np.zeros((0, full_feat.shape[1]), dtype=full_feat.dtype)
+            anchor_z0 = np.zeros((0, full_proj_baseline.shape[1]), dtype=full_proj_baseline.dtype)
 
-        # --- 3c. Sample random negative examples (global, excluding HD neighbors) --
+        # --- 3c. Sample random negative examples (global, excluding local region) --
         k_neg = 10
         n_neg_per_focus = 5 * k_neg
-        neg_exclude = set(all_indices) | hd_nbr_set
+        neg_exclude = set(patch_indices)
         neg_candidates = [i for i in range(N) if i not in neg_exclude]
         n_neg_total = min(n_neg_per_focus * len(focus_indices), len(neg_candidates))
-        neg_indices = rng.choice(neg_candidates, size=n_neg_total, replace=False).tolist()
-        neg_feat_np = full_feat[neg_indices]                          # [n_neg, D]
+        if n_neg_total > 0:
+            neg_indices = rng.choice(neg_candidates, size=n_neg_total, replace=False).tolist()
+            neg_feat_np = full_feat[neg_indices]                      # [n_neg, D]
+        else:
+            neg_indices = []
+            neg_feat_np = np.zeros((0, full_feat.shape[1]), dtype=full_feat.dtype)
+        _mark_stage("prepare_context")
 
         # --- 3d. Compute adaptive margin m -----------------------------------
         # Use the 90th-percentile of each focus point's top-20 LD distances ×1.5.
@@ -348,25 +377,28 @@ class TimeVis(StrategyAbstractClass):
         gamma_repel = float(np.clip((margin_m - 0.3) / 0.2, 0.0, 1.0))
         mu_anchor   = 10.0  # anchor constraint weight
 
-        full_feat_t = torch.from_numpy(full_feat).float().to(self.device)
-
         # Loss-convergence early stop: track L_attract over a sliding window.
         # NP is meaningless as a stopping signal when 2-D cannot faithfully
         # represent high-D neighborhoods (NP stays 0% even while the layout
         # is genuinely improving). L_attract measures whether HD neighbors are
         # still being pulled closer, which is the actual optimisation goal.
+        max_steps = int(vis_cfg.get("refine_max_steps", 5000))
+        time_budget_seconds = vis_cfg.get("refine_time_budget_seconds", None)
+        time_budget_seconds = None if time_budget_seconds in (None, "", False) else float(time_budget_seconds)
+        log_every_steps = int(vis_cfg.get("refine_log_every_steps", 50))
         _loss_window  = []   # recent L_attract values
-        _WINDOW       = 20   # check over last 20 steps
-        _MIN_STEPS    = 100  # never stop before this
-        _REL_TOL      = 5e-4 # stop if (max-min)/max < tol over the window
+        _WINDOW       = int(vis_cfg.get("refine_loss_window", 50))
+        _MIN_STEPS    = int(vis_cfg.get("refine_min_steps", 300))
+        _REL_TOL      = float(vis_cfg.get("refine_loss_rel_tol", 1e-4))
+        stop_reason = f"max_steps({max_steps})"
 
-        for step in range(1000):
+        for step in range(max_steps):
             optimizer.zero_grad()
 
             z_focus   = local_visualizer.encoder(focus_feat_t)    # [n_focus, 2]
             z_all_nbr = local_visualizer.encoder(all_nbr_feat_t)  # [n_focus*k_hd, 2]
-            z_neg     = local_visualizer.encoder(neg_feat_t)      # [n_neg, 2]
-            z_anchors = local_visualizer.encoder(anchor_feat_t)   # [A, 2]
+            z_neg     = local_visualizer.encoder(neg_feat_t) if neg_feat_t.shape[0] > 0 else None
+            z_anchors = local_visualizer.encoder(anchor_feat_t) if anchor_feat_t.shape[0] > 0 else None
 
             l_attract = torch.tensor(0., device=self.device)
             l_repel   = torch.tensor(0., device=self.device)
@@ -382,15 +414,19 @@ class TimeVis(StrategyAbstractClass):
                 l_attract = l_attract + (z_i - z_nbrs).pow(2).sum(dim=1).mean()
 
                 # Repel random negatives (fixed set, no full inference in loop)
-                dist_repel = (z_i - z_neg).pow(2).sum(dim=1).sqrt()
-                hinge = torch.clamp(margin_m - dist_repel, min=0.0)
-                l_repel = l_repel + hinge.pow(2).mean()
+                if z_neg is not None and z_neg.shape[0] > 0:
+                    dist_repel = (z_i - z_neg).pow(2).sum(dim=1).sqrt()
+                    hinge = torch.clamp(margin_m - dist_repel, min=0.0)
+                    l_repel = l_repel + hinge.pow(2).mean()
 
             n_f = max(len(focus_indices), 1)
             l_attract = l_attract / n_f
             l_repel   = l_repel   / n_f
 
-            l_anchor = (z_anchors - anchor_z0_t).pow(2).sum(dim=1).mean()
+            if z_anchors is not None and z_anchors.shape[0] > 0:
+                l_anchor = (z_anchors - anchor_z0_t).pow(2).sum(dim=1).mean()
+            else:
+                l_anchor = torch.tensor(0., device=self.device)
 
             loss_total = l_attract + gamma_repel * l_repel + mu_anchor * l_anchor
             loss_total.backward()
@@ -400,7 +436,7 @@ class TimeVis(StrategyAbstractClass):
             if len(_loss_window) > _WINDOW:
                 _loss_window.pop(0)
 
-            if step % 50 == 0:
+            if log_every_steps > 0 and step % log_every_steps == 0:
                 print(f"[TimeVis] step={step:4d}  L_attract={l_attract.item():.4f}  "
                       f"L_anchor={l_anchor.item():.5f}  "
                       f"t={time.time()-start_time:.1f}s")
@@ -412,19 +448,31 @@ class TimeVis(StrategyAbstractClass):
                 if _w_max > 0 and (_w_max - _w_min) / _w_max < _REL_TOL:
                     print(f"[TimeVis] Loss converged at step {step}: "
                           f"L_attract range={_w_max-_w_min:.6f} < tol")
+                    stop_reason = f"loss_converged(step={step})"
                     break
 
-            if time.time() - start_time > 60.0:
-                print(f"[TimeVis] Time limit at step {step}")
+            if time_budget_seconds is not None and time.time() - start_time > time_budget_seconds:
+                print(f"[TimeVis] Time budget reached at step {step} ({time_budget_seconds:.1f}s)")
+                stop_reason = f"time_budget(step={step}, seconds={time_budget_seconds:.1f})"
                 break
+        else:
+            step = max_steps - 1
+        _mark_stage("train")
 
-        # --- Compute T, C, NP for focus points using full-dataset distances ------
-        # z_eval was computed in the last NP-check iteration inside the loop.
-        # Re-compute here to ensure it uses the final model state.
-        self.visualize_model.eval()
+        # --- Compute T, C, NP for focus points using the subset-patched layout ---
+        # We only update the refined subset and keep all other points on the
+        # baseline projection to preserve global stability and avoid a second
+        # full-dataset encoder pass after local training.
+        refined_indices = np.array(patch_indices, dtype=np.int64)
+        print(f"[TimeVis] Building subset-patched layout for metrics "
+              f"({len(refined_indices)} refined points)...")
+        local_visualizer.eval()
         with torch.no_grad():
-            z_final = local_visualizer.encoder(full_feat_t)  # [N, 2]
-        z_np = z_final.cpu().numpy()  # [N, 2]
+            refined_subset = local_visualizer.encoder(
+                torch.from_numpy(full_feat[refined_indices].copy()).float().to(self.device)
+            ).cpu().numpy()
+        z_np = full_proj_baseline.copy()
+        z_np[refined_indices] = refined_subset
 
         trust_sum = 0.0
         cont_sum  = 0.0
@@ -506,18 +554,43 @@ class TimeVis(StrategyAbstractClass):
               f"steps={step+1}  NP={final_np:.1f}%  MRH={final_mrh:.1f}  "
               f"T={final_trust:.1f}%  C={final_cont:.1f}%  "
               f"margin={margin_m:.3f}  t={time.time()-start_time:.1f}s")
+        _mark_stage("metrics")
 
-        # --- 5. Full-inference projection for current_epoch --------------------
+        # --- 5. Write the subset-patched projection for current_epoch ----------
         # Patch using the trained local visualizer while keeping the global
         # visualizer untouched for future sessions.
-        self._patch_epoch(current_epoch, all_indices, model=local_visualizer)
+        print(f"[TimeVis] Writing subset-patched projection for epoch {current_epoch}...")
+        self._patch_epoch(current_epoch, patch_indices, model=local_visualizer)
         self._last_local_visualizer = local_visualizer
+        _mark_stage("patch")
 
         print(f"[TimeVis] Subset-patch refine finished in {time.time() - start_time:.2f}s "
-              f"({len(all_indices)} points patched, epoch={current_epoch})")
+              f"(focus={len(focus_indices)}, training_context={len(training_context_indices)}, "
+              f"patch={len(patch_indices)}, epoch={current_epoch})")
 
-        # Store all_indices so patch_other_epochs() can reuse them without re-running kNN.
-        self._last_refine_indices = all_indices
+        # Store patch set so patch_other_epochs() can reuse it without rebuilding context.
+        self._last_refine_indices = patch_indices
+        self._last_patch_indices = patch_indices
+        self._last_refine_timing = {
+            **stage_timings,
+            "total": time.time() - start_time,
+            "focus_count": len(focus_indices),
+            "training_context_count": len(training_context_indices),
+            "patch_count": len(patch_indices),
+            "steps_completed": step + 1,
+            "stop_reason": stop_reason,
+        }
+        print(
+            "[TimeVis] refine timings: "
+            f"baseline={stage_timings.get('prepare_baseline', 0.0):.2f}s  "
+            f"context={stage_timings.get('prepare_context', 0.0):.2f}s  "
+            f"train={stage_timings.get('train', 0.0):.2f}s  "
+            f"metrics={stage_timings.get('metrics', 0.0):.2f}s  "
+            f"patch={stage_timings.get('patch', 0.0):.2f}s  "
+            f"total={self._last_refine_timing['total']:.2f}s  "
+            f"steps={self._last_refine_timing['steps_completed']}  "
+            f"stop={stop_reason}"
+        )
 
         # --- 6. Background ablation (non-blocking) ----------------------------
         if os.path.exists(_ablation_cfg_path):
@@ -840,8 +913,8 @@ class TimeVis(StrategyAbstractClass):
             json.dump(existing, f, indent=2)
         print(f"[Ablation] Results saved → {results_path}")
 
-    def _patch_epoch(self, epoch, all_indices, model=None):
-        """Write a full re-projection for one epoch using the provided local visualizer."""
+    def _patch_epoch(self, epoch, patch_indices, model=None):
+        """Write a subset-patched projection for one epoch using the provided local visualizer."""
         import numpy as np, os, torch
 
         vis_method = self.config['vis_method']
@@ -849,17 +922,31 @@ class TimeVis(StrategyAbstractClass):
         content_path = self.config['content_path']
         patch_model = model if model is not None else self.visualize_model
 
+        baseline_path = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}",
+            'epochs', f'epoch_{epoch}', 'projection.npy'
+        )
+
         refined_dir = os.path.join(
             content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
             'epochs', f'epoch_{epoch}'
         )
 
+        if os.path.exists(baseline_path):
+            full_proj = np.load(baseline_path).copy()
+        else:
+            raise FileNotFoundError(
+                f"Baseline projection required for subset patch was not found: {baseline_path}"
+            )
+
+        patch_indices = np.array(sorted(set(patch_indices)), dtype=np.int64)
         patch_model.eval()
         with torch.no_grad():
-            full_feat = self.data_provider.get_representation(epoch)
-            full_proj = patch_model.encoder(
-                torch.from_numpy(full_feat).float().to(self.device)
+            sub_feat = self.data_provider.get_representation(epoch)[patch_indices]
+            sub_proj = patch_model.encoder(
+                torch.from_numpy(sub_feat).float().to(self.device)
             ).cpu().numpy()
+        full_proj[patch_indices] = sub_proj
 
         os.makedirs(refined_dir, exist_ok=True)
         np.save(os.path.join(refined_dir, 'projection.npy'), full_proj)
@@ -867,21 +954,27 @@ class TimeVis(StrategyAbstractClass):
     def patch_other_epochs(self, skip_epoch):
         """Patch all available epochs except skip_epoch using the last local visualizer."""
         import threading
-        all_indices = getattr(self, '_last_refine_indices', None)
+        patch_indices = getattr(self, '_last_patch_indices', None)
         local_visualizer = getattr(self, '_last_local_visualizer', None)
-        if not all_indices or local_visualizer is None:
+        if not patch_indices or local_visualizer is None:
             return
         available_epochs = self.config['available_epochs']
         other_epochs = [e for e in available_epochs if e != skip_epoch]
 
         def _run():
+            import time
+            bg_start = time.time()
             for e in other_epochs:
                 try:
-                    self._patch_epoch(e, all_indices, model=local_visualizer)
+                    epoch_start = time.time()
+                    self._patch_epoch(e, patch_indices, model=local_visualizer)
+                    print(f"[TimeVis] Background patch epoch {e} finished in {time.time() - epoch_start:.2f}s")
                 except Exception as ex:
                     print(f"[TimeVis] Background patch epoch {e} failed: {ex}")
-            print(f"[TimeVis] Background patch complete for {len(other_epochs)} other epochs.")
+            print(
+                f"[TimeVis] Background patch complete for {len(other_epochs)} other epochs "
+                f"in {time.time() - bg_start:.2f}s."
+            )
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-

@@ -41,12 +41,30 @@ def infer_epoch_structure(content_path):
     available_epochs.sort()
     return available_epochs
 
+
 # Func: get coloring list
 def get_coloring_list(class_num):
-    # color = get_standard_classes_color(class_num) * 255
-    color_map = plt.get_cmap('tab10')
-    color = color_map(range(class_num))
-    color_255 = (color[:, :3] * 255).astype(np.uint8)
+    """Return one RGB color per class.
+
+    Keep the familiar tab10 palette for small classification tasks. When the
+    class count exceeds tab10, sample the HSV color wheel evenly so labels do
+    not collapse to repeated colors.
+    """
+    class_num = int(class_num or 0)
+    if class_num <= 0:
+        return []
+
+    if class_num <= 10:
+        color_map = plt.get_cmap('tab10')
+        color = color_map(range(class_num))
+    else:
+        color_map = plt.get_cmap('hsv')
+        hue_positions = np.linspace(0, 1, class_num, endpoint=False)
+        color = color_map(hue_positions)
+        # The raw HSV colormap can be too bright for yellow/cyan on a white UI.
+        color[:, :3] = 0.82 * color[:, :3] + 0.08
+
+    color_255 = np.clip(color[:, :3] * 255, 0, 255).astype(np.uint8)
     return color_255.tolist()
 
 # Func: load projection of certain epoch
@@ -158,8 +176,17 @@ def load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_fl
     return np.load(projection_path)
 
 
-def build_focus_set(content_path, vis_method, vis_id, epoch, seed_indices, zoom_bbox=None, hd_k=15):
-    """Construct Phase-1 focus_set = seeds ∪ bbox points ∪ high-D neighbors."""
+def build_focus_set(
+    content_path,
+    vis_method,
+    vis_id,
+    epoch,
+    seed_indices,
+    zoom_bbox=None,
+    hd_k=15,
+    strategy="seeds_plus_hd",
+):
+    """Construct the runtime focus_set according to the configured strategy."""
     seed_set = {int(i) for i in seed_indices if isinstance(i, (int, np.integer)) or str(i).isdigit()}
     bbox_set = set()
     hd_set = set()
@@ -172,6 +199,7 @@ def build_focus_set(content_path, vis_method, vis_id, epoch, seed_indices, zoom_
             "hd_neighbor_count": 0,
             "focus_set_size": len(focus_indices),
             "used_bbox": False,
+            "focus_set_strategy": strategy,
         }
 
     if zoom_bbox:
@@ -200,13 +228,24 @@ def build_focus_set(content_path, vis_method, vis_id, epoch, seed_indices, zoom_
             hd_set -= set(valid_seeds)
             seed_set = set(valid_seeds)
 
-    focus_indices = sorted(seed_set | bbox_set | hd_set)
+    if strategy == "seeds_only":
+        focus_indices = sorted(seed_set)
+    elif strategy == "seeds_plus_hd":
+        focus_indices = sorted(seed_set | hd_set)
+    elif strategy == "seeds_plus_bbox":
+        focus_indices = sorted(seed_set | bbox_set)
+    elif strategy == "seeds_plus_bbox_plus_hd":
+        focus_indices = sorted(seed_set | bbox_set | hd_set)
+    else:
+        raise ValueError(f"Unsupported focus_set strategy: {strategy}")
+
     return focus_indices, {
         "seed_count": len(seed_set),
         "bbox_count": len(bbox_set),
         "hd_neighbor_count": len(hd_set),
         "focus_set_size": len(focus_indices),
         "used_bbox": zoom_bbox is not None,
+        "focus_set_strategy": strategy,
     }
 
 # Func: load one sample from content_path
@@ -562,6 +601,85 @@ def calculate_projection_neighbors_for_projection(content_path, projection_list,
     indices = _search_projection_neighbors(proj, max_neighbors)
     neighbors = [[int(indices[i][j]) for j in range(1, max_neighbors + 1)] for i in range(len(proj))]
     return neighbors, index_list
+
+
+def load_reordered_representation_array(content_path, epoch):
+    features_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}', 'embeddings.npy')
+    if not os.path.exists(features_path):
+        raise FileNotFoundError(f"Representation not found: {features_path}")
+    features = np.load(features_path)
+    index_dict = load_or_create_index(content_path)
+    index_list = index_dict['train'] + index_dict['test']
+    return np.array(features[index_list], dtype=np.float32), index_list
+
+
+def calculate_refine_metrics_for_projection(content_path, epoch, projection_list, focus_indices, k=10, k_ext=200):
+    proj = np.array(projection_list, dtype=np.float32)
+    features, index_list = load_reordered_representation_array(content_path, epoch)
+    if len(proj) != len(features):
+        raise ValueError("Projection/features length mismatch when computing refine metrics")
+
+    orig_to_pos = {orig: pos for pos, orig in enumerate(index_list)}
+    focus_positions = sorted({orig_to_pos[i] for i in focus_indices if i in orig_to_pos})
+    if not focus_positions:
+        return {
+            "neighbor_preservation": 0.0,
+            "mean_rank_hd": 0.0,
+            "trustworthiness": 0.0,
+            "continuity": 0.0,
+            "focus_count": 0,
+        }
+
+    n_total = len(features)
+    k = min(max(int(k), 1), max(n_total - 1, 1))
+    k_ext = min(max(int(k_ext), k), max(n_total - 1, 1))
+
+    np_sum = 0.0
+    mrh_sum = 0.0
+    trust_sum = 0.0
+    cont_sum = 0.0
+
+    for pos in focus_positions:
+        hd_dists = np.linalg.norm(features - features[pos], axis=1)
+        hd_dists[pos] = np.inf
+        hd_rank = np.argsort(hd_dists)
+
+        ld_dists = np.linalg.norm(proj - proj[pos], axis=1)
+        ld_dists[pos] = np.inf
+        ld_rank = np.argsort(ld_dists)
+
+        hd_topk = set(int(x) for x in hd_rank[:k])
+        ld_topk = set(int(x) for x in ld_rank[:k])
+        np_sum += len(hd_topk & ld_topk) / k
+
+        ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(n_total - 1)}
+        mrh_sum += float(np.mean([ld_rank_full[j] for j in hd_topk]))
+
+        hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(k_ext)}
+        ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(k_ext)}
+
+        t_penalty = 0.0
+        for j in (ld_topk - hd_topk):
+            r_hd = hd_rank_of.get(int(j), k_ext + 1)
+            t_penalty += max(0, r_hd - k)
+
+        c_penalty = 0.0
+        for j in (hd_topk - ld_topk):
+            r_ld = ld_rank_of.get(int(j), k_ext + 1)
+            c_penalty += max(0, r_ld - k)
+
+        worst = k * (k_ext - k)
+        trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
+        cont_sum += 1.0 - c_penalty / worst if worst > 0 else 1.0
+
+    n_focus = len(focus_positions)
+    return {
+        "neighbor_preservation": np_sum / n_focus * 100.0,
+        "mean_rank_hd": mrh_sum / n_focus,
+        "trustworthiness": max(0.0, trust_sum / n_focus * 100.0),
+        "continuity": max(0.0, cont_sum / n_focus * 100.0),
+        "focus_count": n_focus,
+    }
 
 def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10, refine_flag=False):
     index_dict = load_or_create_index(content_path)

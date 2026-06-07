@@ -5,7 +5,7 @@ export default defineConfig({
     plugins: [react()],
     server: {
         host: '0.0.0.0',
-        port: 80,
+        port: 5173,
         proxy: {
             '/syncSession': 'http://127.0.0.1:5050',
             '/updateFocusContext': 'http://127.0.0.1:5050',
@@ -22,6 +22,7 @@ export default defineConfig({
             '/getOriginalNeighbors': 'http://127.0.0.1:5050',
             '/getProjectionNeighbors': 'http://127.0.0.1:5050',
             '/getVisualizeMetrics': 'http://127.0.0.1:5050',
+            '/getRefineMetrics': 'http://127.0.0.1:5050',
             '/getInfluenceSamples': 'http://127.0.0.1:5050',
             '/calculateTrainingEvents': 'http://127.0.0.1:5050',
             '/registerEIFBundle': 'http://127.0.0.1:5050',

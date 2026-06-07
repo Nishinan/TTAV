@@ -44,6 +44,23 @@ class DynaVisRunner:
 
         cfg = {**defaults, **self.vis_config}
         data_dir = os.path.join(self.content_path, "epochs")
+         if "D" not in self.vis_config:
+            if "dimension" in cfg:
+                cfg["D"] = int(cfg["dimension"])
+            else:
+                import numpy as np
+                epoch_ids = []
+                for folder_name in os.listdir(data_dir):
+                    if folder_name.startswith("epoch_"):
+                        try:
+                            epoch_ids.append(int(folder_name.split("_")[1]))
+                        except ValueError:
+                            pass
+                if not epoch_ids:
+                    raise RuntimeError(f"No epoch_* folders found under {data_dir}")
+                first_epoch = min(epoch_ids)
+                embedding_path = os.path.join(data_dir, f"epoch_{first_epoch}", "embeddings.npy")
+                cfg["D"] = int(np.load(embedding_path, mmap_mode="r").shape[1])
         out_root = os.path.join(self.content_path, "visualize", f"DynaVis_{self.vis_id}")
 
         self.hparams = HParams(

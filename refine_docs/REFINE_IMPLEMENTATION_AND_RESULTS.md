@@ -68,7 +68,15 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
   - 不是只由 `seeds` 决定，也不是只由 `bbox` 决定
 
 - `focus_set`
-  - 最终用于局部训练/局部评估的点集合
+  - 用户当前关注区域的点集合
+
+- `training_context`
+  - 局部训练真正使用的上下文集合
+  - 当前实现中由 `focus_set` 与其 high-D 正邻居共同构成
+
+- `patch_set`
+  - 当前 refine 会写回 `_refined/projection.npy` 的点集合
+  - 当前实现中比 `training_context` 更大，会额外包含一圈 patch-support neighbors
 
 - `baseline projection`
   - 原始全局模型输出的二维投影
@@ -84,7 +92,8 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 当前落地的第一版采用：
 
 - 只支持 `TimeVis`
-- `focus_set` 支持 `bbox` 与高维近邻联合定义
+- `focus_set` 支持多种候选定义，但当前运行时默认值已收敛为 `seeds_plus_hd`
+- `bbox` 仍作为 runtime blended projection 的重要条件，而不是默认被硬并入训练集合
 - `blended projection` 只在运行时内存中生成，不单独落盘
 - 用户暂时不能调 `blend_decay`
 - 第一版不做 `instability audit`
@@ -177,8 +186,8 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 
 - 后端支持对 runtime blended projection 计算 projection neighbors
 - 前端 refine 后优先使用 blended 对应的 neighbors
-- 前端补 continuity 计算
-- refine metrics 尽量反映当前显示结果
+- 后端新增对当前 blended projection 统一计算 `NP / MRH / Trustworthiness / Continuity` 的路径
+- 前端只保留位移类指标（`focus shift / global drift`）的本地计算，结构质量指标统一以后端 blended-view 结果为准
 
 ### 3.6 Phase 3: 显式 `local visualizer`
 
@@ -305,8 +314,8 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 - refine 后请求 runtime blended projection 对应的 neighbors
 
 4. refine metrics
-- 前端补 continuity 计算
-- 当前显示结果的 metrics 尽量与 blended 视图一致
+- 前端只保留位移类指标（`focus shift / global drift`）的本地计算
+- `NP / MRH / Trustworthiness / Continuity` 由后端按当前 blended projection 统一计算
 
 5. bug 修复
 - 之前存在“先请求 blended neighbors，后解析 focusIndices”的顺序问题
@@ -358,12 +367,20 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 
 2. refine 默认值收敛
 - 从 `refine_runtime_config.py` 读取 `focus_hd_k` 和 `blend_decay_ratio`
+- 新增 `focus_set_strategy`
 - `TimeVis` 的 `hd_k` 可从 `vis_config.refine_hd_k` 覆盖
 
 3. `/getProjectionNeighbors`
 - 支持 runtime blended projection 路径
 - 若请求里带 `blend_bbox` / `blend_focus_indices`
 - 则先构建 blended projection，再计算 neighbors
+
+4. `/getRefineMetrics`
+- 支持对 runtime blended projection 统一计算：
+  - `neighbor_preservation`
+  - `mean_rank_hd`
+  - `trustworthiness`
+  - `continuity`
 
 ### [tool/server/server_utils.py](/home/yilu/workspace/time-travelling-visualizer/tool/server/server_utils.py:1)
 这是 refine 支撑逻辑最集中的工具文件。
@@ -376,7 +393,12 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 - 用于 bbox 点筛选
 
 2. `build_focus_set(...)`
-- 构造 `focus_set = seeds ∪ bbox内所有点 ∪ seeds高维近邻`
+- 支持：
+  - `seeds_only`
+  - `seeds_plus_hd`
+  - `seeds_plus_bbox`
+  - `seeds_plus_bbox_plus_hd`
+- 当前运行时默认值为 `seeds_plus_hd`
 - 返回 `focus_indices` 和统计信息
 
 3. `build_runtime_blended_projection(...)`
@@ -386,7 +408,11 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 4. 任意 projection 的 neighbors
 - 新增基于任意二维投影直接计算 neighbors 的 helper
 
-5. `faiss -> sklearn` 回退
+5. refine metrics helper
+- 新增基于任意 runtime projection 统一计算 `NP / MRH / Trustworthiness / Continuity` 的 helper
+- 用于保证 blended view 与结构质量指标的定义一致
+
+6. `faiss -> sklearn` 回退
 - 若环境无 `faiss`
 - 自动回退到 `sklearn.NearestNeighbors`
 
@@ -403,6 +429,7 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
   - `focus_hd_k = 15`
   - `blend_decay_ratio = 0.35`
   - `focus_mode = balanced`
+  - `focus_set_strategy = seeds_plus_hd`
 
 作用：
 
@@ -423,17 +450,40 @@ TTAV 原有的 refine 机制更接近“局部 patch”：
 2. 只训练 `local_visualizer`
 - refine 的局部训练不再直接修改全局模型
 
-3. `_patch_epoch(...)`
-- 支持传入 `model`
-- patch 当前 epoch 与其他 epoch 时都能指定使用 local model
+3. 集合语义显式拆分
+- `focus_indices`
+  - 用户关注区域 / 指标评估 / blending 中心
+- `training_context_indices`
+  - `focus_indices ∪ high-D positive neighbors`
+  - 局部训练真正使用的核心上下文
+- `patch_indices`
+  - `training_context_indices ∪ patch-support neighbors`
+  - `_refined/projection.npy` 真正更新的区域
 
-4. `patch_other_epochs(...)`
+4. `_patch_epoch(...)`
+- 支持传入 `model`
+- 只对 `patch_indices` 做 subset encoder 推理并写回 baseline projection
+- 不再在 refine 路径中对整张图做 full encoder inference fallback
+
+5. `patch_other_epochs(...)`
 - 使用 `self._last_local_visualizer`
+- 并输出逐 epoch 的后台 patch 耗时日志
+
+6. refine 分段耗时日志
+- 当前会输出：
+  - `prepare_baseline`
+  - `prepare_context`
+  - `train`
+  - `metrics`
+  - `patch`
+  - `total`
 
 当前效果：
 
 - 全局模型 refine 前后保持不变
 - 局部模型能学到不同的局部嵌入
+- 当前 epoch 的 refined projection 只更新 `patch_set`
+- refine 结束后可直接看到各阶段耗时
 
 这正是“全局稳、局部动”的双模型机制。
 
@@ -733,6 +783,11 @@ benchmark 配置模板见：
 - `Trustworthiness`
 - `Continuity`
 
+说明：
+
+- 当前产品运行时会优先使用“后端对当前 blended projection 的统一计算结果”
+- 不再混用前端 top-k 截断近似的 `Trustworthiness / Continuity`
+
 回答的问题：
 
 - 局部结构有没有更准确
@@ -795,6 +850,7 @@ benchmark 配置模板见：
 - 后端默认 `focus_hd_k = 15`
 - 默认 `blend_decay_ratio = 0.35`
 - 默认 `focus_mode = balanced`
+- 默认 `focus_set_strategy = seeds_plus_hd`
 
 ---
 
@@ -838,15 +894,19 @@ python3 tests/run_refine_benchmark_suite.py \
 - 没有作为产品运行时结果落盘
 - 这是有意设计，因为不同局部区域的 blended 结果是 query-specific 的
 
-4. 第一版不做 `instability audit`
+4. 当前 refine 的 `_refined/projection.npy` 采用 subset patch 语义
+- 它不是 `local visualizer` 对整张图的 full local projection
+- 最终展示语义仍以 runtime blended projection 为准
+
+5. 第一版不做 `instability audit`
 - 目前没有给每个点额外估计 refine 结果稳定性
 
-5. 前端构建环境未完全校验
+6. 前端构建环境未完全校验
 - 当前本地 `web` 目录缺少 `node_modules`
 - `pnpm build` 失败的原因是 `tsc: not found`
 - 目前无法完成完整前端打包验证
 
-6. 当前推荐结论主要来自 `backdoor` 数据集
+7. 当前推荐结论主要来自 `backdoor` 数据集
 - 需要继续在更多数据集上验证稳定性
 
 ---
@@ -876,4 +936,3 @@ python3 tests/run_refine_benchmark_suite.py \
 - [LOCAL_VISUALIZER_ALGORITHM_PLAN.md](/home/yilu/workspace/time-travelling-visualizer/refine_docs/LOCAL_VISUALIZER_ALGORITHM_PLAN.md)
 - [REFINE_VALIDATION_PROTOCOL.md](/home/yilu/workspace/time-travelling-visualizer/refine_docs/REFINE_VALIDATION_PROTOCOL.md)
 - [REFINE_BENCHMARK_WORKFLOW.md](/home/yilu/workspace/time-travelling-visualizer/refine_docs/REFINE_BENCHMARK_WORKFLOW.md)
-

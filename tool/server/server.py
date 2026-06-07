@@ -148,6 +148,10 @@ def update_focus_context():
 
         if vis_method == "TimeVis":
             hd_k = int(active_session.get("vis_config", {}).get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+            focus_set_strategy = active_session.get("vis_config", {}).get(
+                "refine_focus_set_strategy",
+                REFINE_RUNTIME_DEFAULTS["focus_set_strategy"],
+            )
             focus_indices, focus_summary = build_focus_set(
                 content_path=content_path,
                 vis_method=vis_method,
@@ -156,6 +160,7 @@ def update_focus_context():
                 seed_indices=selected_indices,
                 zoom_bbox=zoom_bbox,
                 hd_k=hd_k,
+                strategy=focus_set_strategy,
             )
 
         mask = strategy.get_focus_mask(focus_indices)
@@ -174,13 +179,29 @@ def update_focus_context():
                 current_epoch=current_epoch,
                 epochs_to_update=10
             )
-            # Full re-projection: all points may have moved, so invalidate the
-            # projection-neighbor cache so the next request rebuilds it from scratch.
+            # Refine writes a subset-patched refined projection for the current
+            # epoch, so the refined neighbor cache must be updated accordingly.
             if current_epoch is not None:
                 vis_id = active_session["vis_id"]
-                invalidate_projection_neighbors_cache(
-                    content_path, vis_method, vis_id, current_epoch
-                )
+                patched_indices = getattr(strategy, "_last_patch_indices", None)
+                if patched_indices:
+                    try:
+                        update_projection_neighbors_incremental(
+                            content_path,
+                            vis_method,
+                            vis_id,
+                            current_epoch,
+                            patched_indices,
+                        )
+                    except Exception as cache_ex:
+                        print(f"[TimeVis] Incremental neighbor cache update failed: {cache_ex}")
+                        invalidate_projection_neighbors_cache(
+                            content_path, vis_method, vis_id, current_epoch
+                        )
+                else:
+                    invalidate_projection_neighbors_cache(
+                        content_path, vis_method, vis_id, current_epoch
+                    )
             print("Refinement finished. Refined projections saved to _refined directory.")
             # Patch remaining epochs in the background so switching epochs also shows refined results.
             strategy.patch_other_epochs(skip_epoch=current_epoch)
@@ -198,7 +219,11 @@ def update_focus_context():
             "focus_seed_count":      focus_summary["seed_count"],
             "focus_bbox_count":      focus_summary["bbox_count"],
             "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
+            "focus_set_strategy":    focus_summary.get("focus_set_strategy"),
             "focus_indices":         focus_indices,
+            "training_context_indices": getattr(strategy, "_last_training_context_indices", focus_indices),
+            "patch_indices":         getattr(strategy, "_last_patch_indices", focus_indices),
+            "timings":               getattr(strategy, "_last_refine_timing", None),
         })
 
     except Exception as e:
@@ -758,6 +783,45 @@ def get_visualize_metrics():
     except Exception as e:
         print(e)
         return make_response(jsonify({'error_message': 'Error in calculating metrics'}), 400)
+
+
+@app.route('/getRefineMetrics', methods=["POST"])
+@cross_origin()
+def get_refine_metrics():
+    req = request.get_json()
+    content_path = req['content_path']
+    vis_id = req['vis_id']
+    epoch = int(req['epoch'])
+    vis_method = req['vis_method']
+    refine_flag = bool(req.get('refine_flag', False))
+    blend_bbox = req.get('blend_bbox')
+    blend_decay_ratio = float(req.get('blend_decay_ratio', REFINE_RUNTIME_DEFAULTS['blend_decay_ratio']))
+    blend_focus_indices = req.get('blend_focus_indices') or []
+    focus_indices = req.get('focus_indices') or []
+
+    try:
+        if blend_bbox is not None or blend_focus_indices:
+            projection = build_runtime_blended_projection(
+                content_path,
+                vis_method,
+                vis_id,
+                epoch,
+                blend_bbox,
+                decay_ratio=blend_decay_ratio,
+                focus_indices=blend_focus_indices,
+            )
+        else:
+            projection = load_projection(content_path, vis_method, vis_id, epoch, refine_flag=refine_flag)
+        metrics = calculate_refine_metrics_for_projection(
+            content_path,
+            epoch,
+            projection,
+            focus_indices,
+        )
+        return make_response(jsonify(metrics), 200)
+    except Exception as e:
+        print(e)
+        return make_response(jsonify({'error_message': 'Error in calculating refine metrics'}), 400)
 
 
 @app.route('/getInfluenceSamples', methods=["POST"])
