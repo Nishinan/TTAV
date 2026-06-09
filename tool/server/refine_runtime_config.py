@@ -9,12 +9,12 @@ REFINE_RUNTIME_DEFAULTS = {
     "blend_decay_ratio": 0.35,
     "focus_mode": "balanced",
     "focus_set_strategy": "seeds_plus_hd",
-    "refine_max_steps": 20000,
+    "refine_max_steps": 5000,
     "refine_time_budget_seconds": None,
     "refine_log_every_steps": 100,
-    "refine_min_steps": 300,
-    "refine_loss_window": 50,
-    "refine_loss_rel_tol": 1e-4,
+    "refine_min_steps": 200,
+    "refine_loss_window": 30,
+    "refine_loss_rel_tol": 5e-4,
 }
 
 

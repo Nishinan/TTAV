@@ -9,6 +9,9 @@ export default defineConfig({
         proxy: {
             '/syncSession': 'http://127.0.0.1:5050',
             '/updateFocusContext': 'http://127.0.0.1:5050',
+            '/startRefineSession': 'http://127.0.0.1:5050',
+            '/getRefineSessionProgress': 'http://127.0.0.1:5050',
+            '/stopRefineSession': 'http://127.0.0.1:5050',
             '/startVisualizing': 'http://127.0.0.1:5050',
             '/getTrainingProcessInfo': 'http://127.0.0.1:5050',
             '/updateProjection': 'http://127.0.0.1:5050',

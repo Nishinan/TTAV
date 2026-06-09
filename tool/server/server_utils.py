@@ -25,8 +25,29 @@ from visualize.training_event import TrainingEventDetector
 from influence_function.IF import EmpiricalIF, PairWiseEmpiricalIF
 from influence_function.CustomEncoderModel import CustomEncoderModel
 
+
+def normalize_content_path(content_path):
+    """Map historical machine-specific paths to an accessible local dataset path."""
+    if not content_path:
+        return content_path
+
+    raw = os.path.abspath(os.path.expanduser(str(content_path)))
+    candidates = [raw]
+    for src, dst in (
+        ("/root/project/", "/home/shinan/"),
+        ("/home/yilu/workspace/", "/home/shinan/"),
+    ):
+        if raw.startswith(src):
+            candidates.append(raw.replace(src, dst, 1))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[-1]
+
 # Func: infer available epochs files, return a list of available epochs
 def infer_epoch_structure(content_path):
+    content_path = normalize_content_path(content_path)
     epochs_dir = os.path.join(content_path, 'epochs')
     available_epochs = []
     if os.path.exists(epochs_dir) and os.path.isdir(epochs_dir):
@@ -74,6 +95,7 @@ def load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False):
     :param refine_flag: 如果为 True，优先从带有 _refined 后缀的文件夹读取；
                         若 _refined 文件不存在则回退到原始路径（graceful fallback）
     """
+    content_path = normalize_content_path(content_path)
     def _proj_path(folder):
         return os.path.join(content_path, "visualize", folder,
                             "epochs", f"epoch_{epoch}", "projection.npy")
@@ -110,6 +132,7 @@ def _distance_to_bbox(x, y, bbox):
 
 
 def build_runtime_blended_projection(content_path, vis_method, vis_id, epoch, blend_bbox, decay_ratio=0.35, focus_indices=None):
+    content_path = normalize_content_path(content_path)
     baseline = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=False), dtype=np.float32)
     refined = np.array(load_projection(content_path, vis_method, vis_id, epoch, refine_flag=True), dtype=np.float32)
 
@@ -151,6 +174,7 @@ def build_runtime_blended_projection(content_path, vis_method, vis_id, epoch, bl
 
 def load_raw_projection_array(content_path, vis_method, vis_id, epoch, refine_flag=False):
     """Load raw projection.npy without train/test reordering."""
+    content_path = normalize_content_path(content_path)
     suffix = "_refined" if refine_flag else ""
     projection_path = os.path.join(
         content_path,
@@ -187,6 +211,7 @@ def build_focus_set(
     strategy="seeds_plus_hd",
 ):
     """Construct the runtime focus_set according to the configured strategy."""
+    content_path = normalize_content_path(content_path)
     seed_set = {int(i) for i in seed_indices if isinstance(i, (int, np.integer)) or str(i).isdigit()}
     bbox_set = set()
     hd_set = set()
@@ -242,6 +267,7 @@ def build_focus_set(
     return focus_indices, {
         "seed_count": len(seed_set),
         "bbox_count": len(bbox_set),
+        "bbox_indices": sorted(bbox_set),
         "hd_neighbor_count": len(hd_set),
         "focus_set_size": len(focus_indices),
         "used_bbox": zoom_bbox is not None,
@@ -283,6 +309,7 @@ def load_one_sample(config, content_path, index):
 
 # Func: load all text samples
 def get_all_texts(content_path, from_file=True):
+    content_path = normalize_content_path(content_path)
     text_list = []
     
     if from_file:
@@ -307,6 +334,7 @@ def get_all_texts(content_path, from_file=True):
     return text_list
 
 def get_alignment_data(content_path):
+    content_path = normalize_content_path(content_path)
     alignment_path = os.path.join(content_path, "dataset", "align.json")
     if not os.path.exists(alignment_path):
         return []
@@ -420,6 +448,7 @@ def get_filter_result(config, content_path, epoch, filters):
     return result,''
 
 def load_background(content_path, vis_method,vis_id, epoch):
+    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'visualize',f"{vis_method}_{vis_id}",'epochs',f'epoch_{epoch}', 'background.png')
     if os.path.exists(file_path):
         return convert_to_base64(file_path)
@@ -431,10 +460,12 @@ def convert_to_base64(image_path):
     return base64_image
 
 def load_one_image(content_path, index):
+    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'dataset', 'image', f'{index}.png')
     return convert_to_base64(file_path)
 
 def load_one_text(content_path, index):
+    content_path = normalize_content_path(content_path)
     file_path = os.path.join(content_path, 'dataset', 'text.txt')
     with open(file_path, 'r') as f:
         content = f.read()
@@ -445,6 +476,7 @@ def load_one_text(content_path, index):
         return ""
 
 def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
+    content_path = normalize_content_path(content_path)
     # Cache to disk: high-D neighbors never change after training completes.
     cache_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}',
                               f'hd_neighbors_{max_neighbors}.json')
@@ -468,6 +500,7 @@ def calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=10):
     return neighbors
 
 def _proj_neighbors_cache_path(content_path, vis_method, vis_id, epoch, max_neighbors, refine_flag):
+    content_path = normalize_content_path(content_path)
     suffix = "_refined" if refine_flag else ""
     folder = os.path.join(content_path, "visualize", f"{vis_method}_{vis_id}{suffix}",
                           "epochs", f"epoch_{epoch}")
@@ -484,6 +517,7 @@ def invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, epoc
 
 def invalidate_bundle_neighbor_caches(content_path):
     """Delete stale neighbor caches for a bundle after the on-disk files are replaced."""
+    content_path = normalize_content_path(content_path)
     if not os.path.exists(content_path):
         return
 
@@ -595,6 +629,7 @@ def _get_faiss_index(content_path, vis_method, vis_id, epoch, refine_flag):
     return index, proj
 
 def calculate_projection_neighbors_for_projection(content_path, projection_list, max_neighbors=10):
+    content_path = normalize_content_path(content_path)
     index_dict = load_or_create_index(content_path)
     index_list = index_dict['train'] + index_dict['test']
     proj = np.array(projection_list, dtype='float32')
@@ -604,6 +639,7 @@ def calculate_projection_neighbors_for_projection(content_path, projection_list,
 
 
 def load_reordered_representation_array(content_path, epoch):
+    content_path = normalize_content_path(content_path)
     features_path = os.path.join(content_path, 'epochs', f'epoch_{epoch}', 'embeddings.npy')
     if not os.path.exists(features_path):
         raise FileNotFoundError(f"Representation not found: {features_path}")
@@ -614,6 +650,7 @@ def load_reordered_representation_array(content_path, epoch):
 
 
 def calculate_refine_metrics_for_projection(content_path, epoch, projection_list, focus_indices, k=10, k_ext=200):
+    content_path = normalize_content_path(content_path)
     proj = np.array(projection_list, dtype=np.float32)
     features, index_list = load_reordered_representation_array(content_path, epoch)
     if len(proj) != len(features):
@@ -682,6 +719,7 @@ def calculate_refine_metrics_for_projection(content_path, epoch, projection_list
     }
 
 def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_neighbors=10, refine_flag=False):
+    content_path = normalize_content_path(content_path)
     index_dict = load_or_create_index(content_path)
     index_list = index_dict['train'] + index_dict['test']
 
@@ -712,6 +750,7 @@ def calculate_projection_neighbors(content_path, vis_method, vis_id, epoch, max_
 
 # Func: Load a single attribute from a file based on the configuration and epoch
 def load_single_attribute(content_path, epoch, attribute):
+    content_path = normalize_content_path(content_path)
     if attribute == 'label':
         file_path = os.path.join(content_path, 'dataset', 'labels.npy')
         attr_data = read_label_file(file_path)
@@ -772,6 +811,7 @@ def read_file_as_json(file_path: str):
         return json.load(f)
 
 def load_or_create_index(content_path):
+    content_path = normalize_content_path(content_path)
     index_file_path = os.path.join(content_path, 'dataset', 'index.json')
     if os.path.exists(index_file_path):
         with open(index_file_path, 'r') as f:
@@ -859,6 +899,7 @@ def _compute_trustworthiness_continuity(high_neighbors, low_neighbors):
 
 def _metrics_cache_path(content_path, vis_method, vis_id):
     """Return the path of the per-visualisation metrics cache JSON."""
+    content_path = normalize_content_path(content_path)
     return os.path.join(
         content_path, 'visualize',
         f"{vis_method}_{vis_id}",
@@ -872,6 +913,7 @@ def calculate_visualize_metrics(content_path, vis_method, vis_id, epoch):
     Results are cached to disk (metrics_cache.json) to avoid re-computation
     across server restarts and repeated API calls for the same epoch.
     """
+    content_path = normalize_content_path(content_path)
     cache_path = _metrics_cache_path(content_path, vis_method, vis_id)
     epoch_key = str(epoch)
 

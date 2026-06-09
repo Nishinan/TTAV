@@ -1,5 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Input, Select, Radio, Button, Space, Divider } from 'antd';
+
+const DEFAULT_CONTENT_PATH = '/root/project/Dataset/backdoor';
+const LOCAL_CONTENT_PATH_CONFIG_URL = '/content-path.local.json';
 
 const methodOptions = [
   { label: 'DVI', value: 'DVI' },
@@ -10,11 +13,35 @@ const methodOptions = [
 ];
 
 export default function WebSideBar() {
-  const [contentPath, setContentPath] = useState('/root/project/Dataset/backdoor');
+  const [contentPath, setContentPath] = useState(DEFAULT_CONTENT_PATH);
   const [visualizationID, setVisualizationID] = useState('1');
   const [visualizationMethod, setVisualizationMethod] = useState('TimeVis');
   const [dataType, setDataType] = useState<'Image' | 'Text'>('Image');
   const [taskType, setTaskType] = useState<'Classification' | 'Alignment'>('Classification');
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadLocalContentPath = async () => {
+      try {
+        const response = await fetch(LOCAL_CONTENT_PATH_CONFIG_URL, { cache: 'no-store' });
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const localPath = typeof data?.contentPath === 'string' ? data.contentPath.trim() : '';
+        if (!cancelled && localPath) {
+          setContentPath(localPath);
+        }
+      } catch {
+        // Missing local override is expected in shared/server environments.
+      }
+    };
+
+    void loadLocalContentPath();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const startVisualizing = () => {
     window.postMessage(
@@ -126,4 +153,3 @@ export default function WebSideBar() {
     </div>
   );
 }
-

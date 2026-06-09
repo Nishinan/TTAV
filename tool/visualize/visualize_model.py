@@ -239,3 +239,51 @@ def inject_lora(model, target_layer_names=["decoder"], rank=4):
                 # Replace the original Linear layer with LoRALinear
                 setattr(parent, child_name, LoRALinear(module, rank=rank))
                 print(f"[TTAV] LoRA injected into: {name}")
+
+
+class ResidualProjectionHead(nn.Module):
+    """Small residual head that predicts a 2D correction from the input feature."""
+
+    def __init__(self, input_dim, hidden_dim=64, output_dim=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class FrozenEncoderWithResidualHead(nn.Module):
+    """Projection = frozen base encoder + small trainable residual correction."""
+
+    def __init__(self, base_encoder, input_dim, hidden_dim=64):
+        super().__init__()
+        self.base_encoder = base_encoder
+        for param in self.base_encoder.parameters():
+            param.requires_grad = False
+        self.residual_head = ResidualProjectionHead(input_dim, hidden_dim=hidden_dim, output_dim=2)
+
+    def forward(self, x):
+        with torch.no_grad():
+            base_projection = self.base_encoder(x)
+        return base_projection + self.residual_head(x)
+
+
+class ResidualRefineModel(nn.Module):
+    """Wrapper that keeps the original interface expected by patch/refine code."""
+
+    def __init__(self, base_model, input_dim, hidden_dim=64):
+        super().__init__()
+        self.encoder = FrozenEncoderWithResidualHead(
+            base_model.encoder,
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+        )
+        self.decoder = base_model.decoder
+        for param in self.decoder.parameters():
+            param.requires_grad = False

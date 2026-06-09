@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { EmbeddingView, type EmbeddingViewProps, type DataPoint, type ViewportState } from 'embedding-atlas/react';
 import { useDefaultStore } from "../state/state.unified";
 import { transferArray2Color } from './utils';
+import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition } from '../utils/neighborDiagnostics';
 
 type EmbeddingData = NonNullable<EmbeddingViewProps['data']>;
 
@@ -63,6 +64,7 @@ export const ChartComponent = memo(() => {
     const { setCurrentViewportBBox } = useDefaultStore(["setCurrentViewportBBox"]);
 
     const epochData = allEpochData[epoch];
+    const activePointId = selectedIndices[0] ?? hoveredIndex;
 
     // plot view helpers
     let [tooltip, setTooltip] = useState<DataPoint | null>(null);
@@ -146,12 +148,57 @@ export const ChartComponent = memo(() => {
         });
     }, [dimensions.height, dimensions.width, setCurrentViewportBBox, viewportState]);
 
+    const diagnosticVisibleIds = useMemo(() => {
+        if (!epochData || activePointId === undefined) {
+            return [] as number[];
+        }
+
+        const cachedProjectionNeighborPositions = epochData.projectionNeighbors?.[rawIndexToProjectionPosition(activePointId, epochData.indexList)] ?? [];
+        const effectiveProjectionNeighborPositions = (
+            hoveredIndex === undefined && Array.isArray(cachedProjectionNeighborPositions) && cachedProjectionNeighborPositions.length > 0
+        )
+            ? cachedProjectionNeighborPositions
+            : computeProjectionNeighborPositionsForPoint(
+                activePointId,
+                epochData.projection,
+                epochData.indexList,
+                10,
+            );
+        const hdIds = revealOriginalNeighbors
+            ? convertNeighborPositionsToRawIndices(
+                epochData.originalNeighbors?.[rawIndexToProjectionPosition(activePointId, epochData.indexList)],
+                epochData.indexList,
+            )
+            : [];
+        const ldIds = revealProjectionNeighbors
+            ? convertNeighborPositionsToRawIndices(
+                effectiveProjectionNeighborPositions,
+                epochData.indexList,
+            )
+            : [];
+
+        return Array.from(new Set<number>([
+            activePointId,
+            ...selectedIndices,
+            ...hdIds,
+            ...ldIds,
+        ]));
+    }, [
+        epochData,
+        activePointId,
+        selectedIndices,
+        revealOriginalNeighbors,
+        revealProjectionNeighbors,
+    ]);
+
     // filter dataIndices
     const filteredIndices = useMemo(() => {
         if (!epochData) {
             return [] as number[];
         }
-        const totalIndices = epochData.projection.map((_, idx) => idx);
+        const totalIndices = Array.isArray(epochData.indexList) && epochData.indexList.length > 0
+            ? epochData.indexList
+            : epochData.projection.map((_, idx) => idx);
         let current = totalIndices;
 
         if (shownData.length > 0) {
@@ -168,12 +215,12 @@ export const ChartComponent = memo(() => {
         }
 
         if (isFocusMode && focusIndices.length > 0) {
-            const focusSet = new Set<number>(focusIndices);
+            const focusSet = new Set<number>([...focusIndices, ...diagnosticVisibleIds]);
             current = current.filter((value) => focusSet.has(value));
         }
 
         return current;
-    }, [epochData, focusIndices, index, isFocusMode, shownData]);
+    }, [diagnosticVisibleIds, epochData, focusIndices, index, isFocusMode, shownData]);
 
     // Build a set of highlighted point indices based on highlightData toggles.
     // prediction_error: prediction !== ground-truth label
@@ -231,16 +278,17 @@ export const ChartComponent = memo(() => {
 
         let dataPoints : DataPoint[] = []
 
-        filteredIndices.forEach((originalIndex, position) => {
-            const [px, py] = epochData.projection[originalIndex] ?? [0, 0];
+        filteredIndices.forEach((rawIndex, position) => {
+            const projectionPos = rawIndexToProjectionPosition(rawIndex, epochData.indexList);
+            const [px, py] = epochData.projection[projectionPos] ?? [0, 0];
             x[position] = px;
             y[position] = py;
 
             // Highlighted points always use slot 0 (red); normal points use their label colour.
-            if (hasHighlights && highlightedSet.has(originalIndex)) {
+            if (hasHighlights && highlightedSet.has(rawIndex)) {
                 category[position] = HIGHLIGHT_CATEGORY_IDX;
             } else {
-                const label = inherentLabelData[originalIndex] ?? 0;
+                const label = inherentLabelData[rawIndex] ?? 0;
                 const colorTuple = colorDict.get(label);
                 // Offset by 1 when highlights are active to leave slot 0 for red
                 let categoryIndex = labelToCategoryIndex.get(label);
@@ -253,13 +301,13 @@ export const ChartComponent = memo(() => {
                 category[position] = categoryIndex;
             }
 
-            const label = inherentLabelData[originalIndex] ?? 0;
+            const label = inherentLabelData[rawIndex] ?? 0;
             dataPoints.push({
                 x: px,
                 y: py,
                 category: label,
-                text: `Index: ${originalIndex}\nLabel: ${label}`,
-                identifier: originalIndex,
+                text: `Index: ${rawIndex}\nLabel: ${label}`,
+                identifier: rawIndex,
                 fields: {}
             })
         });
@@ -287,6 +335,16 @@ export const ChartComponent = memo(() => {
         return m;
     }, [prepared]);
 
+    const controlledSelection = useMemo(() => {
+        if (!prepared || selectedIndices.length === 0) return null;
+        return selectedIndices
+            .map((selectedId) => {
+                const pos = posMap.get(selectedId);
+                return pos == null ? null : prepared.dataPoints[pos];
+            })
+            .filter((point): point is DataPoint => point !== null);
+    }, [posMap, prepared, selectedIndices]);
+
     useEffect(() => {
         if (!prepared || hoveredIndex === undefined) {
             return;
@@ -302,31 +360,46 @@ export const ChartComponent = memo(() => {
     useEffect(() => { setTrailRefresh((v) => v + 1); }, [selectedIndices]);
 
     const neighborOverlayProps = useMemo(() => {
-        if (!prepared || !epochData) return { center: null, original: [], projection: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors } as any;
+        if (!prepared || !epochData) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors } as any;
         const idsByPos = prepared.dataPoints.map((p) => p.identifier as number);
-        if (!tooltip) return { center: null, original: [], projection: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices } as any;
-        const hoverId = tooltip.identifier as number;
-        // originalNeighbors stores raw dataset indices — posMap key is also raw index, direct match.
-        const orig = (epochData.originalNeighbors?.[hoverId] ?? []).filter((nid) => posMap.has(nid));
-        // projectionNeighbors stores array positions (faiss output order), not raw indices.
-        // Convert via indexList: indexList[arrayPos] = rawIdx.
-        const indexList: number[] = epochData.indexList ?? [];
-        const projRaw = (epochData.projectionNeighbors?.[hoverId] ?? []).map(
-            (arrayPos: number) => indexList.length > 0 ? indexList[arrayPos] : arrayPos
+        if (activePointId === undefined) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices } as any;
+        const activePointPos = rawIndexToProjectionPosition(activePointId, epochData.indexList);
+        const cachedProjectionNeighborPositions = epochData.projectionNeighbors?.[activePointPos] ?? [];
+        const currentProjectionNeighborPositions = (
+            hoveredIndex === undefined && Array.isArray(cachedProjectionNeighborPositions) && cachedProjectionNeighborPositions.length > 0
+        )
+            ? cachedProjectionNeighborPositions
+            : computeProjectionNeighborPositionsForPoint(
+                activePointId,
+                epochData.projection,
+                epochData.indexList,
+                10,
+            );
+        const hdAll = convertNeighborPositionsToRawIndices(
+            epochData.originalNeighbors?.[activePointPos],
+            epochData.indexList,
         );
-        const proj = projRaw.filter((rawId: number) => posMap.has(rawId));
-        // After refine, epochData.projection is updated but tooltip.x/y still holds the
-        // stale hover coordinate. Always read the authoritative position from the projection array.
-        const latestCoord = epochData.projection?.[hoverId];
-        const center = latestCoord
-            ? { ...tooltip, x: latestCoord[0], y: latestCoord[1] }
-            : tooltip;
+        const ldAll = convertNeighborPositionsToRawIndices(
+            currentProjectionNeighborPositions,
+            epochData.indexList,
+        );
+        const hdSet = new Set<number>(hdAll);
+        const ldSet = new Set<number>(ldAll);
+        const pos = posMap.get(activePointId);
+        const basePoint = pos == null ? null : prepared.dataPoints[pos];
+        const latestCoord = epochData.projection?.[activePointPos];
+        const center = basePoint && latestCoord
+            ? { ...basePoint, x: latestCoord[0], y: latestCoord[1] }
+            : basePoint;
         return {
             center,
-            original: orig,
-            projection: proj,
+            hdOnly: hdAll.filter((nid: number) => !ldSet.has(nid)),
+            ldOnly: ldAll.filter((nid: number) => !hdSet.has(nid)),
+            overlap: hdAll.filter((nid: number) => ldSet.has(nid)),
             dataX: prepared.simpleData.x as Float32Array,
             dataY: prepared.simpleData.y as Float32Array,
+            fullProjection: epochData.projection,
+            indexList: epochData.indexList,
             pointSize,
             revealOriginalNeighbors,
             revealProjectionNeighbors,
@@ -344,7 +417,7 @@ export const ChartComponent = memo(() => {
             setSelectedIndices,
             selectedIndices,
         };
-    }, [prepared, epochData, tooltip, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, selectedIndices]);
+    }, [prepared, epochData, hoveredIndex, selectedIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh]);
 
     class NeighborOverlay {
         private el: HTMLDivElement | null = null;
@@ -426,15 +499,18 @@ export const ChartComponent = memo(() => {
         render() {
             if (!this.svg) return;
             this.clear();
-            const { center, original, projection, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
+            const { center, hdOnly, ldOnly, overlap, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
             const centerLoc = center ? this.proxy.location(center.x, center.y) : null;
             const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            const drawNeighbor = (nid: number, color: string) => {
-                const pos = this.props.posMap.get(nid);
-                if (pos == null) return;
-                const x = dataX[pos];
-                const y = dataY[pos];
-        
+            const drawNeighbor = (
+                nid: number,
+                style: { color: string; lineWidth: number; ringWidth: number; lineOpacity?: number; ringOpacity?: number }
+            ) => {
+                const projectionPos = rawIndexToProjectionPosition(nid, this.props.indexList);
+                const coord = this.props.fullProjection?.[projectionPos];
+                if (!coord) return;
+                const x = coord[0];
+                const y = coord[1];
 
                 const loc = this.proxy.location(x, y);
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -442,27 +518,37 @@ export const ChartComponent = memo(() => {
                 line.setAttribute('y1', String(centerLoc.y));
                 line.setAttribute('x2', String(loc.x));
                 line.setAttribute('y2', String(loc.y));
-                line.setAttribute('stroke', color);
-                line.setAttribute('stroke-width', '1.5');
+                line.setAttribute('stroke', style.color);
+                line.setAttribute('stroke-width', String(style.lineWidth));
                 line.setAttribute('stroke-linecap', 'round');
+                if (style.lineOpacity != null) {
+                    line.setAttribute('stroke-opacity', String(style.lineOpacity));
+                }
                 neighborGroup.appendChild(line);
                 const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
                 circle.setAttribute('cx', String(loc.x));
                 circle.setAttribute('cy', String(loc.y));
                 circle.setAttribute('r', String(pointSize + 1.5));
                 circle.setAttribute('fill', 'none');
-                circle.setAttribute('stroke', color);
-                circle.setAttribute('stroke-width', '2');
+                circle.setAttribute('stroke', style.color);
+                circle.setAttribute('stroke-width', String(style.ringWidth));
+                if (style.ringOpacity != null) {
+                    circle.setAttribute('stroke-opacity', String(style.ringOpacity));
+                }
                 neighborGroup.appendChild(circle);
             };
-            const COLOR_ORIG = '#E74C3C';
-            const COLOR_PROJ = '#2E86DE';
+            const STYLE_HD_ONLY = { color: '#E74C3C', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+            const STYLE_LD_ONLY = { color: '#2E86DE', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+            const STYLE_OVERLAP = { color: '#B8BDC7', lineWidth: 1.0, ringWidth: 1.4, lineOpacity: 0.35, ringOpacity: 0.45 };
             if (centerLoc) {
+                if (revealOriginalNeighbors || revealProjectionNeighbors) {
+                    overlap.forEach((nid: number) => drawNeighbor(nid, STYLE_OVERLAP));
+                }
                 if (revealOriginalNeighbors) {
-                    original.forEach((nid: number) => drawNeighbor(nid, COLOR_ORIG));
+                    hdOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_HD_ONLY));
                 }
                 if (revealProjectionNeighbors) {
-                    projection.forEach((nid: number) => drawNeighbor(nid, COLOR_PROJ));
+                    ldOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_LD_ONLY));
                 }
                 this.svg.appendChild(neighborGroup);
                 const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
@@ -483,7 +569,8 @@ export const ChartComponent = memo(() => {
                         for (let i = 0; i <= currentIdx; i++) {
                             const ep = epochs[i];
                             const epData = this.props.allEpochData?.[ep];
-                            const coord = epData?.projection?.[centerId];
+                            const centerPos = rawIndexToProjectionPosition(centerId, epData?.indexList);
+                            const coord = epData?.projection?.[centerPos];
                             if (!coord) continue;
                             const locp = this.proxy.location(coord[0], coord[1]);
                             points.push({ x: locp.x, y: locp.y });
@@ -701,6 +788,7 @@ export const ChartComponent = memo(() => {
             height={dimensions.height || undefined}
             config={{ mode: mode, colorScheme: 'light', pointSize: pointSize }}
             tooltip={tooltip}
+            selection={controlledSelection}
             onTooltip={(v) => {
                 setHoveredIndex(v ? v.identifier as number : undefined);
                 setTooltip(v);
@@ -714,10 +802,11 @@ export const ChartComponent = memo(() => {
             }}
             // [确定性逻辑 3]：确保 EmbeddingView 的选中事件同步到全局 Store
             onSelection={(points) => {
-                if (points && points.length > 0) {
-                    // 从 DataPoint 对象中提取出我们之前存入的 identifier (即原始索引)
-                    const ids = points.map(p => p.identifier as number);
-                    console.log("[TTAV] Selection Sync to Store:", ids);
+                const ids = points && points.length > 0
+                    ? points.map((p) => p.identifier as number)
+                    : [];
+                console.log("[TTAV] Selection Sync to Store:", ids);
+                if (ids.length > 0) {
                     setSelectedIndices(ids);
                 }
             }}

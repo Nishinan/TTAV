@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
 import { SyncOutlined } from '@ant-design/icons';
+import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, convertProjectionNeighborsToRawIndices } from '../utils/neighborDiagnostics';
 type SampleTag = {
     num: number;
     title: string;
@@ -17,6 +18,9 @@ interface LabelProps {
 
 interface FunctionPanelProps {
     onUpdateProjection: () => Promise<void>;
+    onStopRefine: () => Promise<void>;
+    isRefining: boolean;
+    stopPending: boolean;
 }
 const CompactCheckboxGroup = styled(Checkbox.Group)`
   display: flex;
@@ -53,6 +57,25 @@ const CompactCheckboxGroup = styled(Checkbox.Group)`
     width: 14px;
     height: 14px;
   }
+`;
+
+const LegendRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #4b5563;
+  line-height: 1.35;
+`;
+
+const LegendSwatch = styled.span<{ $color: string; $opacity?: number }>`
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: ${(props) => props.$color};
+  opacity: ${(props) => props.$opacity ?? 1};
+  border: 1px solid rgba(17, 24, 39, 0.12);
 `;
 
 const ColoredClassLabel: React.FC<LabelProps> = ({ label, colorArray, onColorChange }) => {
@@ -103,7 +126,7 @@ function hexToRgbArray(hex: string): [number, number, number] {
     return [r, g, b];
 }
 
-export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
+export function FunctionPanel({ onUpdateProjection, onStopRefine, isRefining, stopPending }: FunctionPanelProps) {
     const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode, epoch, allEpochData } =
         useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode", "epoch", "allEpochData"]);
     const { refineMetrics } = useDefaultStore(['refineMetrics']);
@@ -257,10 +280,36 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
             for (let j = i + 1; j < selectedItems.length; j++) {
                 const left = selectedItems[i];
                 const right = selectedItems[j];
-                const leftHd = epochData.originalNeighbors?.[left.num]?.includes(right.num) ?? false;
-                const rightHd = epochData.originalNeighbors?.[right.num]?.includes(left.num) ?? false;
-                const leftLd = epochData.projectionNeighbors?.[left.num]?.includes(right.num) ?? false;
-                const rightLd = epochData.projectionNeighbors?.[right.num]?.includes(left.num) ?? false;
+                const leftHd = convertNeighborPositionsToRawIndices(
+                    epochData.originalNeighbors?.[
+                        epochData.indexList?.indexOf(left.num) ?? left.num
+                    ],
+                    epochData.indexList,
+                ).includes(right.num);
+                const rightHd = convertNeighborPositionsToRawIndices(
+                    epochData.originalNeighbors?.[
+                        epochData.indexList?.indexOf(right.num) ?? right.num
+                    ],
+                    epochData.indexList,
+                ).includes(left.num);
+                const leftLd = convertProjectionNeighborsToRawIndices(
+                    computeProjectionNeighborPositionsForPoint(
+                        left.num,
+                        epochData.projection,
+                        epochData.indexList,
+                        10,
+                    ),
+                    epochData.indexList,
+                ).includes(right.num);
+                const rightLd = convertProjectionNeighborsToRawIndices(
+                    computeProjectionNeighborPositionsForPoint(
+                        right.num,
+                        epochData.projection,
+                        epochData.indexList,
+                        10,
+                    ),
+                    epochData.indexList,
+                ).includes(left.num);
 
                 relations.push({
                     key: `${left.num}-${right.num}`,
@@ -361,21 +410,35 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
     </div>
 
     {/* 显式 Update 按钮 */}
-    <Button 
-        type="primary" 
-        block 
-        size="small"
-        icon={<SyncOutlined />}
-        // 调用从父组件 AppCombinedView 传下来的异步处理函数
-        onClick={onUpdateProjection}
-        style={{ 
-            marginTop: '8px', 
-            borderRadius: '4px',
-            fontWeight: 500 
-        }}
-    >
-        Update Projection
-    </Button>
+    <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+        <Button 
+            type="primary" 
+            block 
+            size="small"
+            icon={<SyncOutlined />}
+            onClick={onUpdateProjection}
+            disabled={isRefining}
+            style={{ 
+                borderRadius: '4px',
+                fontWeight: 500 
+            }}
+        >
+            {isRefining ? 'Refining...' : 'Update Projection'}
+        </Button>
+        <Button
+            danger
+            block
+            size="small"
+            onClick={onStopRefine}
+            disabled={!isRefining || stopPending}
+            style={{
+                borderRadius: '4px',
+                fontWeight: 500,
+            }}
+        >
+            {stopPending ? 'Stopping...' : 'Stop Refine'}
+        </Button>
+    </div>
 </FunctionalBlock>
             <FunctionalBlock label="Refine Quality">
                 {refineMetrics ? (
@@ -529,7 +592,7 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
                             />
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Neighbors</span>
+                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Neighbor View</span>
                             <Select
                                 size="small"
                                 style={{ width: 240 }}
@@ -555,11 +618,28 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
                                 }}
                                 options={[
                                     { label: 'None', value: 'none' },
-                                    { label: 'Original', value: 'original' },
-                                    { label: 'Projection', value: 'projection' },
-                                    { label: 'Both', value: 'both' },
+                                    { label: 'HD-side', value: 'original' },
+                                    { label: 'LD-side', value: 'projection' },
+                                    { label: 'Full Diagnostic', value: 'both' },
                                 ]}
                             />
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Legend</span>
+                            <div style={{ border: '1px solid #d9d9d9', borderRadius: 6, padding: '8px', background: '#ffffff', width: 240, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                <LegendRow>
+                                    <LegendSwatch $color="#E74C3C" $opacity={1} />
+                                    <span>HD-only: true in high-D top-10, missing in low-D top-10</span>
+                                </LegendRow>
+                                <LegendRow>
+                                    <LegendSwatch $color="#2E86DE" $opacity={1} />
+                                    <span>LD-only: appears in low-D top-10, not a high-D top-10 neighbor</span>
+                                </LegendRow>
+                                <LegendRow>
+                                    <LegendSwatch $color="#B8BDC7" $opacity={0.45} />
+                                    <span>Correct overlap: shared by both sets, shown as weak context</span>
+                                </LegendRow>
+                            </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
                             <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Display</span>

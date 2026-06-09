@@ -12,10 +12,11 @@ from strategy.edge_dataset import DataHandler
 from strategy.spatial_edge_constructor import kcSpatialEdgeConstructor
 from strategy.temporal_edge_constructor import GlobalTemporalEdgeConstructor
 from strategy.losses import SingleVisLoss, UmapLoss, ReconstructionLoss
-from visualize_model import VisModel
+from visualize_model import VisModel, ResidualRefineModel
 from strategy.strategy_abstract import StrategyAbstractClass
 from data_provider import DataProvider
 from umap.umap_ import find_ab_params
+from refine_behavior_config import resolve_refine_behavior_config
 
 class TimeVis(StrategyAbstractClass):
     def __init__(self, config, data_provider):
@@ -144,13 +145,15 @@ class TimeVis(StrategyAbstractClass):
         self.ttav_mask = mask # Boolean mask on GPU
                 
     def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None,
-               current_epoch=None, epochs_to_update=10, _skip_avg_benchmark=False):
+               current_epoch=None, epochs_to_update=10, _skip_avg_benchmark=False,
+               progress_callback=None, should_stop_callback=None,
+               progress_refresh_indices=None):
         """
         Locally refine projections for a set of focus points.
 
         Key design decisions for speed and global stability:
-        1. Keep the global visualizer frozen and train only the last encoder
-           layers of a copied local visualizer.
+        1. Keep the global visualizer frozen and train only a tiny residual
+           adapter on top of the global encoder.
         2. Separate user focus, training context, and patch set so runtime
            semantics match the refine design docs.
         3. Subset inference — after fine-tuning, only the configured patch
@@ -177,6 +180,10 @@ class TimeVis(StrategyAbstractClass):
         if focus_indices is None:
             focus_indices = [focus_index] if focus_index is not None else []
         focus_indices = sorted({int(i) for i in focus_indices})
+        progress_refresh_indices = sorted({
+            int(i) for i in (progress_refresh_indices or [])
+            if isinstance(i, (int, np.integer)) or str(i).isdigit()
+        })
 
         start_time = time.time()
         vis_method = self.config['vis_method']
@@ -343,26 +350,17 @@ class TimeVis(StrategyAbstractClass):
                 torch.from_numpy(full_feat[nbr_idx].copy()).float().to(self.device)
             )
 
-        # --- 4. Fine-tune a dedicated local visualizer copy ---------------------
-        # Keep the global visualizer untouched; the copied local visualizer is
-        # trained only for the current refine request and used to patch outputs.
-        local_visualizer = copy.deepcopy(self.visualize_model).to(self.device)
-        encoder_layers = list(local_visualizer.encoder.children())
-        trainable_params = []
-        linear_count = 0
-        for layer in reversed(encoder_layers):
-            if isinstance(layer, torch.nn.Linear):
-                for p in layer.parameters():
-                    p.requires_grad = True
-                trainable_params += list(layer.parameters())
-                linear_count += 1
-                if linear_count >= 2:
-                    break
-        for _, param in local_visualizer.named_parameters():
-            if not param.requires_grad:
-                continue
-            if not any(param is tp for tp in trainable_params):
-                param.requires_grad = False
+        # --- 4. Train a tiny residual adapter on top of the frozen global encoder ----
+        # This preserves the global parametric mapping while dramatically reducing
+        # the number of trainable parameters compared with copying and fine-tuning
+        # the full local visualizer.
+        residual_hidden_dim = int(vis_cfg.get("refine_residual_hidden_dim", 64))
+        local_visualizer = ResidualRefineModel(
+            self.visualize_model,
+            input_dim=full_feat.shape[1],
+            hidden_dim=residual_hidden_dim,
+        ).to(self.device)
+        trainable_params = list(local_visualizer.encoder.residual_head.parameters())
 
         # Pre-batch all focus points and their HD neighbors for efficient forward pass.
         # focus_hd_nbr_feats[i] has shape [k_hd, D]; stack into [n_focus*k_hd, D].
@@ -377,22 +375,123 @@ class TimeVis(StrategyAbstractClass):
         gamma_repel = float(np.clip((margin_m - 0.3) / 0.2, 0.0, 1.0))
         mu_anchor   = 10.0  # anchor constraint weight
 
-        # Loss-convergence early stop: track L_attract over a sliding window.
-        # NP is meaningless as a stopping signal when 2-D cannot faithfully
-        # represent high-D neighborhoods (NP stays 0% even while the layout
-        # is genuinely improving). L_attract measures whether HD neighbors are
-        # still being pulled closer, which is the actual optimisation goal.
-        max_steps = int(vis_cfg.get("refine_max_steps", 5000))
-        time_budget_seconds = vis_cfg.get("refine_time_budget_seconds", None)
-        time_budget_seconds = None if time_budget_seconds in (None, "", False) else float(time_budget_seconds)
-        log_every_steps = int(vis_cfg.get("refine_log_every_steps", 50))
-        _loss_window  = []   # recent L_attract values
-        _WINDOW       = int(vis_cfg.get("refine_loss_window", 50))
-        _MIN_STEPS    = int(vis_cfg.get("refine_min_steps", 300))
-        _REL_TOL      = float(vis_cfg.get("refine_loss_rel_tol", 1e-4))
-        stop_reason = f"max_steps({max_steps})"
+        behavior_cfg = resolve_refine_behavior_config(vis_cfg)
+        progress_cfg = behavior_cfg["progressive_updates"]
+        stopping_cfg = behavior_cfg["stopping"]
 
-        for step in range(max_steps):
+        log_every_steps = int(vis_cfg.get("refine_log_every_steps", 50))
+        progress_enabled = bool(progress_callback and progress_cfg.get("enabled", False))
+        snapshot_every_steps = max(1, int(progress_cfg.get("snapshot_every_steps", 3)))
+        sampled_metrics_enabled = bool(progress_callback and progress_cfg.get("enable_sampled_metrics", True))
+        sample_metrics_every_steps = max(1, int(progress_cfg.get("sample_metrics_every_steps", 500)))
+
+        enable_max_steps = bool(stopping_cfg.get("enable_max_steps", True))
+        max_steps = max(1, int(stopping_cfg.get("max_steps", 20000)))
+        enable_time_budget = bool(stopping_cfg.get("enable_time_budget", False))
+        time_budget_seconds = stopping_cfg.get("time_budget_seconds", None)
+        time_budget_seconds = None if time_budget_seconds in (None, "", False) else float(time_budget_seconds)
+        enable_loss_converged = bool(stopping_cfg.get("enable_loss_converged", True))
+        stop_priority = list(stopping_cfg.get("priority", ["loss_converged", "time_budget", "max_steps"]))
+        safety_loop_cap = max(max_steps, int(stopping_cfg.get("safety_loop_cap", 200000)))
+
+        _loss_window  = []   # recent L_attract values
+        _WINDOW       = max(2, int(stopping_cfg.get("loss_window", 50)))
+        _MIN_STEPS    = max(1, int(stopping_cfg.get("min_steps", 300)))
+        _REL_TOL      = float(stopping_cfg.get("loss_rel_tol", 1e-4))
+        stop_reason = f"max_steps({max_steps})" if enable_max_steps else f"safety_loop_cap({safety_loop_cap})"
+
+        refined_indices = np.array(patch_indices, dtype=np.int64)
+        patch_feat_t = torch.from_numpy(full_feat[refined_indices].copy()).float().to(self.device)
+        progress_indices = sorted({
+            idx for idx in progress_refresh_indices
+            if 0 <= idx < N
+        }) or patch_indices
+        progress_indices_np = np.array(progress_indices, dtype=np.int64)
+        progress_feat_t = torch.from_numpy(full_feat[progress_indices_np].copy()).float().to(self.device)
+        use_bbox_progress_refresh = len(progress_refresh_indices) > 0
+
+        def _build_subset_projection_for(indices_np, feat_t):
+            local_visualizer.eval()
+            with torch.no_grad():
+                refined_subset = local_visualizer.encoder(feat_t).cpu().numpy()
+            local_visualizer.train()
+            out = full_proj_baseline.copy()
+            out[indices_np] = refined_subset
+            return out
+
+        def _build_subset_patched_projection():
+            return _build_subset_projection_for(refined_indices, patch_feat_t)
+
+        def _build_progress_projection():
+            return _build_subset_projection_for(progress_indices_np, progress_feat_t)
+
+        def _emit_progress_snapshot(step_idx: int):
+            if not progress_enabled:
+                return
+            progress_callback({
+                "status": "running",
+                "steps_completed": step_idx + 1,
+                "focus_indices": focus_indices,
+                "training_context_indices": training_context_indices,
+                "patch_indices": patch_indices,
+                "bbox_indices": progress_refresh_indices,
+                "projection": _build_progress_projection() if use_bbox_progress_refresh else _build_subset_patched_projection(),
+            })
+
+        def _compute_focus_metrics(z_layout):
+            trust_sum = 0.0
+            cont_sum  = 0.0
+            np_sum    = 0.0
+            mrh_sum   = 0.0
+
+            k = 10
+            K_ext = min(200, N - 1)
+
+            for fi_glob in focus_indices:
+                hd_feat_fi = full_feat[fi_glob]
+                hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
+                hd_dists[fi_glob] = np.inf
+                hd_rank = np.argsort(hd_dists)
+
+                ld_dists = np.linalg.norm(z_layout - z_layout[fi_glob], axis=1)
+                ld_dists[fi_glob] = np.inf
+                ld_rank = np.argsort(ld_dists)
+
+                hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
+                ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
+                ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
+
+                hd_topk = set(hd_rank[:k].tolist())
+                ld_topk = set(ld_rank[:k].tolist())
+
+                np_sum += len(hd_topk & ld_topk) / k
+                mrh_sum += float(np.mean([ld_rank_full[j] for j in hd_topk]))
+
+                t_penalty = 0.0
+                for j in (ld_topk - hd_topk):
+                    r_hd = hd_rank_of.get(j, K_ext + 1)
+                    t_penalty += max(0, r_hd - k)
+
+                c_penalty = 0.0
+                for j in (hd_topk - ld_topk):
+                    r_ld = ld_rank_of.get(j, K_ext + 1)
+                    c_penalty += max(0, r_ld - k)
+
+                worst = k * (K_ext - k)
+                trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
+                cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
+
+            n_f = max(len(focus_indices), 1)
+            return {
+                "neighbor_preservation": np_sum / n_f * 100.0,
+                "mean_rank_hd": mrh_sum / n_f,
+                "trustworthiness": max(0.0, trust_sum / n_f * 100.0),
+                "continuity": max(0.0, cont_sum / n_f * 100.0),
+            }
+
+        loop_limit = max_steps if enable_max_steps else safety_loop_cap
+        step = -1
+        for step in range(loop_limit):
             optimizer.zero_grad()
 
             z_focus   = local_visualizer.encoder(focus_feat_t)    # [n_focus, 2]
@@ -441,109 +540,78 @@ class TimeVis(StrategyAbstractClass):
                       f"L_anchor={l_anchor.item():.5f}  "
                       f"t={time.time()-start_time:.1f}s")
 
-            # Loss-convergence early stop (only after _MIN_STEPS)
-            if step >= _MIN_STEPS and len(_loss_window) == _WINDOW:
+            should_emit_projection = progress_enabled and (step + 1) % snapshot_every_steps == 0
+            if use_bbox_progress_refresh:
+                should_emit_projection = progress_enabled and (step + 1) % sample_metrics_every_steps == 0
+            if should_emit_projection:
+                _emit_progress_snapshot(step)
+
+            if sampled_metrics_enabled and (step + 1) % sample_metrics_every_steps == 0:
+                sampled_layout = _build_progress_projection() if use_bbox_progress_refresh else _build_subset_patched_projection()
+                progress_payload = {
+                    "status": "running",
+                    "steps_completed": step + 1,
+                    "focus_indices": focus_indices,
+                    "training_context_indices": training_context_indices,
+                    "patch_indices": patch_indices,
+                    "bbox_indices": progress_refresh_indices,
+                    "sampled_metrics": _compute_focus_metrics(sampled_layout),
+                }
+                if not should_emit_projection:
+                    progress_payload["projection"] = sampled_layout
+                progress_callback(progress_payload)
+
+            loss_converged = False
+            if enable_loss_converged and step >= _MIN_STEPS and len(_loss_window) == _WINDOW:
                 _w_max = max(_loss_window)
                 _w_min = min(_loss_window)
-                if _w_max > 0 and (_w_max - _w_min) / _w_max < _REL_TOL:
+                loss_converged = _w_max > 0 and (_w_max - _w_min) / _w_max < _REL_TOL
+
+            stop_requested = bool(should_stop_callback and should_stop_callback())
+            time_budget_hit = (
+                enable_time_budget and
+                time_budget_seconds is not None and
+                (time.time() - start_time > time_budget_seconds)
+            )
+            max_steps_hit = enable_max_steps and (step + 1 >= max_steps)
+
+            if stop_requested:
+                stop_reason = f"external_stop(step={step + 1})"
+                break
+
+            for condition in stop_priority:
+                if condition == "loss_converged" and loss_converged:
                     print(f"[TimeVis] Loss converged at step {step}: "
-                          f"L_attract range={_w_max-_w_min:.6f} < tol")
+                          f"L_attract range={max(_loss_window)-min(_loss_window):.6f} < tol")
                     stop_reason = f"loss_converged(step={step})"
                     break
-
-            if time_budget_seconds is not None and time.time() - start_time > time_budget_seconds:
-                print(f"[TimeVis] Time budget reached at step {step} ({time_budget_seconds:.1f}s)")
-                stop_reason = f"time_budget(step={step}, seconds={time_budget_seconds:.1f})"
-                break
+                if condition == "time_budget" and time_budget_hit:
+                    print(f"[TimeVis] Time budget reached at step {step} ({time_budget_seconds:.1f}s)")
+                    stop_reason = f"time_budget(step={step}, seconds={time_budget_seconds:.1f})"
+                    break
+                if condition == "max_steps" and max_steps_hit:
+                    stop_reason = f"max_steps({max_steps})"
+                    break
+            else:
+                continue
+            break
         else:
-            step = max_steps - 1
+            stop_reason = f"safety_loop_cap({loop_limit})"
         _mark_stage("train")
 
         # --- Compute T, C, NP for focus points using the subset-patched layout ---
         # We only update the refined subset and keep all other points on the
         # baseline projection to preserve global stability and avoid a second
         # full-dataset encoder pass after local training.
-        refined_indices = np.array(patch_indices, dtype=np.int64)
         print(f"[TimeVis] Building subset-patched layout for metrics "
               f"({len(refined_indices)} refined points)...")
-        local_visualizer.eval()
-        with torch.no_grad():
-            refined_subset = local_visualizer.encoder(
-                torch.from_numpy(full_feat[refined_indices].copy()).float().to(self.device)
-            ).cpu().numpy()
-        z_np = full_proj_baseline.copy()
-        z_np[refined_indices] = refined_subset
+        z_np = _build_subset_patched_projection()
 
-        trust_sum = 0.0
-        cont_sum  = 0.0
-        np_sum    = 0.0
-        mrh_sum   = 0.0   # Mean Rank of HD neighbors in LD space (lower = better)
-
-        k = 10
-        # Extended neighborhood to compute meaningful ranks: top K_ext points
-        # gives penalty a real range instead of collapsing near zero.
-        K_ext = min(200, N - 1)
-
-        for fi_glob in focus_indices:
-            # High-dim ranks (argsort over all N, excluding self)
-            hd_feat_fi = full_feat[fi_glob]
-            hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
-            hd_dists[fi_glob] = np.inf
-            hd_rank = np.argsort(hd_dists)   # index array: hd_rank[r] = point at rank r
-
-            # Low-dim ranks
-            ld_dists = np.linalg.norm(z_np - z_np[fi_glob], axis=1)
-            ld_dists[fi_glob] = np.inf
-            ld_rank = np.argsort(ld_dists)
-
-            # Build rank lookup: point_idx → 1-based rank (only within K_ext)
-            # Used for T/C penalty computation (capped at K_ext for normalisation).
-            hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
-            ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
-
-            # Full LD rank lookup for MRH — must cover all N points so HD
-            # neighbors that landed far away in 2D get their true rank, not 201.
-            ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
-
-            hd_topk = set(hd_rank[:k].tolist())
-            ld_topk = set(ld_rank[:k].tolist())
-
-            # NP: strict top-k set intersection
-            np_sum += len(hd_topk & ld_topk) / k
-
-            # MRH: average LD rank of the HD top-k neighbors (full-range lookup).
-            # Ideal ≈ 5.5 (perfectly centred in top-10).
-            # Crowded-but-good: MRH ≈ 10–30 (just outside top-10 due to density).
-            # Truly bad projection: MRH >> 100.
-            mrh_sum += float(np.mean([
-                ld_rank_full[j] for j in hd_topk
-            ]))
-
-            # Trustworthiness: penalise fake low-D neighbors (in LD but not HD top-k)
-            # Penalty = HD rank - k; if HD rank > K_ext, use K_ext as conservative bound.
-            t_penalty = 0.0
-            for j in (ld_topk - hd_topk):
-                r_hd = hd_rank_of.get(j, K_ext + 1)
-                t_penalty += max(0, r_hd - k)
-
-            # Continuity: penalise missing HD neighbors (in HD but not LD top-k)
-            c_penalty = 0.0
-            for j in (hd_topk - ld_topk):
-                r_ld = ld_rank_of.get(j, K_ext + 1)
-                c_penalty += max(0, r_ld - k)
-
-            # Normalizer: worst-case penalty for one point with k fake neighbors,
-            # each at rank K_ext.  This gives T/C a meaningful [0,1] range
-            # for a single focus point rather than the global N-point formula.
-            worst = k * (K_ext - k)
-            trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
-            cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
-
-        n_f = max(len(focus_indices), 1)
-        final_np    = np_sum    / n_f * 100.0
-        final_mrh   = mrh_sum   / n_f          # raw rank number, not a percentage
-        final_trust = max(0.0, trust_sum / n_f * 100.0)
-        final_cont  = max(0.0, cont_sum  / n_f * 100.0)
+        final_metrics = _compute_focus_metrics(z_np)
+        final_np = final_metrics["neighbor_preservation"]
+        final_mrh = final_metrics["mean_rank_hd"]
+        final_trust = final_metrics["trustworthiness"]
+        final_cont = final_metrics["continuity"]
 
         self._last_refine_np    = final_np
         self._last_refine_mrh   = final_mrh

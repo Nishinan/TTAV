@@ -3,6 +3,7 @@ import styled from 'styled-components';
 import { softmax } from './utils';
 import { useDefaultStore } from '../state/state.unified';
 import { FunctionalBlock } from './custom/basic-components';
+import { classifyNeighborDiagnostics, computeProjectionNeighborPositionsForPoint } from '../utils/neighborDiagnostics';
 
 export function SamplePanel() {
     const { availableEpochs, hoveredIndex, inherentLabelData, epoch, allEpochData, labelDict, dataType, rawData, tokenList } =
@@ -11,13 +12,14 @@ export function SamplePanel() {
     const [data, setData] = useState<string>('');
     const [predictions, setPredictions] = useState<{ value: number, confidence: number, correct: boolean }[]>([]);
     const [historyPrediction, setHistoryPrediction] = useState<{ epoch: number, prediction: number, confidence: number, correct: boolean }[]>([]);
+    const epochData = allEpochData[epoch];
 
     const getDisplayLabel = (index: number) =>
     tokenList ? tokenList[index] : labelDict.get(inherentLabelData[index]) || 'Unknown';
 
     useEffect(() => {
         console.log("hoveredIndex in detail panel: ", hoveredIndex);
-        if (!hoveredIndex || !inherentLabelData || !allEpochData[epoch]) {
+        if (hoveredIndex === undefined || !inherentLabelData || !allEpochData[epoch]) {
             setData('');
             setPredictions([]);
             setHistoryPrediction([]);
@@ -60,6 +62,21 @@ export function SamplePanel() {
         setHistoryPrediction(historyPredictionNew);
 
     }, [hoveredIndex, rawData, epoch, allEpochData, availableEpochs]);
+
+    const neighborDiagnostics = hoveredIndex !== undefined && epochData
+        ? classifyNeighborDiagnostics(
+            epochData.originalNeighbors?.[
+                epochData.indexList?.indexOf(hoveredIndex) ?? hoveredIndex
+            ],
+            computeProjectionNeighborPositionsForPoint(
+                hoveredIndex,
+                epochData.projection,
+                epochData.indexList,
+                10,
+            ),
+            epochData.indexList,
+        )
+        : null;
 
     return (
         <CompactInfoColumn>
@@ -127,27 +144,35 @@ export function SamplePanel() {
 
             <FunctionalBlock label="Neighbors">
                 <CompactSection>
-                    <CompactSectionLabel>HIGH-DIM</CompactSectionLabel>
+                    <CompactSectionLabel>HD-ONLY</CompactSectionLabel>
                     <CompactNeighborList>
-                        {hoveredIndex !== undefined && allEpochData[epoch]?.originalNeighbors[hoveredIndex]?.map((neighbor, index) => (
-                            <HighDimNeighborItem key={index}>
+                        {neighborDiagnostics?.hdOnly.map((neighbor, index) => (
+                            <NeighborItem key={index} $variant="hdOnly">
                                 {neighbor}.{getDisplayLabel(neighbor)}
-                            </HighDimNeighborItem>
+                            </NeighborItem>
                         ))}
                     </CompactNeighborList>
                 </CompactSection>
 
                 <CompactSection>
-                    <CompactSectionLabel>PROJECTION</CompactSectionLabel>
+                    <CompactSectionLabel>LD-ONLY</CompactSectionLabel>
                     <CompactNeighborList>
-                        {hoveredIndex !== undefined && allEpochData[epoch]?.projectionNeighbors[hoveredIndex]?.map((neighbor, index) => {
-                            const isCorrect = allEpochData[epoch].originalNeighbors[hoveredIndex]?.includes(neighbor);
-                            return (
-                                <ProjectionNeighborItem key={index} $correct={isCorrect}>
-                                    {neighbor}.{getDisplayLabel(neighbor)}
-                                </ProjectionNeighborItem>
-                            );
-                        })}
+                        {neighborDiagnostics?.ldOnly.map((neighbor, index) => (
+                            <NeighborItem key={index} $variant="ldOnly">
+                                {neighbor}.{getDisplayLabel(neighbor)}
+                            </NeighborItem>
+                        ))}
+                    </CompactNeighborList>
+                </CompactSection>
+
+                <CompactSection>
+                    <CompactSectionLabel>CORRECT OVERLAP</CompactSectionLabel>
+                    <CompactNeighborList>
+                        {neighborDiagnostics?.overlap.map((neighbor, index) => (
+                            <NeighborItem key={index} $variant="overlap">
+                                {neighbor}.{getDisplayLabel(neighbor)}
+                            </NeighborItem>
+                        ))}
                     </CompactNeighborList>
                 </CompactSection>
             </FunctionalBlock>
@@ -334,22 +359,21 @@ const CompactNeighborList = styled.div`
     gap: 4px;
 `;
 
-const HighDimNeighborItem = styled.span`
+const NeighborItem = styled.span<{ $variant: 'hdOnly' | 'ldOnly' | 'overlap' }>`
     padding: 3px 6px;
     border-radius: 3px;
     font-size: 11px;
     font-family: 'Consolas', monospace;
-    background-color: #f0f0f0;
-    color: #595959;
-    display: inline-block;
-`;
-
-const ProjectionNeighborItem = styled.span<{ $correct: boolean }>`
-    padding: 3px 6px;
-    border-radius: 3px;
-    font-size: 11px;
-    font-family: 'Consolas', monospace;
-    background-color: ${props => props.$correct ? '#d9f7be' : '#ffd6d6'};
-    color: #262626;
+    background-color: ${props => (
+        props.$variant === 'hdOnly' ? '#ffe1dc' :
+        props.$variant === 'ldOnly' ? '#dcebff' :
+        '#f2f4f7'
+    )};
+    color: ${props => (props.$variant === 'overlap' ? '#5f6b7a' : '#262626')};
+    border: 1px solid ${props => (
+        props.$variant === 'hdOnly' ? '#f3a39a' :
+        props.$variant === 'ldOnly' ? '#9fc2f5' :
+        '#d8dde6'
+    )};
     display: inline-block;
 `;

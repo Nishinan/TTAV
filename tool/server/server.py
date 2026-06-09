@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import json
+import uuid
 from pathlib import Path
 import numpy as np
 # from llm_agent import call_llm_agent
@@ -17,6 +18,7 @@ sys.path.append('../visualize')
 
 from server_utils import *
 from refine_runtime_config import REFINE_RUNTIME_DEFAULTS
+from refine_behavior_config import resolve_refine_behavior_config
 
 # flask for API server
 app = Flask(__name__)
@@ -50,10 +52,11 @@ EIF_STATIC_SESSION = "EIF_STATIC_BUNDLE"
 def update_active_session(config, visualizer, strategy):
     """统一更新 Session 的工具函数"""
     global active_session
+    normalized_content_path = normalize_content_path(config.get("content_path"))
     active_session.update({
         "strategy": strategy,
         "visualizer": visualizer,
-        "content_path": config.get("content_path"),
+        "content_path": normalized_content_path,
         "vis_id": config.get("visualizationID") or config.get("vis_id"),
         "vis_method": config.get("vis_method"),
         "vis_config": config.get("vis_config", {})
@@ -64,13 +67,15 @@ def sync_session():
     """新接口：允许前端 Load 时同步 Session"""
     req = request.get_json()
     try:
-        info_path = os.path.join(req['content_path'], 'dataset', 'info.json')
+        content_path = normalize_content_path(req['content_path'])
+        req['content_path'] = content_path
+        info_path = os.path.join(content_path, 'dataset', 'info.json')
         dataset_info = read_file_as_json(info_path) or {}
         if dataset_info.get("eif_bundle"):
             active_session.update({
                 "strategy": EIF_STATIC_SESSION,
                 "visualizer": None,
-                "content_path": req.get("content_path"),
+                "content_path": content_path,
                 "vis_id": req.get("vis_id", "0"),
                 "vis_method": req.get("vis_method"),
                 "vis_config": req.get("vis_config", {}),
@@ -100,6 +105,213 @@ import threading
 
 # Global lock: only one refine() may run at a time (strategy objects are not thread-safe).
 _refine_lock = threading.Lock()
+_refine_sessions = {}
+_refine_sessions_lock = threading.Lock()
+
+
+def _prepare_refine_request(req):
+    content_path = normalize_content_path(req.get("content_path"))
+    selected_indices = req.get("selected_indices", [])
+    focus_mode = req.get("focus_mode", "balanced")
+    current_epoch = req.get("current_epoch", None)
+    zoom_bbox = req.get("zoom_bbox")
+
+    if active_session["strategy"] is None:
+        print("No active session, strategy:", active_session["strategy"],
+              ", path:", active_session["content_path"], "content path:", content_path)
+        raise ValueError("No active session")
+
+    if active_session["strategy"] == EIF_STATIC_SESSION:
+        raise ValueError("EIF static bundles do not support refinement yet")
+
+    strategy = active_session["strategy"]
+    visualizer = active_session["visualizer"]
+    vis_method = active_session["vis_method"]
+    vis_id = active_session["vis_id"]
+    vis_config = active_session.get("vis_config", {})
+    resolved_refine_behavior = resolve_refine_behavior_config(vis_config)
+
+    focus_indices = selected_indices
+    focus_summary = {
+        "seed_count": len(selected_indices),
+        "bbox_count": 0,
+        "bbox_indices": [],
+        "hd_neighbor_count": 0,
+        "focus_set_size": len(selected_indices),
+        "used_bbox": False,
+    }
+
+    if vis_method == "TimeVis":
+        hd_k = int(vis_config.get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+        focus_set_strategy = vis_config.get(
+            "refine_focus_set_strategy",
+            REFINE_RUNTIME_DEFAULTS["focus_set_strategy"],
+        )
+        focus_indices, focus_summary = build_focus_set(
+            content_path=content_path,
+            vis_method=vis_method,
+            vis_id=vis_id,
+            epoch=current_epoch,
+            seed_indices=selected_indices,
+            zoom_bbox=zoom_bbox,
+            hd_k=hd_k,
+            strategy=focus_set_strategy,
+        )
+
+    return {
+        "content_path": content_path,
+        "selected_indices": selected_indices,
+        "focus_mode": focus_mode,
+        "current_epoch": current_epoch,
+        "zoom_bbox": zoom_bbox,
+        "strategy": strategy,
+        "visualizer": visualizer,
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "focus_indices": focus_indices,
+        "focus_summary": focus_summary,
+        "bbox_indices": focus_summary.get("bbox_indices", []),
+        "resolved_refine_behavior": resolved_refine_behavior,
+    }
+
+
+def _run_refine_request(prepared_req, progress_callback=None):
+    content_path = prepared_req["content_path"]
+    focus_mode = prepared_req["focus_mode"]
+    current_epoch = prepared_req["current_epoch"]
+    strategy = prepared_req["strategy"]
+    visualizer = prepared_req["visualizer"]
+    vis_method = prepared_req["vis_method"]
+    vis_id = prepared_req["vis_id"]
+    focus_indices = prepared_req["focus_indices"]
+    focus_summary = prepared_req["focus_summary"]
+    bbox_indices = prepared_req.get("bbox_indices", [])
+    resolved_refine_behavior = prepared_req.get("resolved_refine_behavior")
+
+    print(f"Starting refinement: mode={focus_mode}, selected_points={prepared_req['selected_indices']}")
+
+    mask = strategy.get_focus_mask(focus_indices)
+    strategy.update_ttav_context(focus_indices, focus_mode, mask)
+
+    if vis_method == "DynaVis":
+        strategy.refine_train(focus_mode=focus_mode)
+        print("Start generating DynaVis visualization results...")
+        visualizer.visualize_all_epochs()
+        print("DynaVis visualization results generated.")
+    elif vis_method in ("DVI", "TimeVis"):
+        print("Start refining visualization model...")
+        strategy.refine(
+            focus_indices=focus_indices,
+            neighbor_indices=[],
+            current_epoch=current_epoch,
+            epochs_to_update=10,
+            progress_callback=progress_callback,
+            should_stop_callback=prepared_req.get("should_stop_callback"),
+            progress_refresh_indices=bbox_indices,
+        )
+        if current_epoch is not None:
+            patched_indices = getattr(strategy, "_last_patch_indices", None)
+            if patched_indices:
+                try:
+                    update_projection_neighbors_incremental(
+                        content_path,
+                        vis_method,
+                        vis_id,
+                        current_epoch,
+                        patched_indices,
+                    )
+                except Exception as cache_ex:
+                    print(f"[TimeVis] Incremental neighbor cache update failed: {cache_ex}")
+                    invalidate_projection_neighbors_cache(
+                        content_path, vis_method, vis_id, current_epoch
+                    )
+            else:
+                invalidate_projection_neighbors_cache(
+                    content_path, vis_method, vis_id, current_epoch
+                )
+        print("Refinement finished. Refined projections saved to _refined directory.")
+        strategy.patch_other_epochs(skip_epoch=current_epoch)
+    else:
+        visualizer.visualize_all_epochs()
+
+    return {
+        "status": "success",
+        "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
+        "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
+        "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
+        "continuity":            getattr(strategy, '_last_refine_cont',   None),
+        "focus_set_size":        focus_summary["focus_set_size"],
+        "focus_seed_count":      focus_summary["seed_count"],
+        "focus_bbox_count":      focus_summary["bbox_count"],
+        "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
+        "focus_set_strategy":    focus_summary.get("focus_set_strategy"),
+        "bbox_indices":          bbox_indices,
+        "focus_indices":         focus_indices,
+        "training_context_indices": getattr(strategy, "_last_training_context_indices", focus_indices),
+        "patch_indices":         getattr(strategy, "_last_patch_indices", focus_indices),
+        "resolved_refine_behavior": resolved_refine_behavior,
+        "timings":               getattr(strategy, "_last_refine_timing", None),
+    }
+
+
+def _update_refine_session(session_id, **fields):
+    with _refine_sessions_lock:
+        session = _refine_sessions.get(session_id)
+        if session is None:
+            return
+        session.update(fields)
+        if "projection" in fields:
+            session["projection_version"] = session.get("projection_version", 0) + 1
+
+
+def _run_refine_session_worker(session_id, prepared_req):
+    try:
+        def _should_stop_callback():
+            with _refine_sessions_lock:
+                session = _refine_sessions.get(session_id)
+                return bool(session and session.get("stop_requested", False))
+
+        def _progress_callback(payload):
+            session_fields = {
+                "status": "stopping" if _should_stop_callback() else "running",
+                "steps_completed": payload.get("steps_completed", 0),
+                "focus_indices": payload.get("focus_indices", prepared_req["focus_indices"]),
+                "training_context_indices": payload.get("training_context_indices", []),
+                "patch_indices": payload.get("patch_indices", []),
+                "bbox_indices": payload.get("bbox_indices", prepared_req.get("bbox_indices", [])),
+            }
+            if "projection" in payload:
+                session_fields["projection"] = payload.get("projection")
+            if "sampled_metrics" in payload:
+                session_fields["sampled_metrics"] = payload.get("sampled_metrics")
+            _update_refine_session(session_id, **session_fields)
+
+        prepared_req["should_stop_callback"] = _should_stop_callback
+        result = _run_refine_request(prepared_req, progress_callback=_progress_callback)
+        _update_refine_session(
+            session_id,
+            status="completed",
+            steps_completed=(result.get("timings") or {}).get("steps_completed", 0),
+            focus_indices=result.get("focus_indices", prepared_req["focus_indices"]),
+            training_context_indices=result.get("training_context_indices", []),
+            patch_indices=result.get("patch_indices", []),
+            bbox_indices=result.get("bbox_indices", prepared_req.get("bbox_indices", [])),
+            timings=result.get("timings"),
+            sampled_metrics={
+                "neighbor_preservation": result.get("neighbor_preservation"),
+                "mean_rank_hd": result.get("mean_rank_hd"),
+                "trustworthiness": result.get("trustworthiness"),
+                "continuity": result.get("continuity"),
+            },
+            result=result,
+            resolved_refine_behavior=prepared_req.get("resolved_refine_behavior"),
+        )
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        _update_refine_session(session_id, status="failed", error=str(ex))
+    finally:
+        _refine_lock.release()
 
 @app.route('/updateFocusContext', methods=['POST'])
 @cross_origin()
@@ -108,133 +320,119 @@ def update_focus_context():
     Endpoint to receive user selection and trigger dynamic refinement.
     """
     req = request.get_json()
-    content_path = req.get("content_path")
-    selected_indices = req.get("selected_indices", [])
-    focus_mode = req.get("focus_mode", "balanced")
-    current_epoch = req.get("current_epoch", None)  # epoch currently viewed by user
-    zoom_bbox = req.get("zoom_bbox")
-
-    # Check if a session is active
-    if active_session["strategy"] is None:
-        print("No active session, strategy:", active_session["strategy"],
-              ", path:", active_session["content_path"], "content path:", content_path)
-        return jsonify({"status": "error", "message": "No active session"}), 400
-
-    if active_session["strategy"] == EIF_STATIC_SESSION:
-        return jsonify({
-            "status": "error",
-            "message": "EIF static bundles do not support refinement yet"
-        }), 400
-
-    # Reject concurrent refine requests immediately rather than queueing them.
     if not _refine_lock.acquire(blocking=False):
         return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
 
-    strategy = active_session["strategy"]
-    visualizer = active_session["visualizer"]
-
     try:
-        print(f"Starting refinement: mode={focus_mode}, selected_points={selected_indices}")
-
-        vis_method = active_session["vis_method"]
-        focus_indices = selected_indices
-        focus_summary = {
-            "seed_count": len(selected_indices),
-            "bbox_count": 0,
-            "hd_neighbor_count": 0,
-            "focus_set_size": len(selected_indices),
-            "used_bbox": False,
-        }
-
-        if vis_method == "TimeVis":
-            hd_k = int(active_session.get("vis_config", {}).get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
-            focus_set_strategy = active_session.get("vis_config", {}).get(
-                "refine_focus_set_strategy",
-                REFINE_RUNTIME_DEFAULTS["focus_set_strategy"],
-            )
-            focus_indices, focus_summary = build_focus_set(
-                content_path=content_path,
-                vis_method=vis_method,
-                vis_id=active_session["vis_id"],
-                epoch=current_epoch,
-                seed_indices=selected_indices,
-                zoom_bbox=zoom_bbox,
-                hd_k=hd_k,
-                strategy=focus_set_strategy,
-            )
-
-        mask = strategy.get_focus_mask(focus_indices)
-        strategy.update_ttav_context(focus_indices, focus_mode, mask)
-
-        if vis_method == "DynaVis":
-            strategy.refine_train(focus_mode=focus_mode)
-            print("Start generating DynaVis visualization results...")
-            visualizer.visualize_all_epochs()
-            print("DynaVis visualization results generated.")
-        elif vis_method in ("DVI", "TimeVis"):
-            print("Start refining visualization model...")
-            strategy.refine(
-                focus_indices=focus_indices,
-                neighbor_indices=[],
-                current_epoch=current_epoch,
-                epochs_to_update=10
-            )
-            # Refine writes a subset-patched refined projection for the current
-            # epoch, so the refined neighbor cache must be updated accordingly.
-            if current_epoch is not None:
-                vis_id = active_session["vis_id"]
-                patched_indices = getattr(strategy, "_last_patch_indices", None)
-                if patched_indices:
-                    try:
-                        update_projection_neighbors_incremental(
-                            content_path,
-                            vis_method,
-                            vis_id,
-                            current_epoch,
-                            patched_indices,
-                        )
-                    except Exception as cache_ex:
-                        print(f"[TimeVis] Incremental neighbor cache update failed: {cache_ex}")
-                        invalidate_projection_neighbors_cache(
-                            content_path, vis_method, vis_id, current_epoch
-                        )
-                else:
-                    invalidate_projection_neighbors_cache(
-                        content_path, vis_method, vis_id, current_epoch
-                    )
-            print("Refinement finished. Refined projections saved to _refined directory.")
-            # Patch remaining epochs in the background so switching epochs also shows refined results.
-            strategy.patch_other_epochs(skip_epoch=current_epoch)
-        else:
-            visualizer.visualize_all_epochs()
-
-        # Return backend-computed metrics (full-dataset exact computation)
-        return jsonify({
-            "status": "success",
-            "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
-            "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
-            "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
-            "continuity":            getattr(strategy, '_last_refine_cont',   None),
-            "focus_set_size":        focus_summary["focus_set_size"],
-            "focus_seed_count":      focus_summary["seed_count"],
-            "focus_bbox_count":      focus_summary["bbox_count"],
-            "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
-            "focus_set_strategy":    focus_summary.get("focus_set_strategy"),
-            "focus_indices":         focus_indices,
-            "training_context_indices": getattr(strategy, "_last_training_context_indices", focus_indices),
-            "patch_indices":         getattr(strategy, "_last_patch_indices", focus_indices),
-            "timings":               getattr(strategy, "_last_refine_timing", None),
-        })
-
+        prepared_req = _prepare_refine_request(req)
+        return jsonify(_run_refine_request(prepared_req))
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
     finally:
         _refine_lock.release()
-    
-    
+
+
+@app.route('/startRefineSession', methods=['POST'])
+@cross_origin()
+def start_refine_session():
+    req = request.get_json()
+    if not _refine_lock.acquire(blocking=False):
+        return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
+
+    try:
+        prepared_req = _prepare_refine_request(req)
+    except Exception as e:
+        _refine_lock.release()
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    session_id = str(uuid.uuid4())
+    with _refine_sessions_lock:
+        _refine_sessions[session_id] = {
+            "status": "queued",
+            "projection": None,
+            "projection_version": 0,
+            "steps_completed": 0,
+            "focus_indices": prepared_req["focus_indices"],
+            "training_context_indices": [],
+            "patch_indices": [],
+            "bbox_indices": prepared_req.get("bbox_indices", []),
+            "timings": None,
+            "sampled_metrics": None,
+            "stop_requested": False,
+            "result": None,
+            "resolved_refine_behavior": prepared_req.get("resolved_refine_behavior"),
+            "error": None,
+        }
+
+    worker = threading.Thread(
+        target=_run_refine_session_worker,
+        args=(session_id, prepared_req),
+        daemon=True,
+    )
+    worker.start()
+
+    return jsonify({
+        "status": "success",
+        "session_id": session_id,
+        "focus_indices": prepared_req["focus_indices"],
+        "focus_set_strategy": prepared_req["focus_summary"].get("focus_set_strategy"),
+        "bbox_indices": prepared_req.get("bbox_indices", []),
+        "resolved_refine_behavior": prepared_req.get("resolved_refine_behavior"),
+    })
+
+
+@app.route('/getRefineSessionProgress', methods=['POST'])
+@cross_origin()
+def get_refine_session_progress():
+    req = request.get_json()
+    session_id = req.get("session_id")
+    since_version = int(req.get("since_version", -1))
+
+    with _refine_sessions_lock:
+        session = _refine_sessions.get(session_id)
+        if session is None:
+            return jsonify({"status": "error", "message": "Unknown refine session"}), 404
+        projection = session.get("projection")
+        projection_version = session.get("projection_version", 0)
+        response = {
+            "status": session.get("status", "unknown"),
+            "steps_completed": session.get("steps_completed", 0),
+            "projection_version": projection_version,
+            "focus_indices": session.get("focus_indices", []),
+            "training_context_indices": session.get("training_context_indices", []),
+            "patch_indices": session.get("patch_indices", []),
+            "bbox_indices": session.get("bbox_indices", []),
+            "timings": session.get("timings"),
+            "sampled_metrics": session.get("sampled_metrics"),
+            "stop_requested": bool(session.get("stop_requested", False)),
+            "resolved_refine_behavior": session.get("resolved_refine_behavior"),
+            "result": session.get("result"),
+            "error": session.get("error"),
+        }
+        if projection is not None and projection_version != since_version:
+            response["projection"] = projection.tolist() if isinstance(projection, np.ndarray) else projection
+
+    return jsonify(response)
+
+
+@app.route('/stopRefineSession', methods=['POST'])
+@cross_origin()
+def stop_refine_session():
+    req = request.get_json()
+    session_id = req.get("session_id")
+
+    with _refine_sessions_lock:
+        session = _refine_sessions.get(session_id)
+        if session is None:
+            return jsonify({"status": "error", "message": "Unknown refine session"}), 404
+        session["stop_requested"] = True
+        if session.get("status") in ("queued", "running"):
+            session["status"] = "stopping"
+
+    return jsonify({"status": "success", "session_id": session_id, "stop_requested": True})
+
 
 @app.route('/startVisualizing', methods = ["POST"])
 def start_visualizing():
@@ -242,7 +440,8 @@ def start_visualizing():
     Modified start endpoint to register the active session.
     """
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
+    req['content_path'] = content_path
     # ... other params ...
     vis_method = req['vis_method']
     vis_id = req['vis_id'] or "0"
@@ -286,7 +485,7 @@ Response:
 @app.route('/getTrainingProcessInfo', methods=["GET"])
 @cross_origin()
 def get_training_process_info():
-    content_path = request.args.get('content_path')
+    content_path = normalize_content_path(request.args.get('content_path'))
     
     epochs_dir = os.path.join(content_path, 'epochs')
     available_epochs = []
@@ -343,7 +542,7 @@ Response:
 @cross_origin()
 def update_projection():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -382,7 +581,7 @@ Response:
 @app.route('/getAllText', methods = ["POST"])
 def get_all_text():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
 
     text_list = get_all_texts(content_path)
     token_list_path = os.path.join(content_path, 'dataset', 'token_list.json')
@@ -526,7 +725,7 @@ def register_eif_bundle():
 @app.route('/getAlignment', methods = ["POST"])
 def get_alignment():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
 
     alignment = get_alignment_data(content_path)
 
@@ -554,7 +753,7 @@ Response:
 @cross_origin()
 def get_attributes():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     epoch = req['epoch']
     attributes = req['attributes']
 
@@ -581,7 +780,7 @@ Response:
 @cross_origin()
 def get_simple_filter_result():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     epoch = int(req['epoch'])
     filters = req['filters']
 
@@ -613,7 +812,7 @@ Response:
 @cross_origin()
 def get_background():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -640,7 +839,7 @@ Response:
 @cross_origin()
 def get_image_data():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     if('index' not in req):
         return make_response(jsonify({'image_base64': ''}), 200)
     
@@ -672,7 +871,7 @@ Response:
 @cross_origin()
 def get_text_data():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     if('index' not in req):
         return make_response(jsonify({'text': ''}), 200)
     
@@ -704,7 +903,7 @@ Response:
 @cross_origin()
 def get_original_neighbors():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     epoch = int(req['epoch'])
     
     try:
@@ -731,7 +930,7 @@ Response:
 @cross_origin()
 def get_projection_neighbors():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -772,7 +971,7 @@ def get_projection_neighbors():
 @cross_origin()
 def get_visualize_metrics():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -789,7 +988,7 @@ def get_visualize_metrics():
 @cross_origin()
 def get_refine_metrics():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -828,7 +1027,7 @@ def get_refine_metrics():
 @cross_origin()
 def get_influence_samples():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     epoch = int(req['epoch'])
     training_event = req['training_event']
     num_samples = int(req['num_samples'])
@@ -856,7 +1055,7 @@ def get_influence_samples():
 @cross_origin()
 def calculate_training_events():
     req = request.get_json()
-    content_path = req['content_path']
+    content_path = normalize_content_path(req['content_path'])
     epoch = int(req['epoch'])
     event_types = req['event_types']
 
@@ -874,6 +1073,7 @@ def calculate_training_events():
 def check_port_inuse(port, host):
     import socket
 
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)

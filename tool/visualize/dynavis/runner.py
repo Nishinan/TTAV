@@ -44,7 +44,7 @@ class DynaVisRunner:
 
         cfg = {**defaults, **self.vis_config}
         data_dir = os.path.join(self.content_path, "epochs")
-         if "D" not in self.vis_config:
+        if "D" not in self.vis_config:
             if "dimension" in cfg:
                 cfg["D"] = int(cfg["dimension"])
             else:
