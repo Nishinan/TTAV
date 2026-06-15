@@ -144,7 +144,10 @@ class TimeVis(StrategyAbstractClass):
         self.ttav_mask = mask # Boolean mask on GPU
                 
     def refine(self, focus_indices=None, focus_index=None, neighbor_indices=None,
-               current_epoch=None, epochs_to_update=10, _skip_avg_benchmark=False):
+               current_epoch=None, epochs_to_update=10, _skip_avg_benchmark=False,
+               progress_callback=None, should_stop_callback=None,
+               progress_refresh_indices=None,
+               secondary_indices=None):
         """
         Locally refine projections for a set of focus points.
 
@@ -263,10 +266,30 @@ class TimeVis(StrategyAbstractClass):
         for fi in focus_indices:
             hd_nbr_set.update(hd_neighbors_all[fi][:10])
         hd_nbr_set -= set(focus_indices)
-        hd_neighbor_global = list(hd_nbr_set)  # global indices of HD neighbors
 
-        # --- 3b. Sample anchor points (global, excluding focus neighborhood) --
-        exclude_set = set(all_indices)
+        # Secondary indices expand the training context but are NOT attract targets.
+        sec_set = set()
+        if secondary_indices:
+            sec_set = {int(i) for i in secondary_indices} - set(focus_indices)
+            sec_hd_set = set()
+            for si in sec_set:
+                if si < len(hd_neighbors_all):
+                    sec_hd_set.update(hd_neighbors_all[si][:10])
+            sec_hd_set -= set(focus_indices) | sec_set
+            sec_set |= sec_hd_set
+            if sec_set:
+                print(f"[TimeVis] Tiered refine: {len(focus_indices)} primary + {len(sec_set)} secondary context points")
+
+        training_context_indices = sorted(set(focus_indices) | hd_nbr_set | sec_set)
+        # patch_support_indices = extra points to update beyond the training context
+        patch_support_indices = neighbor_indices
+        patch_indices = sorted(set(training_context_indices) | set(patch_support_indices))
+        self._last_focus_indices = focus_indices
+        self._last_training_context_indices = training_context_indices
+        self._last_patch_indices = patch_indices
+
+        # --- 3b. Sample anchor points (global, excluding patch region) ---------
+        exclude_set = set(patch_indices)
         candidate_anchors = [i for i in range(N) if i not in exclude_set]
         rng = np.random.default_rng(seed=42)
         n_anchors = min(300, len(candidate_anchors))
@@ -313,6 +336,36 @@ class TimeVis(StrategyAbstractClass):
         anchor_feat_t  = torch.from_numpy(anchor_feat_np).float().to(self.device)
         anchor_z0_t    = torch.from_numpy(anchor_z0).float().to(self.device)
         neg_feat_t     = torch.from_numpy(neg_feat_np).float().to(self.device)
+        # Pre-compute intra-focus pairwise structure targets (computed once, reused every step).
+        #
+        # Why this works better than a temporal anchor or a simple hinge repulsion:
+        #   • Temporal anchor (mu * ||z - z0||²) prevents collapse but also prevents any
+        #     movement → NP stays low.  It treats all motion as bad, not just collapse.
+        #   • Hinge repulsion on non-HD pairs misses pairs that ARE mutual HD neighbours yet
+        #     still collapse (they have no repulsion mask entry).
+        #   • Pairwise structure loss ((d_LD(i,j) - α·d_HD(i,j))²) directly encodes the
+        #     desired geometry: focus points may compress toward the centre, but their
+        #     RELATIVE distances must stay proportional to HD space.  Since every pair has
+        #     d_HD > 0, the target d_LD > 0, so co-location is always penalised regardless
+        #     of whether the pair is in each other's HD-neighbour set.
+        n_focus = len(focus_indices)
+        hd_pairwise_scaled_t = None
+        if n_focus > 1:
+            focus_feats_np = full_feat[focus_indices]                      # [n_focus, D]
+            hd_pw = np.linalg.norm(
+                focus_feats_np[:, None, :] - focus_feats_np[None, :, :],
+                axis=-1,
+            )                                                               # [n_focus, n_focus]
+            # Scale HD distances so the mean pairwise distance maps to
+            # target_radius = 25 % of the local neighbourhood margin.
+            # This compresses the focus cluster enough that all HD neighbours
+            # rank in the LD top-10, while keeping them visibly separated.
+            _mean_hd = float(hd_pw[hd_pw > 0].mean()) if (hd_pw > 0).any() else 1.0
+            target_radius = margin_m * 0.25
+            alpha_structure = target_radius / (_mean_hd + 1e-8)
+            hd_pairwise_scaled_t = torch.from_numpy(
+                (hd_pw * alpha_structure).astype(np.float32)
+            ).to(self.device)                                               # [n_focus, n_focus]
 
         # For each focus point, pre-build tensor of its HD neighbor features
         # Shape: list of tensors, each [k_hd, D]
@@ -356,8 +409,33 @@ class TimeVis(StrategyAbstractClass):
         # margin >= 0.5: normal repulsion; margin < 0.3 (clamped floor): disable repulsion.
         gamma_repel = float(np.clip((margin_m - 0.3) / 0.2, 0.0, 1.0))
         mu_anchor   = 10.0  # anchor constraint weight
+        # Weight for the intra-focus pairwise structure loss.
+        # Higher values → stronger structure preservation, harder to collapse,
+        # but also harder for the attract loss to compress the cluster.
+        # Default 1.5 gives a good balance: cluster compresses ~60 % toward HD
+        # neighbours while keeping all pairwise separations visible.
+        gamma_structure = float(vis_cfg.get("refine_structure_weight", 1.5))
 
         full_feat_t = torch.from_numpy(full_feat).float().to(self.device)
+
+        behavior_cfg = resolve_refine_behavior_config(vis_cfg)
+        progress_cfg = behavior_cfg["progressive_updates"]
+        stopping_cfg = behavior_cfg["stopping"]
+
+        log_every_steps = int(vis_cfg.get("refine_log_every_steps", 50))
+        progress_enabled = bool(progress_callback and progress_cfg.get("enabled", False))
+        snapshot_every_steps = max(1, int(progress_cfg.get("snapshot_every_steps", 3)))
+        sampled_metrics_enabled = bool(progress_callback and progress_cfg.get("enable_sampled_metrics", True))
+        sample_metrics_every_steps = max(1, int(progress_cfg.get("sample_metrics_every_steps", 100)))
+
+        enable_max_steps = bool(stopping_cfg.get("enable_max_steps", True))
+        max_steps = max(1, int(stopping_cfg.get("max_steps", 20000)))
+        enable_time_budget = bool(stopping_cfg.get("enable_time_budget", False))
+        time_budget_seconds = stopping_cfg.get("time_budget_seconds", None)
+        time_budget_seconds = None if time_budget_seconds in (None, "", False) else float(time_budget_seconds)
+        enable_loss_converged = bool(stopping_cfg.get("enable_loss_converged", True))
+        stop_priority = list(stopping_cfg.get("priority", ["loss_converged", "time_budget", "max_steps"]))
+        safety_loop_cap = max(max_steps, int(stopping_cfg.get("safety_loop_cap", 200000)))
 
         # Loss-convergence early stop: track L_attract over a sliding window.
         # NP is meaningless as a stopping signal when 2-D cannot faithfully
@@ -413,7 +491,27 @@ class TimeVis(StrategyAbstractClass):
             else:
                 l_anchor = torch.tensor(0., device=self.device)
 
-            loss_total = l_attract + gamma_repel * l_repel + mu_anchor * l_anchor
+            # Intra-focus pairwise structure loss.
+            # Forces the LD pairwise distances within the focus set to be proportional
+            # to their HD pairwise distances (scaled by alpha_structure so the cluster
+            # fits inside the local neighbourhood).  This simultaneously:
+            #   (a) prevents collapse — every pair has a positive HD distance → positive
+            #       LD target, so co-location is penalised for ALL pairs, including
+            #       those that are mutual HD neighbours (the gap left by hinge repulsion).
+            #   (b) preserves local geometry — the internal topology of the focus cluster
+            #       mirrors the HD structure rather than being arbitrarily deformed.
+            #   (c) allows alignment — the whole cluster can compress toward centre
+            #       because α rescales the targets to fit inside target_radius.
+            l_structure = torch.tensor(0., device=self.device)
+            if n_focus > 1 and gamma_structure > 0 and hd_pairwise_scaled_t is not None:
+                diff_ff = z_focus.unsqueeze(0) - z_focus.unsqueeze(1)        # [n, n, 2]
+                dist_ff = diff_ff.pow(2).sum(dim=-1).clamp(min=1e-8).sqrt()  # [n, n]
+                l_structure = (dist_ff - hd_pairwise_scaled_t).pow(2).mean()
+
+            loss_total = (l_attract
+                          + gamma_repel * l_repel
+                          + mu_anchor * l_anchor
+                          + gamma_structure * l_structure)
             loss_total.backward()
             optimizer.step()
 
@@ -431,6 +529,7 @@ class TimeVis(StrategyAbstractClass):
             if step % 50 == 0:
                 print(f"[TimeVis] step={step:4d}  L_attract={l_attract.item():.4f}  "
                       f"L_anchor={l_anchor.item():.5f}  "
+                      f"L_structure={l_structure.item():.4f}  "
                       f"L_total={current_total_loss:.5f}  stale={_stale_steps}  "
                       f"t={time.time()-start_time:.1f}s")
 

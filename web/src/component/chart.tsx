@@ -4,6 +4,431 @@ import { useDefaultStore } from "../state/state.unified";
 import { transferArray2Color } from './utils';
 import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition } from '../utils/neighborDiagnostics';
 
+// ---------------------------------------------------------------------------
+// NeighborOverlay — module-scope so the class reference is stable across
+// renders. embedding-atlas calls update() rather than creating new instances.
+// Box selection is handled by a React overlay div in ChartComponent instead.
+// ---------------------------------------------------------------------------
+
+// Compute the SVG path string for the union outline of axis-aligned rectangles.
+// Uses coordinate compression + directed boundary edges (clockwise in screen y-down).
+function unionRectsPath(rects: Array<{ x1: number; y1: number; x2: number; y2: number }>): string {
+    if (rects.length === 0) return '';
+    const rs = rects.map(r => ({
+        x1: Math.min(r.x1, r.x2), y1: Math.min(r.y1, r.y2),
+        x2: Math.max(r.x1, r.x2), y2: Math.max(r.y1, r.y2),
+    }));
+    const xs = [...new Set(rs.flatMap(r => [r.x1, r.x2]))].sort((a, b) => a - b);
+    const ys = [...new Set(rs.flatMap(r => [r.y1, r.y2]))].sort((a, b) => a - b);
+    const W = xs.length - 1, H = ys.length - 1;
+    const cell = (xi: number, yi: number): boolean =>
+        xi >= 0 && xi < W && yi >= 0 && yi < H &&
+        rs.some(r => {
+            const cx = (xs[xi] + xs[xi + 1]) / 2, cy = (ys[yi] + ys[yi + 1]) / 2;
+            return cx > r.x1 && cx < r.x2 && cy > r.y1 && cy < r.y2;
+        });
+
+    // Directed boundary half-edges for CW exterior tracing (screen y-down):
+    //   top edge of filled cell → L→R, bottom edge → R→L
+    //   right edge of filled cell → T→B, left edge → B→T
+    type E = [number, number, number, number]; // x1,y1 → x2,y2
+    const edges: E[] = [];
+    for (let yi = 0; yi <= H; yi++) {
+        for (let xi = 0; xi < W; xi++) {
+            const a = cell(xi, yi - 1), b = cell(xi, yi);
+            if (!a && b) edges.push([xs[xi], ys[yi], xs[xi + 1], ys[yi]]);       // top  L→R
+            else if (a && !b) edges.push([xs[xi + 1], ys[yi], xs[xi], ys[yi]]); // bot  R→L
+        }
+    }
+    for (let xi = 0; xi <= W; xi++) {
+        for (let yi = 0; yi < H; yi++) {
+            const a = cell(xi - 1, yi), b = cell(xi, yi);
+            if (a && !b) edges.push([xs[xi], ys[yi], xs[xi], ys[yi + 1]]);       // right T→B
+            else if (!a && b) edges.push([xs[xi], ys[yi + 1], xs[xi], ys[yi]]); // left  B→T
+        }
+    }
+
+    // Chain into closed polygon paths via start-point lookup
+    const pk = (x: number, y: number) => `${x},${y}`;
+    const nextMap = new Map<string, E>();
+    for (const e of edges) nextMap.set(pk(e[0], e[1]), e);
+
+    const used = new Set<string>();
+    const paths: string[] = [];
+    for (const start of edges) {
+        if (used.has(pk(start[0], start[1]))) continue;
+        const pts: string[] = [];
+        let e: E | undefined = start;
+        while (e && !used.has(pk(e[0], e[1]))) {
+            used.add(pk(e[0], e[1]));
+            pts.push(`${e[0].toFixed(1)},${e[1].toFixed(1)}`);
+            e = nextMap.get(pk(e[2], e[3]));
+        }
+        if (pts.length >= 3) paths.push(`M ${pts.join(' L ')} Z`);
+    }
+    return paths.join(' ');
+}
+class NeighborOverlay {
+    private el: HTMLDivElement | null = null;
+    private svg: SVGSVGElement | null = null;
+    private props: any;
+    private proxy: any;
+    private handleClickBound: (e: MouseEvent) => void;
+    private defs: SVGDefsElement | null = null;
+
+    constructor(target: HTMLDivElement, props: any) {
+        this.el = target;
+        this.props = props;
+        this.proxy = props.proxy;
+        this.handleClickBound = this.handleClick.bind(this);
+        this.mount();
+    }
+
+    mount() {
+        if (!this.el) return;
+        this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        this.svg.setAttribute('width', String(this.proxy.width));
+        this.svg.setAttribute('height', String(this.proxy.height));
+        this.svg.style.display = 'block';
+        this.el.appendChild(this.svg);
+        this.svg.addEventListener('click', this.handleClickBound);
+        this.defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+        marker.setAttribute('id', 'trail-arrow');
+        marker.setAttribute('viewBox', '0 0 10 10');
+        marker.setAttribute('markerUnits', 'userSpaceOnUse');
+        marker.setAttribute('markerWidth', '10');
+        marker.setAttribute('markerHeight', '10');
+        marker.setAttribute('refX', '8');
+        marker.setAttribute('refY', '5');
+        marker.setAttribute('orient', 'auto');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
+        path.setAttribute('fill', '#7F8C8D');
+        marker.appendChild(path);
+        this.defs.appendChild(marker);
+        this.svg.appendChild(this.defs);
+        this.render();
+    }
+
+    clear() {
+        if (this.svg) {
+            const children = Array.from(this.svg.childNodes);
+            for (const child of children) {
+                if ((child as Element).nodeName.toLowerCase() !== 'defs') {
+                    this.svg.removeChild(child);
+                }
+            }
+        }
+    }
+
+    // Find the nearest rendered data point to a screen-space mouse event.
+    private findNearestId(e: MouseEvent): number | null {
+        if (!this.svg) return null;
+        const rect = this.svg.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        let minD2 = Infinity;
+        let minIdx = -1;
+        for (let i = 0; i < this.props.dataX.length; i++) {
+            const loc = this.proxy.location(this.props.dataX[i], this.props.dataY[i]);
+            const dx = loc.x - sx;
+            const dy = loc.y - sy;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < minD2) { minD2 = d2; minIdx = i; }
+        }
+        if (minIdx >= 0 && minD2 <= 100) return this.props.idsByPos[minIdx] as number;
+        return null;
+    }
+
+    handleClick(e: MouseEvent) {
+        // When box-select overlay is active the React div sits above this SVG
+        // and captures all events — this handler only fires in normal mode.
+
+        // Ctrl/Cmd+Click: deselect nearest point from both primary and secondary.
+        if (e.ctrlKey || e.metaKey) {
+            const id = this.findNearestId(e);
+            if (id !== null) {
+                const newSelected = (this.props.selectedIndices as number[] || []).filter(i => i !== id);
+                const newSecondary = (this.props.secondaryIndices as number[] || []).filter(i => i !== id);
+                this.props.setSelectedIndices?.(newSelected);
+                this.props.setSecondaryIndices?.(newSecondary);
+            }
+            return;
+        }
+
+        // Normal click: select nearest point.
+        const id = this.findNearestId(e);
+        if (id !== null && this.props.setSelectedIndices) {
+            this.props.setSelectedIndices([id]);
+        }
+    }
+
+    render() {
+        if (!this.svg) return;
+        this.clear();
+        const { center, hdOnly, ldOnly, overlap, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
+        const centerLoc = center ? this.proxy.location(center.x, center.y) : null;
+        const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const drawNeighbor = (
+            nid: number,
+            style: { color: string; lineWidth: number; ringWidth: number; lineOpacity?: number; ringOpacity?: number }
+        ) => {
+            let x: number, y: number;
+            const renderedPos = this.props.posMap?.get(nid);
+            if (renderedPos != null) {
+                x = dataX[renderedPos];
+                y = dataY[renderedPos];
+            } else {
+                const projectionPos = rawIndexToProjectionPosition(nid, this.props.indexList);
+                const coord = this.props.fullProjection?.[projectionPos];
+                if (!coord) return;
+                x = coord[0];
+                y = coord[1];
+            }
+            const loc = this.proxy.location(x, y);
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute('x1', String(centerLoc.x));
+            line.setAttribute('y1', String(centerLoc.y));
+            line.setAttribute('x2', String(loc.x));
+            line.setAttribute('y2', String(loc.y));
+            line.setAttribute('stroke', style.color);
+            line.setAttribute('stroke-width', String(style.lineWidth));
+            line.setAttribute('stroke-linecap', 'round');
+            if (style.lineOpacity != null) line.setAttribute('stroke-opacity', String(style.lineOpacity));
+            neighborGroup.appendChild(line);
+            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            circle.setAttribute('cx', String(loc.x));
+            circle.setAttribute('cy', String(loc.y));
+            circle.setAttribute('r', String(pointSize + 1.5));
+            circle.setAttribute('fill', 'none');
+            circle.setAttribute('stroke', style.color);
+            circle.setAttribute('stroke-width', String(style.ringWidth));
+            if (style.ringOpacity != null) circle.setAttribute('stroke-opacity', String(style.ringOpacity));
+            neighborGroup.appendChild(circle);
+        };
+        const STYLE_HD_ONLY  = { color: '#E74C3C', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+        const STYLE_LD_ONLY  = { color: '#2E86DE', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+        const STYLE_OVERLAP  = { color: '#95A5A6', lineWidth: 1.2, ringWidth: 1.8, lineOpacity: 0.75, ringOpacity: 0.85 };
+        if (centerLoc) {
+            if (revealOriginalNeighbors || revealProjectionNeighbors) overlap.forEach((nid: number) => drawNeighbor(nid, STYLE_OVERLAP));
+            if (revealOriginalNeighbors)  hdOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_HD_ONLY));
+            if (revealProjectionNeighbors) ldOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_LD_ONLY));
+            this.svg.appendChild(neighborGroup);
+            const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            centerCircle.setAttribute('cx', String(centerLoc.x));
+            centerCircle.setAttribute('cy', String(centerLoc.y));
+            centerCircle.setAttribute('r', String(pointSize + 2));
+            centerCircle.setAttribute('fill', 'none');
+            centerCircle.setAttribute('stroke', '#666');
+            centerCircle.setAttribute('stroke-width', '2');
+            this.svg.appendChild(centerCircle);
+            if (this.props.showTrail) {
+                const trailGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                const epochs = this.props.availableEpochs || [];
+                const currentIdx = epochs.indexOf(this.props.currentEpoch);
+                const centerId = this.props.center?.identifier as number;
+                if (typeof centerId === 'number') {
+                    const points: { x: number; y: number }[] = [];
+                    for (let i = 0; i <= currentIdx; i++) {
+                        const ep = epochs[i];
+                        const epData = this.props.allEpochData?.[ep];
+                        const centerPos = rawIndexToProjectionPosition(centerId, epData?.indexList);
+                        const coord = epData?.projection?.[centerPos];
+                        if (!coord) continue;
+                        const locp = this.proxy.location(coord[0], coord[1]);
+                        points.push({ x: locp.x, y: locp.y });
+                    }
+                    for (let i = 0; i < points.length; i++) {
+                        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                        c.setAttribute('cx', String(points[i].x));
+                        c.setAttribute('cy', String(points[i].y));
+                        c.setAttribute('r', String(Math.max(3, pointSize + 1)));
+                        c.setAttribute('fill', '#7F8C8D');
+                        c.setAttribute('fill-opacity', '0.85');
+                        c.setAttribute('stroke', '#7F8C8D');
+                        c.setAttribute('stroke-width', '0.5');
+                        trailGroup.appendChild(c);
+                    }
+                    for (let i = 1; i < points.length; i++) {
+                        const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                        l.setAttribute('x1', String(points[i - 1].x));
+                        l.setAttribute('y1', String(points[i - 1].y));
+                        l.setAttribute('x2', String(points[i].x));
+                        l.setAttribute('y2', String(points[i].y));
+                        l.setAttribute('stroke', '#7F8C8D');
+                        l.setAttribute('stroke-width', '2');
+                        l.setAttribute('stroke-dasharray', '6 3');
+                        l.setAttribute('stroke-linecap', 'round');
+                        l.setAttribute('stroke-opacity', '0.9');
+                        l.setAttribute('marker-end', 'url(#trail-arrow)');
+                        trailGroup.appendChild(l);
+                    }
+                }
+                this.svg.appendChild(trailGroup);
+            }
+        } else {
+            this.svg.appendChild(neighborGroup);
+        }
+
+        // Secondary boxes (tiered mode): draw union polygon outline
+        const secondaryBoxes: Array<[number, number, number, number]> = this.props.secondaryBoxes || [];
+        if (secondaryBoxes.length > 0) {
+            // Convert each stored data-coord box to SVG screen coords via proxy,
+            // then compute the union polygon outline.
+            const screenRects = secondaryBoxes.map(([dx1, dy1, dx2, dy2]) => {
+                // dataY1 > dataY2 (y-axis flipped), so (dx1,dy1) = top-left in screen
+                const tl = this.proxy.location(dx1, dy1);
+                const br = this.proxy.location(dx2, dy2);
+                return { x1: tl.x, y1: tl.y, x2: br.x, y2: br.y };
+            });
+            const d = unionRectsPath(screenRects);
+            if (d) {
+                const boxGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('d', d);
+                path.setAttribute('fill', 'rgba(124,58,237,0.06)');
+                path.setAttribute('stroke', '#7c3aed');
+                path.setAttribute('stroke-width', '1.5');
+                path.setAttribute('stroke-dasharray', '6 3');
+                path.setAttribute('pointer-events', 'none');
+                boxGroup.appendChild(path);
+                this.svg.appendChild(boxGroup);
+            }
+        }
+
+        // Primary selected indices: gold / dark rings
+        const selectedGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const selectedSet = new Set<number>(this.props.selectedIndices ?? []);
+        selectedSet.forEach((selectedId: number) => {
+            const pos = this.props.posMap.get(selectedId);
+            if (pos == null) return;
+            const loc = this.proxy.location(dataX[pos], dataY[pos]);
+            const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            ring.setAttribute('cx', String(loc.x));
+            ring.setAttribute('cy', String(loc.y));
+            ring.setAttribute('r', String(pointSize + 3));
+            ring.setAttribute('fill', 'none');
+            ring.setAttribute('stroke', selectedId === this.props.center?.identifier ? '#111827' : '#f59e0b');
+            ring.setAttribute('stroke-width', selectedId === this.props.center?.identifier ? '2.5' : '2');
+            selectedGroup.appendChild(ring);
+        });
+        this.svg.appendChild(selectedGroup);
+
+        if (this.props.showLabel || this.props.showIndex || selectedSet.size > 0) {
+            const textGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            const occupiedBoxes: { x: number, y: number, width: number, height: number }[] = [];
+            const padding = 2;
+            const baseCharWidth = 6;
+            const baseCharHeight = 10;
+
+            const renderLabel = (_id: number, loc: { x: number; y: number }, content: string, forceVisible: boolean) => {
+                const fontSize = forceVisible ? 13 : 10;
+                const charWidth = forceVisible ? 7.5 : baseCharWidth;
+                const charHeight = forceVisible ? 13 : baseCharHeight;
+                const boxWidth = content.length * charWidth;
+                const boxHeight = charHeight;
+                const baseOffset = pointSize + 2;
+                const candidateOffsets = forceVisible
+                    ? [
+                        { dx: baseOffset, dy: -baseOffset },
+                        { dx: baseOffset, dy: charHeight + 4 },
+                        { dx: -(boxWidth + baseOffset), dy: -baseOffset },
+                        { dx: -(boxWidth + baseOffset), dy: charHeight + 4 },
+                        { dx: -(boxWidth / 2), dy: -(pointSize + 10) },
+                        { dx: -(boxWidth / 2), dy: charHeight + pointSize + 6 },
+                    ]
+                    : [{ dx: baseOffset, dy: -baseOffset }];
+
+                let chosen: { labelX: number; labelY: number; boxX: number; boxY: number } | null = null;
+                for (const candidate of candidateOffsets) {
+                    const labelX = loc.x + candidate.dx;
+                    const labelY = loc.y + candidate.dy;
+                    const boxX = labelX;
+                    const boxY = labelY - charHeight;
+                    let collision = false;
+                    for (const box of occupiedBoxes) {
+                        if (
+                            boxX < box.x + box.width + padding &&
+                            boxX + boxWidth + padding > box.x &&
+                            boxY < box.y + box.height + padding &&
+                            boxY + boxHeight + padding > box.y
+                        ) { collision = true; break; }
+                    }
+                    if (!collision) { chosen = { labelX, labelY, boxX, boxY }; break; }
+                }
+                if (!chosen) {
+                    if (!forceVisible) return;
+                    const fallbackLabelX = loc.x + baseOffset;
+                    const fallbackLabelY = loc.y - baseOffset;
+                    chosen = { labelX: fallbackLabelX, labelY: fallbackLabelY, boxX: fallbackLabelX, boxY: fallbackLabelY - charHeight };
+                }
+                const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                textEl.setAttribute('x', String(chosen.labelX));
+                textEl.setAttribute('y', String(chosen.labelY));
+                textEl.setAttribute('fill', forceVisible ? '#111827' : '#000');
+                textEl.setAttribute('font-size', String(fontSize));
+                textEl.setAttribute('font-family', 'Console, monospace');
+                if (forceVisible) {
+                    textEl.setAttribute('font-weight', '700');
+                    textEl.setAttribute('paint-order', 'stroke');
+                    textEl.setAttribute('stroke', '#ffffff');
+                    textEl.setAttribute('stroke-width', '3');
+                    textEl.setAttribute('stroke-linejoin', 'round');
+                }
+                textEl.textContent = content;
+                textGroup.appendChild(textEl);
+                occupiedBoxes.push({ x: chosen.boxX, y: chosen.boxY, width: boxWidth, height: boxHeight });
+            };
+
+            selectedSet.forEach((selectedId: number) => {
+                const pos = this.props.posMap.get(selectedId);
+                if (pos == null) return;
+                const loc = this.proxy.location(this.props.dataX[pos], this.props.dataY[pos]);
+                const labelTextData = this.props.textData && this.props.textData[selectedId]
+                    ? this.props.textData[selectedId]
+                    : (this.props.labelDict?.get(this.props.inherentLabelData[selectedId]) ?? '');
+                const content = formatPointLabel(selectedId, labelTextData, true, true);
+                if (!content) return;
+                renderLabel(selectedId, loc, content, true);
+            });
+
+            for (let i = 0; i < this.props.dataX.length; i++) {
+                const id = this.props.idsByPos[i];
+                if (selectedSet.has(id)) continue;
+                const loc = this.proxy.location(this.props.dataX[i], this.props.dataY[i]);
+                const labelTextData = this.props.textData && this.props.textData[id]
+                    ? this.props.textData[id]
+                    : (this.props.labelDict?.get(this.props.inherentLabelData[id]) ?? '');
+                const content = formatPointLabel(id, labelTextData, this.props.showLabel, this.props.showIndex);
+                if (!content) continue;
+                renderLabel(id, loc, content, false);
+            }
+            this.svg.appendChild(textGroup);
+        }
+    }
+
+    update(nextProps: Partial<any>) {
+        this.props = { ...this.props, ...nextProps };
+        // Always sync proxy so viewport-to-screen conversion stays current.
+        if (this.props.proxy) this.proxy = this.props.proxy;
+        if (this.svg) {
+            this.svg.setAttribute('width', String(this.proxy.width));
+            this.svg.setAttribute('height', String(this.proxy.height));
+        }
+        this.render();
+    }
+
+    destroy() {
+        if (this.svg && this.el) this.el.removeChild(this.svg);
+        if (this.svg) this.svg.removeEventListener('click', this.handleClickBound);
+        this.defs = null;
+        this.svg = null;
+        this.el = null;
+    }
+}
+// ---------------------------------------------------------------------------
+
 type EmbeddingData = NonNullable<EmbeddingViewProps['data']>;
 
 type PreparedEmbedding = {
@@ -62,6 +487,8 @@ export const ChartComponent = memo(() => {
     const { showTrail } = useDefaultStore(["showTrail"]);
     const { setSelectedIndices } = useDefaultStore(["setSelectedIndices"]);
     const { setCurrentViewportBBox } = useDefaultStore(["setCurrentViewportBBox"]);
+    const { boxSelectActive, refineFocusType, secondaryIndices, setSecondaryIndices, secondaryBoxes, setSecondaryBoxes } =
+        useDefaultStore(["boxSelectActive", "refineFocusType", "secondaryIndices", "setSecondaryIndices", "secondaryBoxes", "setSecondaryBoxes"]);
 
     const epochData = allEpochData[epoch];
     const activePointId = selectedIndices[0] ?? hoveredIndex;
@@ -153,28 +580,23 @@ export const ChartComponent = memo(() => {
             return [] as number[];
         }
 
-        const cachedProjectionNeighborPositions = epochData.projectionNeighbors?.[rawIndexToProjectionPosition(activePointId, epochData.indexList)] ?? [];
-        const effectiveProjectionNeighborPositions = (
-            hoveredIndex === undefined && Array.isArray(cachedProjectionNeighborPositions) && cachedProjectionNeighborPositions.length > 0
-        )
-            ? cachedProjectionNeighborPositions
-            : computeProjectionNeighborPositionsForPoint(
-                activePointId,
-                epochData.projection,
-                epochData.indexList,
-                10,
-            );
+        // Both originalNeighbors and projectionNeighbors are indexed by PROJECTION POSITION
+        // and contain PROJECTION POSITIONS (not raw indices). Convert accordingly.
+        const activePointPos = rawIndexToProjectionPosition(activePointId, epochData.indexList);
         const hdIds = revealOriginalNeighbors
             ? convertNeighborPositionsToRawIndices(
-                epochData.originalNeighbors?.[rawIndexToProjectionPosition(activePointId, epochData.indexList)],
-                epochData.indexList,
-            )
+                epochData.originalNeighbors?.[activePointPos] ?? [],
+                epochData.indexList
+              )
             : [];
+        const ldPositions = computeProjectionNeighborPositionsForPoint(
+            activePointId,
+            epochData.originalProjection ?? epochData.projection,
+            epochData.indexList,
+            10
+        );
         const ldIds = revealProjectionNeighbors
-            ? convertNeighborPositionsToRawIndices(
-                effectiveProjectionNeighborPositions,
-                epochData.indexList,
-            )
+            ? convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList)
             : [];
 
         return Array.from(new Set<number>([
@@ -360,37 +782,45 @@ export const ChartComponent = memo(() => {
     useEffect(() => { setTrailRefresh((v) => v + 1); }, [selectedIndices]);
 
     const neighborOverlayProps = useMemo(() => {
-        if (!prepared || !epochData) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors } as any;
+        if (!prepared || !epochData) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors, secondaryIndices, setSecondaryIndices, secondaryBoxes } as any;
         const idsByPos = prepared.dataPoints.map((p) => p.identifier as number);
-        if (activePointId === undefined) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices } as any;
+        if (activePointId === undefined) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices, secondaryIndices, setSecondaryIndices, secondaryBoxes } as any;
+
+        // Both originalNeighbors and projectionNeighbors are indexed by PROJECTION POSITION
+        // and contain PROJECTION POSITIONS (not raw indices). Convert accordingly.
         const activePointPos = rawIndexToProjectionPosition(activePointId, epochData.indexList);
-        const cachedProjectionNeighborPositions = epochData.projectionNeighbors?.[activePointPos] ?? [];
-        const currentProjectionNeighborPositions = (
-            hoveredIndex === undefined && Array.isArray(cachedProjectionNeighborPositions) && cachedProjectionNeighborPositions.length > 0
-        )
-            ? cachedProjectionNeighborPositions
-            : computeProjectionNeighborPositionsForPoint(
-                activePointId,
-                epochData.projection,
-                epochData.indexList,
-                10,
-            );
-        const hdAll = convertNeighborPositionsToRawIndices(
-            epochData.originalNeighbors?.[activePointPos],
+
+        // HD neighbors from originalProjection (pre-refine baseline).
+        const hdPositions: number[] = epochData.originalNeighbors?.[activePointPos] ?? [];
+        const hdAll: number[] = convertNeighborPositionsToRawIndices(hdPositions, epochData.indexList);
+
+        // LD neighbors: use the pre-refine baseline projection (originalProjection) when
+        // available. During refine animation, buildBlendedProjection sets all focus points
+        // to weight=1, so they collapse onto the center in the blended projection. Computing
+        // LD nearest-neighbors from the blended projection would return the same set as HD
+        // neighbors, making all lines zero-length and invisible. The originalProjection gives
+        // a stable, meaningful LD neighborhood so lines remain visible throughout training.
+        // Endpoints are still drawn at current blended positions (via posMap / dataX / dataY).
+        const ldProjection = epochData.originalProjection ?? epochData.projection;
+        const ldPositions = computeProjectionNeighborPositionsForPoint(
+            activePointId,
+            ldProjection,
             epochData.indexList,
+            10
         );
-        const ldAll = convertNeighborPositionsToRawIndices(
-            currentProjectionNeighborPositions,
-            epochData.indexList,
-        );
+        const ldAll = convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList);
+
         const hdSet = new Set<number>(hdAll);
         const ldSet = new Set<number>(ldAll);
-        const pos = posMap.get(activePointId);
-        const basePoint = pos == null ? null : prepared.dataPoints[pos];
-        const latestCoord = epochData.projection?.[activePointPos];
-        const center = basePoint && latestCoord
-            ? { ...basePoint, x: latestCoord[0], y: latestCoord[1] }
-            : basePoint;
+
+        // Center: use posMap (same source as rendered data) for reliable screen coordinates.
+        const centerPos = posMap.get(activePointId);
+        const center = centerPos == null ? null : prepared.dataPoints[centerPos];
+
+        // Three-color classification — endpoints always at CURRENT blended positions:
+        //   red  (hdOnly)  = HD neighbors not yet in LD space → alignment gap; lines shorten as refine works
+        //   blue (ldOnly)  = original LD neighbors not in HD space → lengthen as focus point moves toward HD
+        //   gray (overlap) = appears after refine completes and backend refreshes projectionNeighbors
         return {
             center,
             hdOnly: hdAll.filter((nid: number) => !ldSet.has(nid)),
@@ -416,348 +846,82 @@ export const ChartComponent = memo(() => {
             currentEpoch: epoch,
             setSelectedIndices,
             selectedIndices,
+            secondaryIndices,
+            setSecondaryIndices,
+            secondaryBoxes,
         };
-    }, [prepared, epochData, hoveredIndex, selectedIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh]);
+    }, [prepared, epochData, activePointId, selectedIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
 
-    class NeighborOverlay {
-        private el: HTMLDivElement | null = null;
-        private svg: SVGSVGElement | null = null;
-        private props: any;
-        private proxy: any;
-        private handleClickBound: any;
-        private defs: SVGDefsElement | null = null;
-        constructor(target: HTMLDivElement, props: any) {
-            this.el = target;
-            this.props = props;
-            this.proxy = props.proxy;
-            this.handleClickBound = this.handleClick.bind(this);
-            this.mount();
-        }
-        mount() {
-            if (!this.el) return;
-            this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            this.svg.setAttribute('width', String(this.proxy.width));
-            this.svg.setAttribute('height', String(this.proxy.height));
-            this.el.appendChild(this.svg);
-            this.svg.addEventListener('click', this.handleClickBound);
-            this.defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-            const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-            marker.setAttribute('id', 'trail-arrow');
-            marker.setAttribute('viewBox', '0 0 10 10');
-            marker.setAttribute('markerUnits', 'userSpaceOnUse');
-            marker.setAttribute('markerWidth', '10');
-            marker.setAttribute('markerHeight', '10');
-            marker.setAttribute('refX', '8');
-            marker.setAttribute('refY', '5');
-            marker.setAttribute('orient', 'auto');
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
-            path.setAttribute('fill', '#7F8C8D');
-            marker.appendChild(path);
-            this.defs.appendChild(marker);
-            this.svg.appendChild(this.defs);
-            this.render();
-        }
-        clear() {
-            if (this.svg) {
-                const children = Array.from(this.svg.childNodes);
-                for (const child of children) {
-                    if ((child as Element).nodeName.toLowerCase() !== 'defs') {
-                        this.svg.removeChild(child);
-                    }
-                }
-            }
-        }
-        handleClick(e: MouseEvent) {
-            if (!this.svg) return;
-            const rect = this.svg.getBoundingClientRect();
-            const sx = e.clientX - rect.left;
-            const sy = e.clientY - rect.top;
-            let minD2 = Infinity;
-            let minIdx = -1;
-            for (let i = 0; i < this.props.dataX.length; i++) {
-                const x = this.props.dataX[i];
-                const y = this.props.dataY[i];
-                const loc = this.proxy.location(x, y);
-                const dx = loc.x - sx;
-                const dy = loc.y - sy;
-                const d2 = dx * dx + dy * dy;
-                if (d2 < minD2) {
-                    minD2 = d2;
-                    minIdx = i;
-                }
-            }
-            const threshold = 100;
-            if (minIdx >= 0 && minD2 <= threshold) {
-                const id = this.props.idsByPos[minIdx];
-                if (this.props.setSelectedIndices) {
-                    console.log(`Click on id ${id}`);
-                    this.props.setSelectedIndices([id]);
-                }
-            }
-        }
-        render() {
-            if (!this.svg) return;
-            this.clear();
-            const { center, hdOnly, ldOnly, overlap, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
-            const centerLoc = center ? this.proxy.location(center.x, center.y) : null;
-            const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            const drawNeighbor = (
-                nid: number,
-                style: { color: string; lineWidth: number; ringWidth: number; lineOpacity?: number; ringOpacity?: number }
-            ) => {
-                const projectionPos = rawIndexToProjectionPosition(nid, this.props.indexList);
-                const coord = this.props.fullProjection?.[projectionPos];
-                if (!coord) return;
-                const x = coord[0];
-                const y = coord[1];
+    // ---- box select overlay state & handlers ----
+    const [boxDrag, setBoxDrag] = useState<{ startX: number; startY: number; curX: number; curY: number } | null>(null);
 
-                const loc = this.proxy.location(x, y);
-                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                line.setAttribute('x1', String(centerLoc.x));
-                line.setAttribute('y1', String(centerLoc.y));
-                line.setAttribute('x2', String(loc.x));
-                line.setAttribute('y2', String(loc.y));
-                line.setAttribute('stroke', style.color);
-                line.setAttribute('stroke-width', String(style.lineWidth));
-                line.setAttribute('stroke-linecap', 'round');
-                if (style.lineOpacity != null) {
-                    line.setAttribute('stroke-opacity', String(style.lineOpacity));
+    const handleBoxMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        setBoxDrag({ startX: x, startY: y, curX: x, curY: y });
+    };
+
+    const handleBoxMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+        if (!boxDrag) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        setBoxDrag((prev) => prev ? { ...prev, curX: e.clientX - rect.left, curY: e.clientY - rect.top } : null);
+    };
+
+    const handleBoxMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+        if (!boxDrag) return;
+        const overlayRect = e.currentTarget.getBoundingClientRect();
+        const curX = e.clientX - overlayRect.left;
+        const curY = e.clientY - overlayRect.top;
+        const x1 = Math.min(boxDrag.startX, curX), x2 = Math.max(boxDrag.startX, curX);
+        const y1 = Math.min(boxDrag.startY, curY), y2 = Math.max(boxDrag.startY, curY);
+        if (prepared && viewportState) {
+            // Use the actual SVG element's bounding rect so our coords match proxy.location() exactly.
+            const svgEl = atlasRef.current?.querySelector('svg');
+            const svgRect = svgEl?.getBoundingClientRect();
+            const svgW = svgRect?.width ?? overlayRect.width;
+            const svgH = svgRect?.height ?? overlayRect.height;
+            const svgOX = svgRect ? svgRect.left - overlayRect.left : 0;
+            const svgOY = svgRect ? svgRect.top - overlayRect.top : 0;
+            if (svgH <= 0) { setBoxDrag(null); return; }
+
+            const { x: vx, y: vy, scale } = viewportState;
+            const halfH = svgH / 2;
+            // Coords relative to SVG origin
+            const toSvgX = (ox: number) => ox - svgOX;
+            const toSvgY = (oy: number) => oy - svgOY;
+            // SVG → data
+            const toDataX = (sx: number) => vx + (sx - svgW / 2) / (scale * halfH);
+            const toDataY = (sy: number) => vy - (sy - halfH) / (scale * halfH);
+
+            const boxIds: number[] = [];
+            for (let i = 0; i < prepared.simpleData.x.length; i++) {
+                const sx = svgW / 2 + (prepared.simpleData.x[i] - vx) * scale * halfH;
+                const sy = halfH - (prepared.simpleData.y[i] - vy) * scale * halfH;
+                // Compare in SVG space
+                if (sx >= toSvgX(x1) && sx <= toSvgX(x2) && sy >= toSvgY(y1) && sy <= toSvgY(y2))
+                    boxIds.push(prepared.dataPoints[i].identifier as number);
+            }
+            const dataBox: [number, number, number, number] = [
+                toDataX(toSvgX(x1)), toDataY(toSvgY(y1)), toDataX(toSvgX(x2)), toDataY(toSvgY(y2)),
+            ];
+            if (refineFocusType === 'tiered') {
+                const primarySet = new Set(selectedIndices);
+                const existingSecondary = new Set(secondaryIndices);
+                const newSecondary = [...secondaryIndices];
+                for (const id of boxIds) {
+                    if (!primarySet.has(id) && !existingSecondary.has(id)) newSecondary.push(id);
                 }
-                neighborGroup.appendChild(line);
-                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-                circle.setAttribute('cx', String(loc.x));
-                circle.setAttribute('cy', String(loc.y));
-                circle.setAttribute('r', String(pointSize + 1.5));
-                circle.setAttribute('fill', 'none');
-                circle.setAttribute('stroke', style.color);
-                circle.setAttribute('stroke-width', String(style.ringWidth));
-                if (style.ringOpacity != null) {
-                    circle.setAttribute('stroke-opacity', String(style.ringOpacity));
-                }
-                neighborGroup.appendChild(circle);
-            };
-            const STYLE_HD_ONLY = { color: '#E74C3C', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
-            const STYLE_LD_ONLY = { color: '#2E86DE', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
-            const STYLE_OVERLAP = { color: '#B8BDC7', lineWidth: 1.0, ringWidth: 1.4, lineOpacity: 0.35, ringOpacity: 0.45 };
-            if (centerLoc) {
-                if (revealOriginalNeighbors || revealProjectionNeighbors) {
-                    overlap.forEach((nid: number) => drawNeighbor(nid, STYLE_OVERLAP));
-                }
-                if (revealOriginalNeighbors) {
-                    hdOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_HD_ONLY));
-                }
-                if (revealProjectionNeighbors) {
-                    ldOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_LD_ONLY));
-                }
-                this.svg.appendChild(neighborGroup);
-                const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-                centerCircle.setAttribute('cx', String(centerLoc.x));
-                centerCircle.setAttribute('cy', String(centerLoc.y));
-                centerCircle.setAttribute('r', String(pointSize + 2));
-                centerCircle.setAttribute('fill', 'none');
-                centerCircle.setAttribute('stroke', '#666');
-                centerCircle.setAttribute('stroke-width', '2');
-                this.svg.appendChild(centerCircle);
-                if (this.props.showTrail) {
-                    const trailGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-                    const epochs = this.props.availableEpochs || [];
-                    const currentIdx = epochs.indexOf(this.props.currentEpoch);
-                    const centerId = this.props.center?.identifier as number;
-                    if (typeof centerId === 'number') {
-                        const points: { x: number; y: number }[] = [];
-                        for (let i = 0; i <= currentIdx; i++) {
-                            const ep = epochs[i];
-                            const epData = this.props.allEpochData?.[ep];
-                            const centerPos = rawIndexToProjectionPosition(centerId, epData?.indexList);
-                            const coord = epData?.projection?.[centerPos];
-                            if (!coord) continue;
-                            const locp = this.proxy.location(coord[0], coord[1]);
-                            points.push({ x: locp.x, y: locp.y });
-                        }
-                        for (let i = 0; i < points.length; i++) {
-                        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-                        c.setAttribute('cx', String(points[i].x));
-                        c.setAttribute('cy', String(points[i].y));
-                        c.setAttribute('r', String(Math.max(3, pointSize + 1)));
-                        c.setAttribute('fill', '#7F8C8D');
-                        c.setAttribute('fill-opacity', '0.85');
-                        c.setAttribute('stroke', '#7F8C8D');
-                        c.setAttribute('stroke-width', '0.5');
-                        trailGroup.appendChild(c);
-                        }
-                        for (let i = 1; i < points.length; i++) {
-                            const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                            l.setAttribute('x1', String(points[i - 1].x));
-                            l.setAttribute('y1', String(points[i - 1].y));
-                            l.setAttribute('x2', String(points[i].x));
-                            l.setAttribute('y2', String(points[i].y));
-                            l.setAttribute('stroke', '#7F8C8D');
-                            l.setAttribute('stroke-width', '2');
-                            l.setAttribute('stroke-dasharray', '6 3');
-                            l.setAttribute('stroke-linecap', 'round');
-                            l.setAttribute('stroke-opacity', '0.9');
-                            l.setAttribute('marker-end', 'url(#trail-arrow)');
-                            trailGroup.appendChild(l);
-                        }
-                    }
-                    this.svg.appendChild(trailGroup);
-                }
+                setSecondaryIndices(newSecondary);
+                setSecondaryBoxes([...secondaryBoxes, dataBox]);
             } else {
-                this.svg.appendChild(neighborGroup);
+                setSelectedIndices(boxIds);
+                setSecondaryIndices([]);
+                setSecondaryBoxes([]);
             }
-
-            const selectedGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            const selectedSet = new Set<number>(this.props.selectedIndices ?? []);
-            selectedSet.forEach((selectedId: number) => {
-                const pos = this.props.posMap.get(selectedId);
-                if (pos == null) return;
-                const x = dataX[pos];
-                const y = dataY[pos];
-                const loc = this.proxy.location(x, y);
-                const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-                ring.setAttribute('cx', String(loc.x));
-                ring.setAttribute('cy', String(loc.y));
-                ring.setAttribute('r', String(pointSize + 3));
-                ring.setAttribute('fill', 'none');
-                ring.setAttribute('stroke', selectedId === this.props.center?.identifier ? '#111827' : '#f59e0b');
-                ring.setAttribute('stroke-width', selectedId === this.props.center?.identifier ? '2.5' : '2');
-                selectedGroup.appendChild(ring);
-            });
-            this.svg.appendChild(selectedGroup);
-
-            if (this.props.showLabel || this.props.showIndex || selectedSet.size > 0) {
-                const textGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-                const occupiedBoxes: { x: number, y: number, width: number, height: number }[] = [];
-                const padding = 2;
-                const baseCharWidth = 6;
-                const baseCharHeight = 10;
-
-                const renderLabel = (id: number, loc: { x: number; y: number }, content: string, forceVisible: boolean) => {
-                    const fontSize = forceVisible ? 13 : 10;
-                    const charWidth = forceVisible ? 7.5 : baseCharWidth;
-                    const charHeight = forceVisible ? 13 : baseCharHeight;
-                    const boxWidth = content.length * charWidth;
-                    const boxHeight = charHeight;
-                    const baseOffset = pointSize + 2;
-                    const candidateOffsets = forceVisible
-                        ? [
-                            { dx: baseOffset, dy: -baseOffset },
-                            { dx: baseOffset, dy: charHeight + 4 },
-                            { dx: -(boxWidth + baseOffset), dy: -baseOffset },
-                            { dx: -(boxWidth + baseOffset), dy: charHeight + 4 },
-                            { dx: -(boxWidth / 2), dy: -(pointSize + 10) },
-                            { dx: -(boxWidth / 2), dy: charHeight + pointSize + 6 },
-                        ]
-                        : [
-                            { dx: baseOffset, dy: -baseOffset },
-                        ];
-
-                    let chosen: { labelX: number; labelY: number; boxX: number; boxY: number } | null = null;
-
-                    for (const candidate of candidateOffsets) {
-                        const labelX = loc.x + candidate.dx;
-                        const labelY = loc.y + candidate.dy;
-                        const boxX = labelX;
-                        const boxY = labelY - charHeight;
-
-                        let collision = false;
-                        for (const box of occupiedBoxes) {
-                            if (
-                                boxX < box.x + box.width + padding &&
-                                boxX + boxWidth + padding > box.x &&
-                                boxY < box.y + box.height + padding &&
-                                boxY + boxHeight + padding > box.y
-                            ) {
-                                collision = true;
-                                break;
-                            }
-                        }
-
-                        if (!collision) {
-                            chosen = { labelX, labelY, boxX, boxY };
-                            break;
-                        }
-                    }
-
-                    if (!chosen) {
-                        if (!forceVisible) return;
-                        const fallbackLabelX = loc.x + baseOffset;
-                        const fallbackLabelY = loc.y - baseOffset;
-                        chosen = {
-                            labelX: fallbackLabelX,
-                            labelY: fallbackLabelY,
-                            boxX: fallbackLabelX,
-                            boxY: fallbackLabelY - charHeight,
-                        };
-                    }
-
-                    const textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                    textEl.setAttribute('x', String(chosen.labelX));
-                    textEl.setAttribute('y', String(chosen.labelY));
-                    textEl.setAttribute('fill', forceVisible ? '#111827' : '#000');
-                    textEl.setAttribute('font-size', String(fontSize));
-                    textEl.setAttribute('font-family', 'Console, monospace');
-                    if (forceVisible) {
-                        textEl.setAttribute('font-weight', '700');
-                        textEl.setAttribute('paint-order', 'stroke');
-                        textEl.setAttribute('stroke', '#ffffff');
-                        textEl.setAttribute('stroke-width', '3');
-                        textEl.setAttribute('stroke-linejoin', 'round');
-                    }
-                    textEl.textContent = content;
-                    textGroup.appendChild(textEl);
-                    occupiedBoxes.push({ x: chosen.boxX, y: chosen.boxY, width: boxWidth, height: boxHeight });
-                };
-
-                selectedSet.forEach((selectedId: number) => {
-                    const pos = this.props.posMap.get(selectedId);
-                    if (pos == null) return;
-                    const x = this.props.dataX[pos];
-                    const y = this.props.dataY[pos];
-                    const loc = this.proxy.location(x, y);
-                    const labelTextData = this.props.textData && this.props.textData[selectedId] ? this.props.textData[selectedId] : (this.props.labelDict?.get(this.props.inherentLabelData[selectedId]) ?? '');
-                    const content = formatPointLabel(selectedId, labelTextData, true, true);
-                    if (!content) return;
-                    renderLabel(selectedId, loc, content, true);
-                });
-
-                for (let i = 0; i < this.props.dataX.length; i++) {
-                    const id = this.props.idsByPos[i];
-                    if (selectedSet.has(id)) continue;
-                    const x = this.props.dataX[i];
-                    const y = this.props.dataY[i];
-                    const loc = this.proxy.location(x, y);
-                    const labelTextData = this.props.textData && this.props.textData[id] ? this.props.textData[id] : (this.props.labelDict?.get(this.props.inherentLabelData[id]) ?? '');
-                    const content = formatPointLabel(id, labelTextData, this.props.showLabel, this.props.showIndex);
-                    if (!content) continue;
-                    renderLabel(id, loc, content, false);
-                }
-                this.svg.appendChild(textGroup);
-            }
-
-            
         }
-        update(nextProps: Partial<any>) {
-            this.props = { ...this.props, ...nextProps };
-            if (this.svg) {
-                this.svg.setAttribute('width', String(this.props.proxy.width));
-                this.svg.setAttribute('height', String(this.props.proxy.height));
-            }
-            this.render();
-        }
-        destroy() {
-            if (this.svg && this.el) {
-                this.el.removeChild(this.svg);
-            }
-            if (this.svg) {
-                this.svg.removeEventListener('click', this.handleClickBound);
-            }
-            this.defs = null;
-            this.svg = null;
-            this.el = null;
-        }
-    }
+        setBoxDrag(null);
+    };
 
     // find selected datapoint
     async function querySelection(x: number, y: number, unitDistance: number): Promise<DataPoint | null> {
@@ -779,6 +943,7 @@ export const ChartComponent = memo(() => {
         }
         return prepared.dataPoints[minIndex];
     }
+
 
     const content = prepared ? (
         <EmbeddingView
@@ -825,6 +990,27 @@ export const ChartComponent = memo(() => {
         >
             <div style={{ position: 'relative', flex: 1 }}>
                 {content ?? <div style={{ width: '100%', height: '100%' }} />}
+                {boxSelectActive && (
+                    <div
+                        style={{ position: 'absolute', inset: 0, cursor: 'crosshair', zIndex: 100, userSelect: 'none' }}
+                        onMouseDown={handleBoxMouseDown}
+                        onMouseMove={handleBoxMouseMove}
+                        onMouseUp={handleBoxMouseUp}
+                    >
+                        {boxDrag && (
+                            <div style={{
+                                position: 'absolute',
+                                left: Math.min(boxDrag.startX, boxDrag.curX),
+                                top: Math.min(boxDrag.startY, boxDrag.curY),
+                                width: Math.abs(boxDrag.curX - boxDrag.startX),
+                                height: Math.abs(boxDrag.curY - boxDrag.startY),
+                                border: '1.5px dashed #7c3aed',
+                                background: 'rgba(124,58,237,0.08)',
+                                pointerEvents: 'none',
+                            }} />
+                        )}
+                    </div>
+                )}
             </div>
         </div>
     );

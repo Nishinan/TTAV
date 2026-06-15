@@ -1,5 +1,5 @@
 import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button, Tooltip } from 'antd';
-import { useDefaultStore,FocusMode } from '../state/state.unified';
+import { useDefaultStore, FocusMode, RefineFocusType } from '../state/state.unified';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
@@ -115,6 +115,8 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         useDefaultStore(["showIndex","showLabel","showBackground","showTrail","setShowIndex","setShowLabel","setShowBackground","setShowTrail"]);
 // Get focusMode and its auto-generated setter
     const { focusMode, setFocusMode } = useDefaultStore(['focusMode', 'setFocusMode']);
+    const { boxSelectActive, setBoxSelectActive, refineFocusType, setRefineFocusType, secondaryIndices, setSecondaryIndices, setSecondaryBoxes } =
+        useDefaultStore(['boxSelectActive', 'setBoxSelectActive', 'refineFocusType', 'setRefineFocusType', 'secondaryIndices', 'setSecondaryIndices', 'setSecondaryBoxes']);
     
     useEffect(() => {
         if (pointSize < 1) {
@@ -360,6 +362,61 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         {focusMode === 'coarse' && 'Visual highlight only.'}
         {focusMode === 'balanced' && 'Increase sampling weight.'}
         {focusMode === 'fine' && 'Enable LoRA local adaptation.'}
+    </div>
+
+    {/* Focus type + box select */}
+    <div style={{ marginBottom: '8px', border: '1px solid #e5e7eb', borderRadius: 6, padding: '8px', background: '#faf5ff' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: '12px', fontWeight: 600, color: '#6b21a8' }}>Focus Type</span>
+            <Select
+                size="small"
+                value={refineFocusType}
+                style={{ width: '120px' }}
+                onChange={(v: RefineFocusType) => {
+                    setRefineFocusType(v);
+                    if (v === 'uniform') { setSecondaryIndices([]); setSecondaryBoxes([]); }
+                }}
+                options={[
+                    { value: 'uniform', label: 'All Focus' },
+                    { value: 'tiered', label: 'Tiered' },
+                ]}
+            />
+        </div>
+        <Button
+            size="small"
+            block
+            onClick={() => setBoxSelectActive(!boxSelectActive)}
+            style={{
+                marginBottom: 6,
+                background: boxSelectActive ? '#7c3aed' : undefined,
+                color: boxSelectActive ? '#fff' : undefined,
+                borderColor: boxSelectActive ? '#7c3aed' : undefined,
+                fontWeight: boxSelectActive ? 600 : undefined,
+            }}
+        >
+            {boxSelectActive ? '⬛ 框选模式 ON — 再次点击退出' : '☐ 开始框选'}
+        </Button>
+        {refineFocusType === 'tiered' && (
+            <div style={{ fontSize: '11px', color: '#6b21a8', lineHeight: 1.5 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                    <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '2px solid #f59e0b', background: 'none' }} />
+                    <span><b>{selectedIndices.length}</b> primary（点击添加，Ctrl+点击移除）</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '1.5px dashed #7c3aed', background: 'none' }} />
+                    <span><b>{secondaryIndices.length}</b> secondary（框选，仅扩展上下文）</span>
+                    {secondaryIndices.length > 0 && (
+                        <Button size="small" style={{ padding: '0 4px', height: 18, fontSize: 10 }} danger
+                            onClick={() => { setSecondaryIndices([]); setSecondaryBoxes([]); }}>
+                            清除
+                        </Button>
+                    )}
+                </div>
+            </div>
+        )}
+        {refineFocusType === 'uniform' && (
+            <div style={{ fontSize: '11px', color: '#888' }}>框选区域：所有点设为 focus。</div>
+        )}
     </div>
 
     {/* 显式 Update 按钮 */}

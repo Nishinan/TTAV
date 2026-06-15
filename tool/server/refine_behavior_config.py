@@ -19,7 +19,7 @@ REFINE_BEHAVIOR_DEFAULTS = {
         "snapshot_every_steps": 30,
         "poll_interval_ms": 1500,
         "enable_sampled_metrics": True,
-        "sample_metrics_every_steps": 200,
+        "sample_metrics_every_steps": 100,
     },
     "stopping": {
         "enable_max_steps": True,
@@ -66,7 +66,7 @@ def resolve_refine_behavior_config(vis_config=None) -> dict:
     if "refine_enable_sampled_metrics" in vis_config:
         progress_cfg["enable_sampled_metrics"] = bool(vis_config.get("refine_enable_sampled_metrics"))
     if "refine_sample_metrics_every_steps" in vis_config:
-        progress_cfg["sample_metrics_every_steps"] = max(1, int(vis_config.get("refine_sample_metrics_every_steps", 200)))
+        progress_cfg["sample_metrics_every_steps"] = max(1, int(vis_config.get("refine_sample_metrics_every_steps", 100)))
 
     if "refine_max_steps" in vis_config:
         stop_cfg["max_steps"] = max(1, int(vis_config.get("refine_max_steps", stop_cfg["max_steps"])))

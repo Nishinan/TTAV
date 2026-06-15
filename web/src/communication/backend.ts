@@ -97,6 +97,48 @@ export function updateFocusContext(
     return basicPostWithJsonResponse('/updateFocusContext', data, options);
 }
 
+export function startRefineSession(
+    contentPath: string,
+    selectedIndices: number[],
+    focusMode: string,
+    currentEpoch?: number,
+    zoomBBox?: ViewportBBox | null,
+    secondaryIndices?: number[],
+    options?: NetworkOptions
+) {
+    const data: Record<string, any> = {
+        "content_path": contentPath,
+        "selected_indices": selectedIndices,
+        "focus_mode": focusMode,
+    };
+    if (currentEpoch !== undefined) {
+        data["current_epoch"] = currentEpoch;
+    }
+    if (zoomBBox) {
+        data["zoom_bbox"] = {
+            "x_min": zoomBBox.xMin,
+            "x_max": zoomBBox.xMax,
+            "y_min": zoomBBox.yMin,
+            "y_max": zoomBBox.yMax,
+        };
+    }
+    if (secondaryIndices && secondaryIndices.length > 0) {
+        data["secondary_indices"] = secondaryIndices;
+    }
+    return basicPostWithJsonResponse('/startRefineSession', data, options);
+}
+
+export function getRefineSessionProgress(
+    sessionId: string,
+    sinceVersion: number = -1,
+    options?: NetworkOptions
+) {
+    return basicPostWithJsonResponse('/getRefineSessionProgress', {
+        "session_id": sessionId,
+        "since_version": sinceVersion,
+    }, options);
+}
+
 export async function syncSession(config: any): Promise<any> {
     // 这里的路由名需要和 Python server 中的 @app.route('/syncSession') 对应
     return basicPostWithJsonResponse('/syncSession', config);

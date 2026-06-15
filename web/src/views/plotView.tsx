@@ -110,8 +110,10 @@ interface FunctionViewPanelsProps {
                     : Promise.resolve(''),
             ]);
 
+        const rawProjection = projection.projection || [];
         const data: any = {
-            projection: projection.projection || [],
+            projection: rawProjection,
+            originalProjection: rawProjection,  // never overwritten after refine
             originalNeighbors: originalNeighbors.neighbors || [],
             projectionNeighbors: projectionNeighbors.neighbors || [],
             indexList: projectionNeighbors.index_list || [],
@@ -763,6 +765,50 @@ function MessageHandler() {
     return <></>;
 }
 
+// Normalize raw backend metrics response into a consistent shape (or null if absent).
+function normalizeStructuralMetrics(raw: any): {
+    neighbor_preservation: number | null;
+    mean_rank_hd: number | null;
+    trustworthiness: number | null;
+    continuity: number | null;
+} | null {
+    if (!raw) return null;
+    const np = raw.neighbor_preservation ?? null;
+    const mrh = raw.mean_rank_hd ?? null;
+    const t = raw.trustworthiness ?? null;
+    const c = raw.continuity ?? null;
+    if (np === null && mrh === null && t === null && c === null) return null;
+    return { neighbor_preservation: np, mean_rank_hd: mrh, trustworthiness: t, continuity: c };
+}
+
+// Evaluate projection quality and write refineMetrics to the global store.
+async function updateDisplayedRefineMetrics(
+    focusIndices: number[],
+    oldEpochData: any,
+    newEpochData: any,
+    backendMetrics: ReturnType<typeof normalizeStructuralMetrics>,
+) {
+    const frontendResult = await evaluateProjectionQuality(0, focusIndices, oldEpochData, newEpochData);
+    const state = useGlobalStore.getState();
+    // Backend values are already percentages (0-100). Panel displays as `v * 100 %`,
+    // so divide by 100 to store as fraction (0-1).
+    // Frontend fallback values (avgNeighborConsistency etc.) are already fractions (0-1).
+    state.setValue('refineMetrics', {
+        focusDisplacement: frontendResult?.avgFocusShift ?? 0,
+        globalDrift: frontendResult?.avgGlobalDrift ?? 0,
+        neighborPreservation: backendMetrics?.neighbor_preservation != null
+            ? backendMetrics.neighbor_preservation / 100
+            : (frontendResult?.avgNeighborConsistency ?? 0),
+        meanRankHD: backendMetrics?.mean_rank_hd ?? 0,
+        trustworthiness: backendMetrics?.trustworthiness != null
+            ? backendMetrics.trustworthiness / 100
+            : (frontendResult?.avgTrustworthiness ?? 0),
+        continuity: backendMetrics?.continuity != null
+            ? backendMetrics.continuity / 100
+            : (frontendResult?.avgContinuity ?? 0),
+    });
+}
+
 export function AppCombinedView() {
     // [TTAV] Deconstruct required state and the generic 'setValue' from the store
     // Note: 'allEpochData' must be included here to be recognized in the function below
@@ -777,7 +823,9 @@ export function AppCombinedView() {
         setValue,
         focusMode,
         currentViewportBBox,
+        setHoveredIndex,
         eifSessionInfo,
+        secondaryIndices,
     } = useDefaultStore([
         'contentPath',
         'selectedIndices',
@@ -788,7 +836,9 @@ export function AppCombinedView() {
         'setValue',
         'focusMode',
         'currentViewportBBox',
+        'setHoveredIndex',
         'eifSessionInfo',
+        'secondaryIndices',
     ]);
 // 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
     const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
@@ -835,6 +885,7 @@ export function AppCombinedView() {
          
 
     const isRefining = useRef(false);
+    const [, setActiveRefineSessionId] = useState<string | null>(null);
     const REFINE_MSG_KEY = 'ttav_refine_loading';
 
     const handleUpdate = async () => {
@@ -846,33 +897,131 @@ export function AppCombinedView() {
             message.warning("Please select points on the canvas first.");
             return;
         }
-        // Prevent concurrent refine calls — each would create its own loading toast
         if (isRefining.current) {
             message.warning("Refinement already in progress, please wait.");
             return;
         }
         isRefining.current = true;
-        // Use a stable key so any stale toast from a prior crash is destroyed first
         message.loading({ content: 'Refining layout...', key: REFINE_MSG_KEY, duration: 0 });
 
         try {
             const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
-            const response = await BackendAPI.updateFocusContext(
+            const startResponse = await BackendAPI.startRefineSession(
                 contentPath,
                 selectedIndices,
                 focusMode,
                 epoch,
-                currentViewportBBox
+                currentViewportBBox,
+                secondaryIndices && secondaryIndices.length > 0 ? secondaryIndices : undefined,
             );
 
-            if (response && response.status === "success") {
-                console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
-
-                // After refine, only projection coords and low-D neighbors change.
-                // Re-use originalNeighbors/prediction/background from oldEpochData to skip those requests.
-                const focusIndices = Array.isArray((response as any).focus_indices)
-                    ? (response as any).focus_indices as number[]
+            if (startResponse && (startResponse as any).status === "success") {
+                const sessionId = (startResponse as any).session_id as string;
+                let focusIndices = Array.isArray((startResponse as any).focus_indices)
+                    ? (startResponse as any).focus_indices as number[]
                     : selectedIndices;
+                let bboxIndices = Array.isArray((startResponse as any).bbox_indices)
+                    ? (startResponse as any).bbox_indices as number[]
+                    : [];
+                let lastProjectionVersion = -1;
+                let finalProgress: any = null;
+                let latestSampledMetrics: any = null;
+                let resolvedBehavior: any = (startResponse as any).resolved_refine_behavior ?? null;
+                setActiveRefineSessionId(sessionId);
+
+                // blendBaseline is the pre-refine projection used as the LD anchor for
+                // neighbor-set computation during animation (avoids co-location collapse).
+                const blendBaseline = oldEpochData.projection;
+
+                const applyIntermediateProjection = (refinedProjection: number[][], latestFocusIndices: number[]) => {
+                    const blendedProjection = buildBlendedProjection(
+                        blendBaseline,
+                        refinedProjection,
+                        currentViewportBBox,
+                        latestFocusIndices,
+                    );
+                    const state = useGlobalStore.getState();
+                    const currentEpochData = state.allEpochData[targetEpoch] || oldEpochData;
+                    state.setValue('focusIndices', latestFocusIndices);
+                    state.setValue('allEpochData', {
+                        ...state.allEpochData,
+                        [targetEpoch]: {
+                            ...currentEpochData,
+                            projection: blendedProjection,
+                            originalProjection: blendBaseline,
+                        },
+                    });
+                    return {
+                        ...currentEpochData,
+                        projection: blendedProjection,
+                        originalProjection: blendBaseline,
+                    };
+                };
+
+                const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+                while (true) {
+                    const progress = await BackendAPI.getRefineSessionProgress(sessionId, lastProjectionVersion);
+                    finalProgress = progress;
+
+                    if (Array.isArray((progress as any).focus_indices) && (progress as any).focus_indices.length > 0) {
+                        focusIndices = (progress as any).focus_indices as number[];
+                    }
+                    if (Array.isArray((progress as any).bbox_indices)) {
+                        bboxIndices = (progress as any).bbox_indices as number[];
+                    }
+                    if ((progress as any).resolved_refine_behavior) {
+                        resolvedBehavior = (progress as any).resolved_refine_behavior;
+                    }
+                    const progressMetrics = normalizeStructuralMetrics(
+                        (progress as any).sampled_metrics
+                        ?? ((progress as any).result ? {
+                            neighbor_preservation: (progress as any).result.neighbor_preservation,
+                            mean_rank_hd: (progress as any).result.mean_rank_hd,
+                            trustworthiness: (progress as any).result.trustworthiness,
+                            continuity: (progress as any).result.continuity,
+                        } : null)
+                    );
+                    if (progressMetrics) {
+                        latestSampledMetrics = progressMetrics;
+                    }
+
+                    if (Array.isArray((progress as any).projection)) {
+                        const liveEpochData = applyIntermediateProjection((progress as any).projection as number[][], focusIndices);
+                        lastProjectionVersion = Number((progress as any).projection_version ?? lastProjectionVersion);
+                        const stepsCompleted = Number((progress as any).steps_completed ?? 0);
+                        const maxSteps = Number(
+                            resolvedBehavior?.stopping?.max_steps
+                            ?? (progress as any)?.resolved_refine_behavior?.stopping?.max_steps
+                            ?? 0
+                        );
+                        await updateDisplayedRefineMetrics(focusIndices, oldEpochData, liveEpochData, latestSampledMetrics);
+                        message.loading({
+                            content: (progress as any).stop_requested
+                                ? `Stopping refine... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps`
+                                : (stepsCompleted > 0 ? `Refining layout... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps` : 'Refining layout...'),
+                            key: REFINE_MSG_KEY,
+                            duration: 0,
+                        });
+                    } else if (latestSampledMetrics) {
+                        const liveEpochData = useGlobalStore.getState().allEpochData[targetEpoch];
+                        if (liveEpochData) {
+                            await updateDisplayedRefineMetrics(focusIndices, oldEpochData, liveEpochData, latestSampledMetrics);
+                        }
+                    }
+
+                    if ((progress as any).status === "completed") {
+                        break;
+                    }
+                    if ((progress as any).status === "failed" || (progress as any).status === "error") {
+                        throw new Error((progress as any).error || 'Refine session failed.');
+                    }
+
+                    await sleep(REFINE_DEFAULTS.progressPollMs);
+                }
+
+                console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
+                setActiveRefineSessionId(null);
 
                 const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
                 const refinedProjection = projResp.projection || oldEpochData.projection;
@@ -882,36 +1031,33 @@ export function AppCombinedView() {
                     currentVisID,
                     targetEpoch,
                     true,
+                    currentViewportBBox,
+                    focusIndices,
+                    DEFAULT_BLEND_DECAY_RATIO,
                 );
-
+                const blendedProjection = buildBlendedProjection(
+                    blendBaseline,
+                    refinedProjection,
+                    currentViewportBBox,
+                    focusIndices,
+                );
                 const newEpochData = {
                     ...oldEpochData,
-                    projection: refinedProjection,
+                    projection: blendedProjection,
+                    originalProjection: blendBaseline,
                     projectionNeighbors: projNeighResp.neighbors || oldEpochData.projectionNeighbors,
                     indexList: projNeighResp.index_list || oldEpochData.indexList,
                 };
 
-                // Write updated epoch data to store so canvas re-renders
                 const state = useGlobalStore.getState();
                 state.setValue('focusIndices', focusIndices);
                 state.setValue('allEpochData', { ...state.allEpochData, [targetEpoch]: newEpochData });
-
-                const metrics = await evaluateProjectionQuality(epoch, focusIndices, oldEpochData, newEpochData);
-                if (metrics) {
-                    const r = response as any;
-                    const backendNP = typeof r.neighbor_preservation === 'number' ? r.neighbor_preservation / 100 : metrics.avgNeighborConsistency;
-                    const backendMRH = typeof r.mean_rank_hd === 'number' ? r.mean_rank_hd : 0;
-                    const backendTrust = typeof r.trustworthiness === 'number' ? r.trustworthiness / 100 : metrics.avgTrustworthiness;
-                    const backendCont = typeof r.continuity === 'number' ? r.continuity / 100 : metrics.avgContinuity;
-                    useGlobalStore.getState().setValue('refineMetrics', {
-                        focusDisplacement: metrics.avgFocusShift,
-                        globalDrift: metrics.avgGlobalDrift,
-                        neighborPreservation: backendNP,
-                        meanRankHD: backendMRH,
-                        trustworthiness: backendTrust,
-                        continuity: backendCont,
-                    });
+                if (selectedIndices.length > 0) {
+                    setHoveredIndex(selectedIndices[0]);
                 }
+
+                const backendMetrics = normalizeStructuralMetrics((finalProgress as any)?.result);
+                await updateDisplayedRefineMetrics(focusIndices, oldEpochData, newEpochData, backendMetrics);
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, focusIndices, newEpochData.indexList || []);
 
                 message.success({ content: `Epoch ${targetEpoch} refined! Refined projection updated!`, key: REFINE_MSG_KEY });
@@ -944,9 +1090,7 @@ export function AppCombinedView() {
                         <PanelResizeHandle className="subtle-resize-handle" hitAreaMargins={{ coarse: 12, fine: 6 }} />
                         <Panel defaultSize={30} minSize={8} maxSize={60} collapsible collapsedSize={0}>
                            <div style={{ width: '100%', height: '100%', borderLeft: '1px solid #ccc' }}>
-                {/* [逻辑更替]：不再监听模式改变自动触发，
-                    而是将 handleUpdate 传给子组件，由子组件的 "Update" 按钮显式调用。
-                */}
+                
                 <FunctionViewPanels
                     onUpdateProjection={handleUpdate}
                     refineReady={!(eifSessionInfo?.isEifBundle) || eifSessionInfo.refineReady}

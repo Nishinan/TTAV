@@ -8,6 +8,7 @@ import { SelectedListener } from "../state/types";
 import { TrainingEvent, InfluenceSample } from "../component/types";
 // 1. Define FocusMode type
 export type FocusMode = "coarse" | "balanced" | "fine";
+export type RefineFocusType = "uniform" | "tiered";
 export type ViewportBBox = {
     xMin: number;
     xMax: number;
@@ -17,6 +18,9 @@ export type ViewportBBox = {
 // Types from plotView
 export type EpochData = {
     projection: number[][];
+    // The non-blended projection as first loaded; never updated after refine.
+    // Kept so the blend baseline always matches the backend (which also starts from the original).
+    originalProjection?: number[][];
     prediction: number[];
     predProbability: number[][];
     originalNeighbors: number[][];
@@ -83,6 +87,12 @@ export type BaseMutableGlobalStore = {
     isFocusMode: boolean;
     focusIndices: number[];
     focusMode: FocusMode; // Added focusMode field
+
+    // Box select and refine focus type
+    boxSelectActive: boolean;
+    refineFocusType: RefineFocusType;
+    secondaryIndices: number[];
+    secondaryBoxes: Array<[number, number, number, number]>; // [dataX1, dataY1, dataX2, dataY2]
 
     // Training events and influence
     trainingEvents: TrainingEvent[];
@@ -169,6 +179,12 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     isFocusMode: false,
     focusIndices: [],
     focusMode: "coarse", // Initializing with "coarse"
+
+    // Box select and refine focus type
+    boxSelectActive: false,
+    refineFocusType: "uniform" as RefineFocusType,
+    secondaryIndices: [],
+    secondaryBoxes: [],
     
     // Training events and influence
     trainingEvents: [],
