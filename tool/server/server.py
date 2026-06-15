@@ -2,9 +2,11 @@ import os
 import sys
 import shutil
 import json
-import uuid
+import time
+import traceback
 from pathlib import Path
 import numpy as np
+import torch
 # from llm_agent import call_llm_agent
 from run_visualization import visualize_run, init_visualize_component
 
@@ -18,7 +20,6 @@ sys.path.append('../visualize')
 
 from server_utils import *
 from refine_runtime_config import REFINE_RUNTIME_DEFAULTS
-from refine_behavior_config import resolve_refine_behavior_config
 
 # flask for API server
 app = Flask(__name__)
@@ -43,61 +44,375 @@ active_session = {
     "content_path": None,
     "vis_id": None,
     "vis_method": None,
-    "vis_config": {}
+    "vis_config": {},
+    "eif_session_info": None,
 }
 
 EIF_BUNDLE_ROOT = Path("/root/project/Dataset/eif_bundles")
 EIF_STATIC_SESSION = "EIF_STATIC_BUNDLE"
+EIF_SESSION_STATUS_FILE = "eif_session_status.json"
+EIF_BUILD_TASKS = {}
+
+
+def _status_path_for_content(content_path):
+    return Path(content_path) / EIF_SESSION_STATUS_FILE
+
+
+def _normalize_eif_session_status(payload, *, content_path=None, sample_id=None, vis_method=None, vis_id=None):
+    now_ms = int(time.time() * 1000)
+    normalized = dict(payload or {})
+    normalized.setdefault("sample_id", sample_id or "")
+    normalized.setdefault("content_path", str(content_path) if content_path is not None else "")
+    normalized.setdefault("vis_method", vis_method or "TimeVis")
+    normalized.setdefault("vis_id", str(vis_id or "1"))
+    normalized.setdefault("eif_bundle", True)
+    normalized.setdefault("trainable_session_status", "registered")
+    normalized["refine_ready"] = normalized.get("trainable_session_status") == "ready"
+    normalized.setdefault("message", "EIF bundle registered.")
+    normalized.setdefault("updated_at", now_ms)
+    return normalized
+
+
+def _read_eif_session_status(content_path, *, sample_id=None, vis_method=None, vis_id=None):
+    status_path = _status_path_for_content(content_path)
+    if status_path.exists():
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                return _normalize_eif_session_status(
+                    json.load(f),
+                    content_path=content_path,
+                    sample_id=sample_id,
+                    vis_method=vis_method,
+                    vis_id=vis_id,
+                )
+        except Exception:
+            traceback.print_exc()
+    return _normalize_eif_session_status(
+        {},
+        content_path=content_path,
+        sample_id=sample_id,
+        vis_method=vis_method,
+        vis_id=vis_id,
+    )
+
+
+def _write_eif_session_status(content_path, status_payload):
+    normalized = _normalize_eif_session_status(status_payload, content_path=content_path)
+    status_path = _status_path_for_content(content_path)
+    status_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    dataset_info_path = Path(content_path) / "dataset" / "info.json"
+    if dataset_info_path.exists():
+        try:
+            dataset_info = json.loads(dataset_info_path.read_text(encoding="utf-8"))
+            dataset_info["eif_bundle"] = True
+            dataset_info["refine_capable"] = True
+            dataset_info["trainable_session_status"] = normalized["trainable_session_status"]
+            dataset_info["refine_ready"] = normalized["refine_ready"]
+            dataset_info["trainable_session_message"] = normalized["message"]
+            dataset_info_path.write_text(json.dumps(dataset_info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            traceback.print_exc()
+
+    vis_info_path = Path(content_path) / "visualize" / f"{normalized['vis_method']}_{normalized['vis_id']}" / "info.json"
+    if vis_info_path.exists():
+        try:
+            vis_info = json.loads(vis_info_path.read_text(encoding="utf-8"))
+            vis_info["eif_bundle"] = True
+            vis_info["trainable_session_status"] = normalized["trainable_session_status"]
+            vis_info["refine_ready"] = normalized["refine_ready"]
+            vis_info["trainable_session_message"] = normalized["message"]
+            vis_info_path.write_text(json.dumps(vis_info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            traceback.print_exc()
+
+    return normalized
+
+
+def _is_trainable_session_ready(content_path, vis_method, vis_id):
+    status = _read_eif_session_status(content_path, vis_method=vis_method, vis_id=vis_id)
+    model_path = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "vis_model.pth"
+    return status.get("trainable_session_status") == "ready" and model_path.exists()
+
+
+def _build_eif_task_key(content_path, vis_method, vis_id):
+    return f"{content_path}::{vis_method}::{vis_id}"
+
+
+def _build_fast_fit_vis_config(embedding_dim, vis_config):
+    next_config = dict(vis_config or {})
+    width_1 = min(128, max(32, embedding_dim // 16))
+    width_2 = min(32, max(8, width_1 // 4))
+    encoder_dims = [embedding_dim, width_1, width_2, 2]
+    decoder_dims = [2, width_2, width_1, embedding_dim]
+    next_config["dimension"] = embedding_dim
+    next_config["encoder_dims"] = encoder_dims
+    next_config["decoder_dims"] = decoder_dims
+    next_config.setdefault("gpu_id", -1)
+    next_config.setdefault("resolution", [300, 300])
+    next_config.setdefault("fast_fit_steps", 240)
+    next_config.setdefault("fast_fit_lr", 0.01)
+    next_config.setdefault("fast_fit_patience", 30)
+    next_config.setdefault("fast_fit_recon_weight", 0.05)
+    return next_config
+
+
+def _fit_fast_trainable_session(content_path, sample_id, vis_method, vis_id, vis_config, *, data_type="Text", task_type="Alignment"):
+    from run_visualization import initialize_config
+    from visualize_model import VisModel
+
+    info_path = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "info.json"
+    existing_info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
+    available_epochs = []
+    epochs_root = Path(content_path) / "epochs"
+    for child in epochs_root.iterdir():
+        if child.is_dir() and child.name.startswith("epoch_"):
+            try:
+                available_epochs.append(int(child.name.split("_")[1]))
+            except Exception:
+                pass
+    available_epochs.sort()
+    if not available_epochs:
+        raise ValueError("No available epochs found for EIF bundle")
+
+    first_epoch = available_epochs[0]
+    embedding_path = Path(content_path) / "epochs" / f"epoch_{first_epoch}" / "embeddings.npy"
+    projection_path = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "epochs" / f"epoch_{first_epoch}" / "projection.npy"
+    embeddings = np.load(embedding_path).astype(np.float32)
+    target_projection = np.load(projection_path).astype(np.float32)
+    if embeddings.ndim != 2 or target_projection.ndim != 2 or target_projection.shape[1] != 2:
+        raise ValueError("EIF fast-fit requires 2D projection targets and 2D embedding arrays")
+    if len(embeddings) != len(target_projection):
+        raise ValueError("Embeddings and projection must have the same number of points")
+
+    fit_vis_config = _build_fast_fit_vis_config(int(embeddings.shape[1]), vis_config)
+    config = initialize_config(content_path, vis_method, vis_id, data_type, task_type, fit_vis_config)
+    device = torch.device("cuda:{}".format(config['vis_config']['gpu_id']) if torch.cuda.is_available() and config['vis_config']['gpu_id'] != -1 else "cpu")
+    model = VisModel(config['vis_config']['encoder_dims'], config['vis_config']['decoder_dims']).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(config['vis_config'].get('fast_fit_lr', 0.01)))
+    projection_weight = 1.0
+    recon_weight = float(config['vis_config'].get('fast_fit_recon_weight', 0.05))
+    max_steps = int(config['vis_config'].get('fast_fit_steps', 240))
+    patience = int(config['vis_config'].get('fast_fit_patience', 30))
+
+    feat_t = torch.from_numpy(embeddings).to(dtype=torch.float32, device=device)
+    proj_t = torch.from_numpy(target_projection).to(dtype=torch.float32, device=device)
+    best_loss = float('inf')
+    best_state = None
+    stale_steps = 0
+
+    model.train()
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        pred_proj = model.encoder(feat_t)
+        recon = model.decoder(pred_proj)
+        loss_proj = torch.mean((pred_proj - proj_t) ** 2)
+        loss_recon = torch.mean((recon - feat_t) ** 2)
+        loss = projection_weight * loss_proj + recon_weight * loss_recon
+        loss.backward()
+        optimizer.step()
+
+        current_loss = float(loss.detach().cpu().item())
+        if current_loss + 1e-7 < best_loss:
+            best_loss = current_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            stale_steps = 0
+        else:
+            stale_steps += 1
+
+        if step % 40 == 0:
+            print(f"[EIF-FastFit] sample={sample_id} step={step} loss={current_loss:.6f} proj={float(loss_proj.detach().cpu().item()):.6f} recon={float(loss_recon.detach().cpu().item()):.6f}", flush=True)
+        if stale_steps >= patience:
+            print(f"[EIF-FastFit] Early stop at step {step} best_loss={best_loss:.6f}", flush=True)
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+
+    with torch.no_grad():
+        for epoch in available_epochs:
+            epoch_embedding_path = Path(content_path) / "epochs" / f"epoch_{epoch}" / "embeddings.npy"
+            epoch_embeddings = np.load(epoch_embedding_path).astype(np.float32)
+            epoch_t = torch.from_numpy(epoch_embeddings).to(dtype=torch.float32, device=device)
+            fitted_projection = model.encoder(epoch_t).cpu().numpy().astype(np.float32)
+            epoch_projection_dir = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "epochs" / f"epoch_{epoch}"
+            epoch_projection_dir.mkdir(parents=True, exist_ok=True)
+            np.save(epoch_projection_dir / "projection.npy", fitted_projection)
+
+    model_save_path = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "vis_model.pth"
+    torch.save({
+        "loss": best_loss,
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }, model_save_path)
+
+    info_payload = {
+        **existing_info,
+        "content_path": str(content_path),
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "data_type": data_type,
+        "task_type": task_type,
+        "sample_id": sample_id,
+        "eif_bundle": True,
+        "fit_mode": "eif_projection_regression",
+        "vis_config": config['vis_config'],
+    }
+    info_path.write_text(json.dumps(info_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _build_trainable_session(content_path, sample_id, vis_method, vis_id, vis_config, *, data_type="Text", task_type="Alignment"):
+    _write_eif_session_status(content_path, {
+        "sample_id": sample_id,
+        "content_path": content_path,
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "trainable_session_status": "building",
+        "message": "Fitting adaptive refine session to EIF projection...",
+    })
+    _fit_fast_trainable_session(content_path, sample_id, vis_method, vis_id, vis_config, data_type=data_type, task_type=task_type)
+    return _write_eif_session_status(content_path, {
+        "sample_id": sample_id,
+        "content_path": content_path,
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "trainable_session_status": "ready",
+        "message": "Adaptive refine session is ready.",
+    })
+
+
+def _start_trainable_session_build(content_path, sample_id, vis_method, vis_id, vis_config, *, data_type="Text", task_type="Alignment"):
+    task_key = _build_eif_task_key(content_path, vis_method, vis_id)
+    with _refine_lock:
+        existing = EIF_BUILD_TASKS.get(task_key)
+        if existing is not None and existing.is_alive():
+            return False
+
+        def _runner():
+            try:
+                _build_trainable_session(
+                    content_path,
+                    sample_id,
+                    vis_method,
+                    vis_id,
+                    vis_config,
+                    data_type=data_type,
+                    task_type=task_type,
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                _write_eif_session_status(content_path, {
+                    "sample_id": sample_id,
+                    "content_path": content_path,
+                    "vis_method": vis_method,
+                    "vis_id": vis_id,
+                    "trainable_session_status": "error",
+                    "message": f"Adaptive refine session build failed: {exc}",
+                    "error": str(exc),
+                })
+            finally:
+                with _refine_lock:
+                    EIF_BUILD_TASKS.pop(task_key, None)
+
+        import threading
+        thread = threading.Thread(target=_runner, daemon=True)
+        EIF_BUILD_TASKS[task_key] = thread
+        thread.start()
+        return True
+
 
 def update_active_session(config, visualizer, strategy):
     """统一更新 Session 的工具函数"""
     global active_session
-    normalized_content_path = normalize_content_path(config.get("content_path"))
     active_session.update({
         "strategy": strategy,
         "visualizer": visualizer,
-        "content_path": normalized_content_path,
+        "content_path": config.get("content_path"),
         "vis_id": config.get("visualizationID") or config.get("vis_id"),
         "vis_method": config.get("vis_method"),
-        "vis_config": config.get("vis_config", {})
+        "vis_config": config.get("vis_config", {}),
+        "eif_session_info": None,
     })
+
 
 @app.route('/syncSession', methods=['POST'])
 def sync_session():
     """新接口：允许前端 Load 时同步 Session"""
     req = request.get_json()
     try:
-        content_path = normalize_content_path(req['content_path'])
-        req['content_path'] = content_path
-        info_path = os.path.join(content_path, 'dataset', 'info.json')
+        info_path = os.path.join(req['content_path'], 'dataset', 'info.json')
         dataset_info = read_file_as_json(info_path) or {}
         if dataset_info.get("eif_bundle"):
+            vis_method = req.get("vis_method", "TimeVis")
+            vis_id = str(req.get("vis_id") or req.get("visualizationID", "0"))
+            eif_session_info = _read_eif_session_status(
+                req["content_path"],
+                sample_id=dataset_info.get("sample_id"),
+                vis_method=vis_method,
+                vis_id=vis_id,
+            )
+
+            if _is_trainable_session_ready(req["content_path"], vis_method, vis_id):
+                config = initialize_config(
+                    req['content_path'],
+                    vis_method,
+                    vis_id,
+                    req['data_type'],
+                    req['task_type'],
+                    req['vis_config']
+                )
+                visualizer, strategy = init_visualize_component(config)
+                update_active_session(config, visualizer, strategy)
+                active_session["eif_session_info"] = eif_session_info
+                return jsonify({
+                    "status": "success",
+                    "message": "EIF adaptive refine session synced",
+                    "eifBundle": True,
+                    "trainableSessionStatus": eif_session_info["trainable_session_status"],
+                    "refineReady": True,
+                    "eifSessionInfo": eif_session_info,
+                })
+
             active_session.update({
                 "strategy": EIF_STATIC_SESSION,
                 "visualizer": None,
-                "content_path": content_path,
-                "vis_id": req.get("vis_id", "0"),
-                "vis_method": req.get("vis_method"),
+                "content_path": req.get("content_path"),
+                "vis_id": vis_id,
+                "vis_method": vis_method,
                 "vis_config": req.get("vis_config", {}),
+                "eif_session_info": eif_session_info,
             })
-            return jsonify({"status": "success", "message": "EIF static bundle session synced"})
+            return jsonify({
+                "status": "success",
+                "message": eif_session_info.get("message", "EIF bundle session synced"),
+                "eifBundle": True,
+                "trainableSessionStatus": eif_session_info["trainable_session_status"],
+                "refineReady": False,
+                "eifSessionInfo": eif_session_info,
+            })
 
         config = initialize_config(
-            req['content_path'], 
-            req['vis_method'], 
-            req.get('vis_id', "0"),
-            req['data_type'], 
-            req['task_type'], 
+            req['content_path'],
+            req['vis_method'],
+            req.get('vis_id') or req.get('visualizationID', "0"),
+            req['data_type'],
+            req['task_type'],
             req['vis_config']
         )
-        
+
         # 即使是 Load，我们也调用 init 来准备好 strategy 对象（比如加载模型）
         visualizer, strategy = init_visualize_component(config)
         update_active_session(config, visualizer, strategy)
-        return jsonify({"status": "success", "message": "Session synced on server"})
+        return jsonify({
+            "status": "success",
+            "message": "Session synced on server",
+            "eifBundle": False,
+            "refineReady": True,
+            "eifSessionInfo": None,
+        })
     except Exception as e:
-        import traceback
-        traceback.print_exc() 
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
         
@@ -105,213 +420,6 @@ import threading
 
 # Global lock: only one refine() may run at a time (strategy objects are not thread-safe).
 _refine_lock = threading.Lock()
-_refine_sessions = {}
-_refine_sessions_lock = threading.Lock()
-
-
-def _prepare_refine_request(req):
-    content_path = normalize_content_path(req.get("content_path"))
-    selected_indices = req.get("selected_indices", [])
-    focus_mode = req.get("focus_mode", "balanced")
-    current_epoch = req.get("current_epoch", None)
-    zoom_bbox = req.get("zoom_bbox")
-
-    if active_session["strategy"] is None:
-        print("No active session, strategy:", active_session["strategy"],
-              ", path:", active_session["content_path"], "content path:", content_path)
-        raise ValueError("No active session")
-
-    if active_session["strategy"] == EIF_STATIC_SESSION:
-        raise ValueError("EIF static bundles do not support refinement yet")
-
-    strategy = active_session["strategy"]
-    visualizer = active_session["visualizer"]
-    vis_method = active_session["vis_method"]
-    vis_id = active_session["vis_id"]
-    vis_config = active_session.get("vis_config", {})
-    resolved_refine_behavior = resolve_refine_behavior_config(vis_config)
-
-    focus_indices = selected_indices
-    focus_summary = {
-        "seed_count": len(selected_indices),
-        "bbox_count": 0,
-        "bbox_indices": [],
-        "hd_neighbor_count": 0,
-        "focus_set_size": len(selected_indices),
-        "used_bbox": False,
-    }
-
-    if vis_method == "TimeVis":
-        hd_k = int(vis_config.get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
-        focus_set_strategy = vis_config.get(
-            "refine_focus_set_strategy",
-            REFINE_RUNTIME_DEFAULTS["focus_set_strategy"],
-        )
-        focus_indices, focus_summary = build_focus_set(
-            content_path=content_path,
-            vis_method=vis_method,
-            vis_id=vis_id,
-            epoch=current_epoch,
-            seed_indices=selected_indices,
-            zoom_bbox=zoom_bbox,
-            hd_k=hd_k,
-            strategy=focus_set_strategy,
-        )
-
-    return {
-        "content_path": content_path,
-        "selected_indices": selected_indices,
-        "focus_mode": focus_mode,
-        "current_epoch": current_epoch,
-        "zoom_bbox": zoom_bbox,
-        "strategy": strategy,
-        "visualizer": visualizer,
-        "vis_method": vis_method,
-        "vis_id": vis_id,
-        "focus_indices": focus_indices,
-        "focus_summary": focus_summary,
-        "bbox_indices": focus_summary.get("bbox_indices", []),
-        "resolved_refine_behavior": resolved_refine_behavior,
-    }
-
-
-def _run_refine_request(prepared_req, progress_callback=None):
-    content_path = prepared_req["content_path"]
-    focus_mode = prepared_req["focus_mode"]
-    current_epoch = prepared_req["current_epoch"]
-    strategy = prepared_req["strategy"]
-    visualizer = prepared_req["visualizer"]
-    vis_method = prepared_req["vis_method"]
-    vis_id = prepared_req["vis_id"]
-    focus_indices = prepared_req["focus_indices"]
-    focus_summary = prepared_req["focus_summary"]
-    bbox_indices = prepared_req.get("bbox_indices", [])
-    resolved_refine_behavior = prepared_req.get("resolved_refine_behavior")
-
-    print(f"Starting refinement: mode={focus_mode}, selected_points={prepared_req['selected_indices']}")
-
-    mask = strategy.get_focus_mask(focus_indices)
-    strategy.update_ttav_context(focus_indices, focus_mode, mask)
-
-    if vis_method == "DynaVis":
-        strategy.refine_train(focus_mode=focus_mode)
-        print("Start generating DynaVis visualization results...")
-        visualizer.visualize_all_epochs()
-        print("DynaVis visualization results generated.")
-    elif vis_method in ("DVI", "TimeVis"):
-        print("Start refining visualization model...")
-        strategy.refine(
-            focus_indices=focus_indices,
-            neighbor_indices=[],
-            current_epoch=current_epoch,
-            epochs_to_update=10,
-            progress_callback=progress_callback,
-            should_stop_callback=prepared_req.get("should_stop_callback"),
-            progress_refresh_indices=bbox_indices,
-        )
-        if current_epoch is not None:
-            patched_indices = getattr(strategy, "_last_patch_indices", None)
-            if patched_indices:
-                try:
-                    update_projection_neighbors_incremental(
-                        content_path,
-                        vis_method,
-                        vis_id,
-                        current_epoch,
-                        patched_indices,
-                    )
-                except Exception as cache_ex:
-                    print(f"[TimeVis] Incremental neighbor cache update failed: {cache_ex}")
-                    invalidate_projection_neighbors_cache(
-                        content_path, vis_method, vis_id, current_epoch
-                    )
-            else:
-                invalidate_projection_neighbors_cache(
-                    content_path, vis_method, vis_id, current_epoch
-                )
-        print("Refinement finished. Refined projections saved to _refined directory.")
-        strategy.patch_other_epochs(skip_epoch=current_epoch)
-    else:
-        visualizer.visualize_all_epochs()
-
-    return {
-        "status": "success",
-        "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
-        "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
-        "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
-        "continuity":            getattr(strategy, '_last_refine_cont',   None),
-        "focus_set_size":        focus_summary["focus_set_size"],
-        "focus_seed_count":      focus_summary["seed_count"],
-        "focus_bbox_count":      focus_summary["bbox_count"],
-        "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
-        "focus_set_strategy":    focus_summary.get("focus_set_strategy"),
-        "bbox_indices":          bbox_indices,
-        "focus_indices":         focus_indices,
-        "training_context_indices": getattr(strategy, "_last_training_context_indices", focus_indices),
-        "patch_indices":         getattr(strategy, "_last_patch_indices", focus_indices),
-        "resolved_refine_behavior": resolved_refine_behavior,
-        "timings":               getattr(strategy, "_last_refine_timing", None),
-    }
-
-
-def _update_refine_session(session_id, **fields):
-    with _refine_sessions_lock:
-        session = _refine_sessions.get(session_id)
-        if session is None:
-            return
-        session.update(fields)
-        if "projection" in fields:
-            session["projection_version"] = session.get("projection_version", 0) + 1
-
-
-def _run_refine_session_worker(session_id, prepared_req):
-    try:
-        def _should_stop_callback():
-            with _refine_sessions_lock:
-                session = _refine_sessions.get(session_id)
-                return bool(session and session.get("stop_requested", False))
-
-        def _progress_callback(payload):
-            session_fields = {
-                "status": "stopping" if _should_stop_callback() else "running",
-                "steps_completed": payload.get("steps_completed", 0),
-                "focus_indices": payload.get("focus_indices", prepared_req["focus_indices"]),
-                "training_context_indices": payload.get("training_context_indices", []),
-                "patch_indices": payload.get("patch_indices", []),
-                "bbox_indices": payload.get("bbox_indices", prepared_req.get("bbox_indices", [])),
-            }
-            if "projection" in payload:
-                session_fields["projection"] = payload.get("projection")
-            if "sampled_metrics" in payload:
-                session_fields["sampled_metrics"] = payload.get("sampled_metrics")
-            _update_refine_session(session_id, **session_fields)
-
-        prepared_req["should_stop_callback"] = _should_stop_callback
-        result = _run_refine_request(prepared_req, progress_callback=_progress_callback)
-        _update_refine_session(
-            session_id,
-            status="completed",
-            steps_completed=(result.get("timings") or {}).get("steps_completed", 0),
-            focus_indices=result.get("focus_indices", prepared_req["focus_indices"]),
-            training_context_indices=result.get("training_context_indices", []),
-            patch_indices=result.get("patch_indices", []),
-            bbox_indices=result.get("bbox_indices", prepared_req.get("bbox_indices", [])),
-            timings=result.get("timings"),
-            sampled_metrics={
-                "neighbor_preservation": result.get("neighbor_preservation"),
-                "mean_rank_hd": result.get("mean_rank_hd"),
-                "trustworthiness": result.get("trustworthiness"),
-                "continuity": result.get("continuity"),
-            },
-            result=result,
-            resolved_refine_behavior=prepared_req.get("resolved_refine_behavior"),
-        )
-    except Exception as ex:
-        import traceback
-        traceback.print_exc()
-        _update_refine_session(session_id, status="failed", error=str(ex))
-    finally:
-        _refine_lock.release()
 
 @app.route('/updateFocusContext', methods=['POST'])
 @cross_origin()
@@ -320,119 +428,111 @@ def update_focus_context():
     Endpoint to receive user selection and trigger dynamic refinement.
     """
     req = request.get_json()
+    content_path = req.get("content_path")
+    selected_indices = req.get("selected_indices", [])
+    focus_mode = req.get("focus_mode", "balanced")
+    current_epoch = req.get("current_epoch", None)  # epoch currently viewed by user
+    zoom_bbox = req.get("zoom_bbox")
+
+    # Check if a session is active
+    if active_session["strategy"] is None:
+        print("No active session, strategy:", active_session["strategy"],
+              ", path:", active_session["content_path"], "content path:", content_path)
+        return jsonify({"status": "error", "message": "No active session"}), 400
+
+    if active_session["strategy"] == EIF_STATIC_SESSION:
+        eif_info = active_session.get("eif_session_info") or {}
+        return jsonify({
+            "status": "error",
+            "message": eif_info.get("message", "Adaptive refine session is still preparing."),
+            "trainableSessionStatus": eif_info.get("trainable_session_status", "registered"),
+            "refineReady": False,
+        }), 400
+
+    # Reject concurrent refine requests immediately rather than queueing them.
     if not _refine_lock.acquire(blocking=False):
         return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
 
+    strategy = active_session["strategy"]
+    visualizer = active_session["visualizer"]
+
     try:
-        prepared_req = _prepare_refine_request(req)
-        return jsonify(_run_refine_request(prepared_req))
+        print(f"Starting refinement: mode={focus_mode}, selected_points={selected_indices}")
+
+        vis_method = active_session["vis_method"]
+        focus_indices = selected_indices
+        focus_summary = {
+            "seed_count": len(selected_indices),
+            "bbox_count": 0,
+            "hd_neighbor_count": 0,
+            "focus_set_size": len(selected_indices),
+            "used_bbox": False,
+        }
+
+        if vis_method == "TimeVis":
+            hd_k = int(active_session.get("vis_config", {}).get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+            focus_indices, focus_summary = build_focus_set(
+                content_path=content_path,
+                vis_method=vis_method,
+                vis_id=active_session["vis_id"],
+                epoch=current_epoch,
+                seed_indices=selected_indices,
+                zoom_bbox=zoom_bbox,
+                hd_k=hd_k,
+            )
+
+        mask = strategy.get_focus_mask(focus_indices)
+        strategy.update_ttav_context(focus_indices, focus_mode, mask)
+
+        if vis_method == "DynaVis":
+            strategy.refine_train(focus_mode=focus_mode)
+            print("Start generating DynaVis visualization results...")
+            visualizer.visualize_all_epochs()
+            print("DynaVis visualization results generated.")
+        elif vis_method in ("DVI", "TimeVis"):
+            print("Start refining visualization model...")
+            strategy.refine(
+                focus_indices=focus_indices,
+                neighbor_indices=[],
+                current_epoch=current_epoch,
+                epochs_to_update=10
+            )
+            # Full re-projection: all points may have moved, so invalidate the
+            # projection-neighbor cache so the next request rebuilds it from scratch.
+            if current_epoch is not None:
+                vis_id = active_session["vis_id"]
+                invalidate_projection_neighbors_cache(
+                    content_path, vis_method, vis_id, current_epoch
+                )
+            print("Refinement finished. Refined projections saved to _refined directory.")
+            # Patch remaining epochs in the background so switching epochs also shows refined results.
+            strategy.patch_other_epochs(skip_epoch=current_epoch)
+        else:
+            visualizer.visualize_all_epochs()
+
+        # Return backend-computed metrics (full-dataset exact computation)
+        return jsonify({
+            "status": "success",
+            "neighbor_preservation": getattr(strategy, '_last_refine_np',    None),
+            "mean_rank_hd":          getattr(strategy, '_last_refine_mrh',   None),
+            "trustworthiness":       getattr(strategy, '_last_refine_trust',  None),
+            "continuity":            getattr(strategy, '_last_refine_cont',   None),
+            "focus_set_size":        focus_summary["focus_set_size"],
+            "focus_seed_count":      focus_summary["seed_count"],
+            "focus_bbox_count":      focus_summary["bbox_count"],
+            "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
+            "focus_indices":         focus_indices,
+        })
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
     finally:
         _refine_lock.release()
-
-
-@app.route('/startRefineSession', methods=['POST'])
-@cross_origin()
-def start_refine_session():
-    req = request.get_json()
-    if not _refine_lock.acquire(blocking=False):
-        return jsonify({"status": "error", "message": "Refinement already in progress"}), 429
-
-    try:
-        prepared_req = _prepare_refine_request(req)
-    except Exception as e:
-        _refine_lock.release()
-        return jsonify({"status": "error", "message": str(e)}), 400
-
-    session_id = str(uuid.uuid4())
-    with _refine_sessions_lock:
-        _refine_sessions[session_id] = {
-            "status": "queued",
-            "projection": None,
-            "projection_version": 0,
-            "steps_completed": 0,
-            "focus_indices": prepared_req["focus_indices"],
-            "training_context_indices": [],
-            "patch_indices": [],
-            "bbox_indices": prepared_req.get("bbox_indices", []),
-            "timings": None,
-            "sampled_metrics": None,
-            "stop_requested": False,
-            "result": None,
-            "resolved_refine_behavior": prepared_req.get("resolved_refine_behavior"),
-            "error": None,
-        }
-
-    worker = threading.Thread(
-        target=_run_refine_session_worker,
-        args=(session_id, prepared_req),
-        daemon=True,
-    )
-    worker.start()
-
-    return jsonify({
-        "status": "success",
-        "session_id": session_id,
-        "focus_indices": prepared_req["focus_indices"],
-        "focus_set_strategy": prepared_req["focus_summary"].get("focus_set_strategy"),
-        "bbox_indices": prepared_req.get("bbox_indices", []),
-        "resolved_refine_behavior": prepared_req.get("resolved_refine_behavior"),
-    })
-
-
-@app.route('/getRefineSessionProgress', methods=['POST'])
-@cross_origin()
-def get_refine_session_progress():
-    req = request.get_json()
-    session_id = req.get("session_id")
-    since_version = int(req.get("since_version", -1))
-
-    with _refine_sessions_lock:
-        session = _refine_sessions.get(session_id)
-        if session is None:
-            return jsonify({"status": "error", "message": "Unknown refine session"}), 404
-        projection = session.get("projection")
-        projection_version = session.get("projection_version", 0)
-        response = {
-            "status": session.get("status", "unknown"),
-            "steps_completed": session.get("steps_completed", 0),
-            "projection_version": projection_version,
-            "focus_indices": session.get("focus_indices", []),
-            "training_context_indices": session.get("training_context_indices", []),
-            "patch_indices": session.get("patch_indices", []),
-            "bbox_indices": session.get("bbox_indices", []),
-            "timings": session.get("timings"),
-            "sampled_metrics": session.get("sampled_metrics"),
-            "stop_requested": bool(session.get("stop_requested", False)),
-            "resolved_refine_behavior": session.get("resolved_refine_behavior"),
-            "result": session.get("result"),
-            "error": session.get("error"),
-        }
-        if projection is not None and projection_version != since_version:
-            response["projection"] = projection.tolist() if isinstance(projection, np.ndarray) else projection
-
-    return jsonify(response)
-
-
-@app.route('/stopRefineSession', methods=['POST'])
-@cross_origin()
-def stop_refine_session():
-    req = request.get_json()
-    session_id = req.get("session_id")
-
-    with _refine_sessions_lock:
-        session = _refine_sessions.get(session_id)
-        if session is None:
-            return jsonify({"status": "error", "message": "Unknown refine session"}), 404
-        session["stop_requested"] = True
-        if session.get("status") in ("queued", "running"):
-            session["status"] = "stopping"
-
-    return jsonify({"status": "success", "session_id": session_id, "stop_requested": True})
-
+    
+    
 
 @app.route('/startVisualizing', methods = ["POST"])
 def start_visualizing():
@@ -440,8 +540,7 @@ def start_visualizing():
     Modified start endpoint to register the active session.
     """
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
-    req['content_path'] = content_path
+    content_path = req['content_path']
     # ... other params ...
     vis_method = req['vis_method']
     vis_id = req['vis_id'] or "0"
@@ -485,7 +584,7 @@ Response:
 @app.route('/getTrainingProcessInfo', methods=["GET"])
 @cross_origin()
 def get_training_process_info():
-    content_path = normalize_content_path(request.args.get('content_path'))
+    content_path = request.args.get('content_path')
     
     epochs_dir = os.path.join(content_path, 'epochs')
     available_epochs = []
@@ -542,7 +641,7 @@ Response:
 @cross_origin()
 def update_projection():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -581,7 +680,7 @@ Response:
 @app.route('/getAllText', methods = ["POST"])
 def get_all_text():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
 
     text_list = get_all_texts(content_path)
     token_list_path = os.path.join(content_path, 'dataset', 'token_list.json')
@@ -612,6 +711,11 @@ def register_eif_bundle():
     vis_method = str(req.get("vis_method", "TimeVis")).strip() or "TimeVis"
     vis_id = str(req.get("vis_id", "1")).strip() or "1"
     overwrite = bool(req.get("overwrite", True))
+    build_trainable_session = bool(req.get("build_trainable_session", False))
+    wait_until_ready = bool(req.get("wait_until_ready", False))
+    data_type = str(req.get("data_type", "Text")).strip() or "Text"
+    task_type = str(req.get("task_type", "Alignment")).strip() or "Alignment"
+    vis_config = req.get("vis_config", {"gpu_id": -1}) or {"gpu_id": -1}
 
     if not sample_id:
         return jsonify({"status": "error", "message": "sample_id is required"}), 400
@@ -636,7 +740,39 @@ def register_eif_bundle():
     method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}"
     refined_method_dir = target_dir / "visualize" / f"{vis_method}_{vis_id}_refined"
 
+    current_status = _read_eif_session_status(str(target_dir), sample_id=sample_id, vis_method=vis_method, vis_id=vis_id)
     if method_dir.exists() and not overwrite:
+        if build_trainable_session and not _is_trainable_session_ready(str(target_dir), vis_method, vis_id):
+            if wait_until_ready:
+                current_status = _build_trainable_session(
+                    str(target_dir),
+                    sample_id,
+                    vis_method,
+                    vis_id,
+                    vis_config,
+                    data_type=data_type,
+                    task_type=task_type,
+                )
+            elif current_status.get("trainable_session_status") != "building":
+                _write_eif_session_status(str(target_dir), {
+                    "sample_id": sample_id,
+                    "content_path": str(target_dir),
+                    "vis_method": vis_method,
+                    "vis_id": vis_id,
+                    "trainable_session_status": "building",
+                    "message": "Fitting adaptive refine session to EIF projection...",
+                })
+                _start_trainable_session_build(
+                    str(target_dir),
+                    sample_id,
+                    vis_method,
+                    vis_id,
+                    vis_config,
+                    data_type=data_type,
+                    task_type=task_type,
+                )
+            current_status = _read_eif_session_status(str(target_dir), sample_id=sample_id, vis_method=vis_method, vis_id=vis_id)
+
         return jsonify({
             "status": "success",
             "sample_id": sample_id,
@@ -645,7 +781,11 @@ def register_eif_bundle():
             "vis_method": vis_method,
             "vis_id": vis_id,
             "cached": True,
+            "trainableSessionStatus": current_status.get("trainable_session_status", "registered"),
+            "refineReady": bool(current_status.get("refine_ready", False)),
+            "statusMessage": current_status.get("message"),
         })
+
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
@@ -667,8 +807,11 @@ def register_eif_bundle():
         "model": bundle.get("model", "EIFTokenBundle"),
         "classes": classes,
         "eif_bundle": True,
+        "refine_capable": True,
         "sample_id": sample_id,
         "prompt_len": bundle.get("prompt_len"),
+        "trainable_session_status": "registered",
+        "refine_ready": False,
     }
 
     with open(dataset_dir / "info.json", "w", encoding="utf-8") as f:
@@ -704,14 +847,55 @@ def register_eif_bundle():
         "content_path": str(target_dir),
         "vis_method": vis_method,
         "vis_id": vis_id,
-        "data_type": "Text",
-        "task_type": "Alignment",
-        "vis_config": req.get("vis_config", {"gpu_id": -1}),
+        "data_type": data_type,
+        "task_type": task_type,
+        "vis_config": vis_config,
         "sample_id": sample_id,
         "eif_bundle": True,
+        "trainable_session_status": "registered",
+        "refine_ready": False,
     }
     with open(target_dir / "visualize" / f"{vis_method}_{vis_id}" / "info.json", "w", encoding="utf-8") as f:
         json.dump(vis_info, f, indent=2, ensure_ascii=False)
+
+    current_status = _write_eif_session_status(str(target_dir), {
+        "sample_id": sample_id,
+        "content_path": str(target_dir),
+        "vis_method": vis_method,
+        "vis_id": vis_id,
+        "trainable_session_status": "registered",
+        "message": "EIF bundle uploaded successfully.",
+    })
+
+    if build_trainable_session:
+        if wait_until_ready:
+            current_status = _build_trainable_session(
+                str(target_dir),
+                sample_id,
+                vis_method,
+                vis_id,
+                vis_config,
+                data_type=data_type,
+                task_type=task_type,
+            )
+        else:
+            current_status = _write_eif_session_status(str(target_dir), {
+                "sample_id": sample_id,
+                "content_path": str(target_dir),
+                "vis_method": vis_method,
+                "vis_id": vis_id,
+                "trainable_session_status": "building",
+                "message": "Fitting adaptive refine session to EIF projection...",
+            })
+            _start_trainable_session_build(
+                str(target_dir),
+                sample_id,
+                vis_method,
+                vis_id,
+                vis_config,
+                data_type=data_type,
+                task_type=task_type,
+            )
 
     return jsonify({
         "status": "success",
@@ -720,12 +904,38 @@ def register_eif_bundle():
         "num_points": num_points,
         "vis_method": vis_method,
         "vis_id": vis_id,
+        "trainableSessionStatus": current_status.get("trainable_session_status", "registered"),
+        "refineReady": bool(current_status.get("refine_ready", False)),
+        "statusMessage": current_status.get("message"),
+    })
+
+
+@app.route('/getEIFBundleStatus', methods=['POST'])
+@cross_origin()
+def get_eif_bundle_status():
+    req = request.get_json() or {}
+    content_path = str(req.get("content_path", "")).strip()
+    if not content_path:
+        return jsonify({"status": "error", "message": "content_path is required"}), 400
+
+    vis_method = str(req.get("vis_method", "TimeVis")).strip() or "TimeVis"
+    vis_id = str(req.get("vis_id", "1")).strip() or "1"
+    status_payload = _read_eif_session_status(content_path, vis_method=vis_method, vis_id=vis_id)
+    status_payload["refine_ready"] = _is_trainable_session_ready(content_path, vis_method, vis_id)
+    status_payload["trainable_session_status"] = "ready" if status_payload["refine_ready"] else status_payload.get("trainable_session_status", "registered")
+    return jsonify({
+        "status": "success",
+        "eifBundle": True,
+        "trainableSessionStatus": status_payload["trainable_session_status"],
+        "refineReady": bool(status_payload["refine_ready"]),
+        "eifSessionInfo": status_payload,
+        "message": status_payload.get("message", "EIF bundle status fetched."),
     })
 
 @app.route('/getAlignment', methods = ["POST"])
 def get_alignment():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
 
     alignment = get_alignment_data(content_path)
 
@@ -753,7 +963,7 @@ Response:
 @cross_origin()
 def get_attributes():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     epoch = req['epoch']
     attributes = req['attributes']
 
@@ -780,7 +990,7 @@ Response:
 @cross_origin()
 def get_simple_filter_result():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     epoch = int(req['epoch'])
     filters = req['filters']
 
@@ -812,7 +1022,7 @@ Response:
 @cross_origin()
 def get_background():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -839,7 +1049,7 @@ Response:
 @cross_origin()
 def get_image_data():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     if('index' not in req):
         return make_response(jsonify({'image_base64': ''}), 200)
     
@@ -871,7 +1081,7 @@ Response:
 @cross_origin()
 def get_text_data():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     if('index' not in req):
         return make_response(jsonify({'text': ''}), 200)
     
@@ -903,7 +1113,7 @@ Response:
 @cross_origin()
 def get_original_neighbors():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     epoch = int(req['epoch'])
     
     try:
@@ -930,7 +1140,7 @@ Response:
 @cross_origin()
 def get_projection_neighbors():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -971,7 +1181,7 @@ def get_projection_neighbors():
 @cross_origin()
 def get_visualize_metrics():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     vis_id = req['vis_id']
     epoch = int(req['epoch'])
     vis_method = req['vis_method']
@@ -984,50 +1194,11 @@ def get_visualize_metrics():
         return make_response(jsonify({'error_message': 'Error in calculating metrics'}), 400)
 
 
-@app.route('/getRefineMetrics', methods=["POST"])
-@cross_origin()
-def get_refine_metrics():
-    req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
-    vis_id = req['vis_id']
-    epoch = int(req['epoch'])
-    vis_method = req['vis_method']
-    refine_flag = bool(req.get('refine_flag', False))
-    blend_bbox = req.get('blend_bbox')
-    blend_decay_ratio = float(req.get('blend_decay_ratio', REFINE_RUNTIME_DEFAULTS['blend_decay_ratio']))
-    blend_focus_indices = req.get('blend_focus_indices') or []
-    focus_indices = req.get('focus_indices') or []
-
-    try:
-        if blend_bbox is not None or blend_focus_indices:
-            projection = build_runtime_blended_projection(
-                content_path,
-                vis_method,
-                vis_id,
-                epoch,
-                blend_bbox,
-                decay_ratio=blend_decay_ratio,
-                focus_indices=blend_focus_indices,
-            )
-        else:
-            projection = load_projection(content_path, vis_method, vis_id, epoch, refine_flag=refine_flag)
-        metrics = calculate_refine_metrics_for_projection(
-            content_path,
-            epoch,
-            projection,
-            focus_indices,
-        )
-        return make_response(jsonify(metrics), 200)
-    except Exception as e:
-        print(e)
-        return make_response(jsonify({'error_message': 'Error in calculating refine metrics'}), 400)
-
-
 @app.route('/getInfluenceSamples', methods=["POST"])
 @cross_origin()
 def get_influence_samples():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     epoch = int(req['epoch'])
     training_event = req['training_event']
     num_samples = int(req['num_samples'])
@@ -1055,7 +1226,7 @@ def get_influence_samples():
 @cross_origin()
 def calculate_training_events():
     req = request.get_json()
-    content_path = normalize_content_path(req['content_path'])
+    content_path = req['content_path']
     epoch = int(req['epoch'])
     event_types = req['event_types']
 
@@ -1073,7 +1244,6 @@ def calculate_training_events():
 def check_port_inuse(port, host):
     import socket
 
-    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)

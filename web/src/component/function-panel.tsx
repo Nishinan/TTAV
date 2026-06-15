@@ -17,6 +17,8 @@ interface LabelProps {
 
 interface FunctionPanelProps {
     onUpdateProjection: () => Promise<void>;
+    refineReady?: boolean;
+    refineStatusMessage?: string | null;
 }
 const CompactCheckboxGroup = styled(Checkbox.Group)`
   display: flex;
@@ -103,7 +105,7 @@ function hexToRgbArray(hex: string): [number, number, number] {
     return [r, g, b];
 }
 
-export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
+export function FunctionPanel({ onUpdateProjection, refineReady = true, refineStatusMessage = null }: FunctionPanelProps) {
     const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode, epoch, allEpochData } =
         useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode", "epoch", "allEpochData"]);
     const { refineMetrics } = useDefaultStore(['refineMetrics']);
@@ -366,6 +368,7 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
         block 
         size="small"
         icon={<SyncOutlined />}
+        disabled={!refineReady}
         // 调用从父组件 AppCombinedView 传下来的异步处理函数
         onClick={onUpdateProjection}
         style={{ 
@@ -374,8 +377,13 @@ export function FunctionPanel({ onUpdateProjection }: FunctionPanelProps) {
             fontWeight: 500 
         }}
     >
-        Update Projection
+        {refineReady ? 'Update Projection' : 'Preparing Adaptive Refine...'}
     </Button>
+    {!refineReady && refineStatusMessage && (
+        <div className='alt-text' style={{ fontSize: '11px', lineHeight: '1.4', marginTop: '8px', color: '#888' }}>
+            {refineStatusMessage}
+        </div>
+    )}
 </FunctionalBlock>
             <FunctionalBlock label="Refine Quality">
                 {refineMetrics ? (

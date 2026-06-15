@@ -14,6 +14,17 @@ export interface ViewportBBox {
     yMax: number;
 }
 
+export interface EIFSessionInfo {
+    sample_id: string;
+    content_path: string;
+    vis_method: string;
+    vis_id: string;
+    trainable_session_status: string;
+    refine_ready: boolean;
+    message: string;
+    updated_at: number;
+}
+
 /**
  * Interfaces
  */
@@ -86,56 +97,22 @@ export function updateFocusContext(
     return basicPostWithJsonResponse('/updateFocusContext', data, options);
 }
 
-export function startRefineSession(
-    contentPath: string,
-    selectedIndices: number[],
-    focusMode: string,
-    currentEpoch?: number,
-    zoomBBox?: ViewportBBox | null,
-    options?: NetworkOptions
-) {
-    const data: Record<string, any> = {
-        "content_path": contentPath,
-        "selected_indices": selectedIndices,
-        "focus_mode": focusMode,
-    };
-    if (currentEpoch !== undefined) {
-        data["current_epoch"] = currentEpoch;
-    }
-    if (zoomBBox) {
-        data["zoom_bbox"] = {
-            "x_min": zoomBBox.xMin,
-            "x_max": zoomBBox.xMax,
-            "y_min": zoomBBox.yMin,
-            "y_max": zoomBBox.yMax,
-        };
-    }
-    return basicPostWithJsonResponse('/startRefineSession', data, options);
-}
-
-export function getRefineSessionProgress(
-    sessionId: string,
-    sinceVersion: number = -1,
-    options?: NetworkOptions
-) {
-    return basicPostWithJsonResponse('/getRefineSessionProgress', {
-        "session_id": sessionId,
-        "since_version": sinceVersion,
-    }, options);
-}
-
-export function stopRefineSession(
-    sessionId: string,
-    options?: NetworkOptions
-) {
-    return basicPostWithJsonResponse('/stopRefineSession', {
-        "session_id": sessionId,
-    }, options);
-}
-
 export async function syncSession(config: any): Promise<any> {
     // 这里的路由名需要和 Python server 中的 @app.route('/syncSession') 对应
     return basicPostWithJsonResponse('/syncSession', config);
+}
+
+export async function getEIFBundleStatus(
+    contentPath: string,
+    visMethod: string,
+    visID: string,
+    options?: NetworkOptions
+): Promise<any> {
+    return basicPostWithJsonResponse('/getEIFBundleStatus', {
+        content_path: contentPath,
+        vis_method: visMethod,
+        vis_id: visID,
+    }, options);
 }
 /**
  * Backend API functions
@@ -161,7 +138,7 @@ export function triggerStartVisualizing(
 }
 
 export function fetchTrainingProcessInfo(contentPath: string, options?: NetworkOptions) {
-    return basicGetWithJsonResponse(`/getTrainingProcessInfo?content_path=${encodeURIComponent(contentPath)}`, options);
+    return basicGetWithJsonResponse(`/getTrainingProcessInfo?content_path=${contentPath}`, options);
 }
 
 export async function fetchEpochProjection(
@@ -308,43 +285,6 @@ export function getVisualizeMetrics(
         "epoch": `${epoch}`
     };
     return basicPostWithJsonResponse('/getVisualizeMetrics', data, options);
-}
-
-export function getRefineMetrics(
-    contentPath: string,
-    vis_method: string,
-    vis_id: string,
-    epoch: number,
-    focusIndices: number[],
-    refineFlag: boolean = false,
-    blendBBox?: ViewportBBox | null,
-    blendFocusIndices?: number[] | null,
-    blendDecayRatio?: number,
-    options?: NetworkOptions
-) {
-    const data: Record<string, any> = {
-        "content_path": contentPath,
-        "vis_method": vis_method,
-        "vis_id": vis_id,
-        "epoch": epoch,
-        "focus_indices": focusIndices,
-        "refine_flag": refineFlag,
-    };
-    if (blendBBox) {
-        data["blend_bbox"] = {
-            "x_min": blendBBox.xMin,
-            "x_max": blendBBox.xMax,
-            "y_min": blendBBox.yMin,
-            "y_max": blendBBox.yMax,
-        };
-    }
-    if (blendFocusIndices && blendFocusIndices.length > 0) {
-        data["blend_focus_indices"] = blendFocusIndices;
-    }
-    if (blendDecayRatio !== undefined) {
-        data["blend_decay_ratio"] = blendDecayRatio;
-    }
-    return basicPostWithJsonResponse('/getRefineMetrics', data, options);
 }
 
 export function getInfluenceSamples(

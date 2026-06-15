@@ -1,6 +1,7 @@
 from typing import Optional, Dict, Any
 import torch
 import os
+import json
 from .scripts.hparams import HParams
 from .scripts.train_motion import main as train_motion_main
 from .scripts.train_motion import train_refined 
@@ -15,7 +16,7 @@ class DynaVisRunner:
         self.vis_config = vis_config or {}
 
         defaults = {
-            "D": 128,
+            "D": 512,
             "d": 2,
             "bs": 32,
             "lr_ae": 1e-3,
@@ -43,6 +44,23 @@ class DynaVisRunner:
         }
 
         cfg = {**defaults, **self.vis_config}
+
+        # L2-normalized ReLU features can be sparse; robust/IQR normalization may divide by
+        # near-zero per-dimension IQR and explode otherwise unit-norm inputs.
+        info_path = os.path.join(self.content_path, "dataset", "info.json")
+        if "norm_mode" not in self.vis_config and os.path.isfile(info_path):
+            try:
+                with open(info_path, "r") as f:
+                    info = json.load(f)
+                norm_note = str(info.get("normalization", "")).lower()
+                repr_note = str(info.get("representation", "")).lower()
+                if "l2" in norm_note or "l2-normalized" in repr_note:
+                    cfg["norm_mode"] = "center_only"
+                    cfg["std_clip_low"] = 1.0
+                    print(f"[DynaVisRunner] detected L2-normalized embeddings; using norm_mode=center_only for {self.content_path}")
+            except Exception as e:
+                print(f"[DynaVisRunner] warning: failed to inspect info.json for normalization mode: {e}")
+
         data_dir = os.path.join(self.content_path, "epochs")
         if "D" not in self.vis_config:
             if "dimension" in cfg:

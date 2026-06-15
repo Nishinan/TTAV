@@ -8,13 +8,27 @@ from server_utils import generate_dimension_array
 #                     filename='app.log', filemode='w')
 
 def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vis_config):
+    saved_vis_config = {}
+    vis_info_path = os.path.join(content_path, "visualize", f"{vis_method}_{vis_id}", "info.json")
+    if os.path.exists(vis_info_path):
+        try:
+            with open(vis_info_path, "r", encoding="utf-8") as f:
+                vis_info = json.load(f)
+            if isinstance(vis_info.get("vis_config"), dict):
+                saved_vis_config = vis_info["vis_config"]
+        except Exception as exc:
+            print(f"Failed to load saved vis_config from {vis_info_path}: {exc}")
+
     config = {}
     config["content_path"] = content_path
     config["vis_method"] = vis_method
     config["vis_id"] = vis_id
     config["data_type"] = data_type
     config["task_type"] = task_type
-    config["vis_config"] = vis_config
+    config["vis_config"] = {
+        **saved_vis_config,
+        **(vis_config or {}),
+    }
     
     with open(os.path.join(content_path, 'dataset', 'info.json')) as f:
         dataset_info = json.load(f)
@@ -46,13 +60,20 @@ def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vi
             
     # vis_model dims
     if vis_method == "DVI" or vis_method == "TimeVis" or vis_method == "DynaVis":
-        epoch_0 = available_epochs[0]
-        embedding_path = os.path.join(content_path, 'epochs', f'epoch_{epoch_0}', 'embeddings.npy')
-        embedding = np.load(embedding_path)
-        encoder_dims, decoder_dims = generate_dimension_array(embedding.shape[1])
-        config['vis_config']['dimension'] = embedding.shape[1]
-        config['vis_config']['encoder_dims'] = encoder_dims
-        config['vis_config']['decoder_dims'] = decoder_dims
+        vc = config['vis_config']
+        reuse_existing_dims = (
+            isinstance(vc.get('encoder_dims'), list)
+            and isinstance(vc.get('decoder_dims'), list)
+            and isinstance(vc.get('dimension'), int)
+        )
+        if not reuse_existing_dims:
+            epoch_0 = available_epochs[0]
+            embedding_path = os.path.join(content_path, 'epochs', f'epoch_{epoch_0}', 'embeddings.npy')
+            embedding = np.load(embedding_path)
+            encoder_dims, decoder_dims = generate_dimension_array(embedding.shape[1])
+            config['vis_config']['dimension'] = embedding.shape[1]
+            config['vis_config']['encoder_dims'] = encoder_dims
+            config['vis_config']['decoder_dims'] = decoder_dims
         
         # resolution_str = config['vis_config']['resolution']
         # r = resolution_str.split(",")
@@ -72,6 +93,16 @@ def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vi
         vc['s_n_epochs'] = 500
     if 'b_n_epochs' not in vc:
         vc['b_n_epochs'] = 0
+    if 'refine_max_steps' not in vc:
+        vc['refine_max_steps'] = 800
+    if 'refine_min_steps' not in vc:
+        vc['refine_min_steps'] = 800
+    if 'refine_patience' not in vc:
+        vc['refine_patience'] = 0
+    if 'refine_loss_min_delta' not in vc:
+        vc['refine_loss_min_delta'] = 1e-4
+    if 'refine_time_limit_s' not in vc:
+        vc['refine_time_limit_s'] = 0.0
 
     # 特定方法的默认值
     if vis_method == "TimeVis":

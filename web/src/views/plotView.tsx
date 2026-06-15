@@ -58,6 +58,26 @@ function normalizeSelectedIndices(value: number[] | undefined): number[] {
     return Array.from(deduped).sort((a, b) => a - b);
 }
 
+function normalizeEIFSessionInfo(response: any) {
+    const info = response?.eifSessionInfo;
+    if (response?.eifBundle !== true || !info || typeof info !== 'object') {
+        return null;
+    }
+
+    return {
+        isEifBundle: true,
+        sampleId: typeof info.sample_id === 'string' ? info.sample_id : '',
+        trainableSessionStatus: typeof response.trainableSessionStatus === 'string'
+            ? response.trainableSessionStatus
+            : (typeof info.trainable_session_status === 'string' ? info.trainable_session_status : 'registered'),
+        refineReady: response.refineReady === true || info.refine_ready === true,
+        message: typeof response.message === 'string'
+            ? response.message
+            : (typeof info.message === 'string' ? info.message : 'Adaptive refine session is still preparing.'),
+        updatedAt: typeof info.updated_at === 'number' ? info.updated_at : Date.now(),
+    };
+}
+
 // // 1. 定义接口，明确告诉 TypeScript 这个组件接受什么属性
 // interface FunctionViewPanelsProps {
 //     onFocusModeChange: (mode: string) => Promise<void>;
@@ -65,9 +85,8 @@ function normalizeSelectedIndices(value: number[] | undefined): number[] {
 // 修改 Props 接口，增加 onUpdateProjection
 interface FunctionViewPanelsProps {
     onUpdateProjection: () => Promise<void>;
-    onStopRefine: () => Promise<void>;
-    isRefining: boolean;
-    stopPending: boolean;
+    refineReady?: boolean;
+    refineStatusMessage?: string | null;
 }
 
 
@@ -206,8 +225,8 @@ const initStaticContext = async (contentPath: string, dataType: string) => {
 };
 
 /**
- * Evaluate displacement-oriented quality on the currently displayed view.
- * Structural metrics are computed by the backend against the same projection.
+ * Evaluate projection quality after refinement.
+ * Reports focus displacement, global drift, neighbor preservation, and trustworthiness.
  */
 export const evaluateProjectionQuality = async (
     epochNum: number,
@@ -264,14 +283,96 @@ export const evaluateProjectionQuality = async (
     });
     const avgGlobalDrift = globalDrift / (nonFocusCount || 1);
 
+    // --- Dim 3: Neighbor Preservation ---
+    // How many of the post-refine low-D neighbors are also high-D neighbors?
+    // Both originalNeighbors and projectionNeighbors store proj-position indices (0..N-1),
+    // because both are built on arrays re-ordered by index.json on the backend.
+    // No rawIdx→pos conversion is needed here.
+    const highNeighborsNC = oldData.originalNeighbors || [];
+    const newLowNeighbors = newData.projectionNeighbors || [];
+
+
+
+    let neighborConsistency = 0;
+    let ncCount = 0;
+    selectedIndices.forEach(rawIdx => {
+        const pos = toPos(rawIdx);
+        const highList: number[] = highNeighborsNC[pos] || [];
+        const lowList:  number[] = newLowNeighbors[pos] || [];
+        if (highList.length === 0 || lowList.length === 0) return;
+
+        const k = Math.min(highList.length, lowList.length);
+        const highSet = new Set(highList.slice(0, k));
+        const intersection = lowList.slice(0, k).filter(p => highSet.has(p));
+        neighborConsistency += intersection.length / k;
+        ncCount++;
+    });
+    const avgNeighborConsistency = ncCount > 0 ? neighborConsistency / ncCount : 0;
+
+    // --- Dim 4: Trustworthiness ---
+    // T = 1 - (2 / n·k·(2n-3k-1)) × Σ_i Σ_{j∈U_i} (r(i,j) - k)
+    // U_i = points in low-D neighborhood but not in high-D neighborhood.
+    // Both neighbor lists use the same proj-position index space — no conversion needed.
+    const highNeighborsTrust = oldData.originalNeighbors || [];
+    const lowNeighborsTrust  = newData.projectionNeighbors || [];
+
+    let trustSum = 0;
+    let trustCount = 0;
+    let continuitySum = 0;
+    let continuityCount = 0;
+    const N = newProj.length;
+
+    selectedIndices.forEach(rawIdx => {
+        const pos = toPos(rawIdx);
+        const highList: number[] = highNeighborsTrust[pos] || [];
+        const lowList:  number[] = lowNeighborsTrust[pos]  || [];
+        if (highList.length === 0 || lowList.length === 0) return;
+
+        const k = Math.min(highList.length, lowList.length);
+        const highSet = new Set(highList.slice(0, k));
+
+        // Penalty: low-D neighbor j not found in high-D top-k
+        let penalty = 0;
+        lowList.slice(0, k).forEach(j => {
+            if (!highSet.has(j)) {
+                const rank = highList.indexOf(j);
+                const r = rank === -1 ? highList.length + 1 : rank + 1;
+                penalty += (r - k);
+            }
+        });
+
+        const norm = k * (2 * N - 3 * k - 1) / 2;
+        trustSum += norm > 0 ? 1 - penalty / norm : 1;
+        trustCount++;
+
+        let continuityPenalty = 0;
+        highList.slice(0, k).forEach(j => {
+            if (!lowList.slice(0, k).includes(j)) {
+                const rank = lowList.indexOf(j);
+                const r = rank === -1 ? lowList.length + 1 : rank + 1;
+                continuityPenalty += (r - k);
+            }
+        });
+        continuitySum += norm > 0 ? 1 - continuityPenalty / norm : 1;
+        continuityCount++;
+    });
+    const avgTrustworthiness = trustCount > 0 ? trustSum / trustCount : 1;
+    const avgContinuity = continuityCount > 0 ? continuitySum / continuityCount : 1;
+
     console.log("-----------------------------------------");
     console.log(`> Focus Displacement: ${avgFocusShift.toFixed(4)}`);
     console.log(`> Global Drift: ${avgGlobalDrift.toFixed(4)}`);
+    console.log(`> Neighbor Preservation: ${(avgNeighborConsistency * 100).toFixed(2)}%`);
+    console.log(`> Trustworthiness: ${(avgTrustworthiness * 100).toFixed(2)}%`);
+    console.log(`> Continuity: ${(avgContinuity * 100).toFixed(2)}%`);
     console.log("-----------------------------------------");
 
     return {
         avgFocusShift,
         avgGlobalDrift,
+        avgNeighborConsistency,
+        avgTrustworthiness,
+        avgContinuity,
     };
 };
 
@@ -379,10 +480,12 @@ const refreshEpochData = async (
 function MessageHandler() {
     // State from unified store
     const {
+        contentPath, visID, vis_method, dataType, taskType, eifSessionInfo,
         setContentPath, setAvailableEpochs, setDataType, setTaskType,
         setTextData, setTokenList, setInherentLabelData,
         setColorDict, setLabelDict, setProgress, setValue, setSelectedIndices, setHoveredIndex,
     } = useDefaultStore([
+        'contentPath', 'visID', 'vis_method', 'dataType', 'taskType', 'eifSessionInfo',
         'setContentPath', 'setAvailableEpochs', 'setDataType', 'setTaskType',
         'setTextData', 'setTokenList', 'setInherentLabelData',
         'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices', 'setHoveredIndex'
@@ -436,6 +539,8 @@ function MessageHandler() {
 
         if (response.status === "success") {
             message.success({ content: 'Backend Session Resumed!', key: 'sync_task' });
+            const normalizedEIFSessionInfo = normalizeEIFSessionInfo(response);
+            setValue('eifSessionInfo', normalizedEIFSessionInfo);
             // 更新当前路径等基础状态，确保后续 Update 正常
             setContentPath(contentPath);
             setDataType(dataType as 'Text' | 'Image');
@@ -486,10 +591,11 @@ function MessageHandler() {
             }
 
             // 4. 同步后端 Session
-            await BackendAPI.syncSession({
+            const syncResponse = await BackendAPI.syncSession({
                 content_path: contentPath, vis_method: visualizationMethod, vis_id: visualizationID,
                 data_type: dataType, task_type: taskType, vis_config: visConfig
             });
+            setValue('eifSessionInfo', normalizeEIFSessionInfo(syncResponse));
 
             // 5. 更新 store，确保后续 handleUpdate 能拿到正确的 vis_method / visID
             setContentPath(contentPath);
@@ -563,6 +669,70 @@ function MessageHandler() {
         return () => window.removeEventListener('message', handleMessage);
     }, []);
 
+    const eifReadyReloadRef = useRef(new Set<string>());
+
+    useEffect(() => {
+        if (!eifSessionInfo?.isEifBundle || eifSessionInfo.refineReady || !contentPath || !vis_method || !visID) {
+            return;
+        }
+
+        const reloadKey = `${contentPath}::${vis_method}::${visID}`;
+        let active = true;
+        let intervalId: number | null = null;
+
+        const pollStatus = async () => {
+            try {
+                const response = await BackendAPI.getEIFBundleStatus(contentPath, vis_method, visID);
+                if (!active || response?.status !== 'success') return;
+
+                const normalizedEIFSessionInfo = normalizeEIFSessionInfo(response);
+                setValue('eifSessionInfo', normalizedEIFSessionInfo);
+
+                if (normalizedEIFSessionInfo?.refineReady && !eifReadyReloadRef.current.has(reloadKey)) {
+                    eifReadyReloadRef.current.add(reloadKey);
+                    message.loading({
+                        content: 'Adaptive refine session is ready. Refreshing projection...',
+                        key: 'eif_refine_ready_reload',
+                        duration: 0,
+                    });
+                    const reloaded = await handleLoadVisualization(
+                        contentPath,
+                        vis_method,
+                        visID,
+                        dataType,
+                        taskType,
+                        { gpu_id: -1 }
+                    );
+                    if (reloaded) {
+                        message.success({
+                            content: 'Adaptive refine session is ready. Projection refreshed.',
+                            key: 'eif_refine_ready_reload',
+                        });
+                    } else {
+                        message.warning({
+                            content: 'Adaptive refine session is ready, but the automatic refresh failed.',
+                            key: 'eif_refine_ready_reload',
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('[TTAV] Failed to poll EIF bundle status:', error);
+            }
+        };
+
+        void pollStatus();
+        intervalId = window.setInterval(() => {
+            void pollStatus();
+        }, 3000);
+
+        return () => {
+            active = false;
+            if (intervalId !== null) {
+                window.clearInterval(intervalId);
+            }
+        };
+    }, [contentPath, dataType, eifSessionInfo, setValue, taskType, visID, vis_method]);
+
     useEffect(() => {
         const payload = parseEIFJumpPayloadFromLocation();
         if (!payload?.contentPath) return;
@@ -607,7 +777,7 @@ export function AppCombinedView() {
         setValue,
         focusMode,
         currentViewportBBox,
-        setHoveredIndex,
+        eifSessionInfo,
     } = useDefaultStore([
         'contentPath',
         'selectedIndices',
@@ -618,7 +788,7 @@ export function AppCombinedView() {
         'setValue',
         'focusMode',
         'currentViewportBBox',
-        'setHoveredIndex',
+        'eifSessionInfo',
     ]);
 // 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
     const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
@@ -665,62 +835,13 @@ export function AppCombinedView() {
          
 
     const isRefining = useRef(false);
-    const [isRefineActive, setIsRefineActive] = useState(false);
-    const [activeRefineSessionId, setActiveRefineSessionId] = useState<string | null>(null);
-    const [stopPending, setStopPending] = useState(false);
     const REFINE_MSG_KEY = 'ttav_refine_loading';
 
-    const updateDisplayedRefineMetrics = async (
-        focusIndicesForMetrics: number[],
-        oldData: any,
-        newData: any,
-        sampledMetrics: any | null,
-    ) => {
-        const metrics = await evaluateProjectionQuality(epoch, focusIndicesForMetrics, oldData, newData);
-        if (!metrics) return;
-        const previousMetrics = useGlobalStore.getState().refineMetrics;
-        useGlobalStore.getState().setValue('refineMetrics', {
-            focusDisplacement: metrics.avgFocusShift,
-            globalDrift: metrics.avgGlobalDrift,
-            neighborPreservation: sampledMetrics?.neighbor_preservation != null
-                ? sampledMetrics.neighbor_preservation / 100
-                : previousMetrics?.neighborPreservation ?? 0,
-            meanRankHD: sampledMetrics?.mean_rank_hd != null
-                ? sampledMetrics.mean_rank_hd
-                : previousMetrics?.meanRankHD ?? 0,
-            trustworthiness: sampledMetrics?.trustworthiness != null
-                ? sampledMetrics.trustworthiness / 100
-                : previousMetrics?.trustworthiness ?? 0,
-            continuity: sampledMetrics?.continuity != null
-                ? sampledMetrics.continuity / 100
-                : previousMetrics?.continuity ?? 0,
-        });
-    };
-
-    const normalizeStructuralMetrics = (metricsLike: any | null | undefined) => {
-        if (!metricsLike) return null;
-        return {
-            neighbor_preservation: metricsLike.neighbor_preservation ?? metricsLike.neighborPreservation ?? null,
-            mean_rank_hd: metricsLike.mean_rank_hd ?? metricsLike.meanRankHD ?? null,
-            trustworthiness: metricsLike.trustworthiness ?? null,
-            continuity: metricsLike.continuity ?? null,
-        };
-    };
-
-    const handleStopRefine = async () => {
-        if (!activeRefineSessionId || !isRefineActive || stopPending) return;
-        try {
-            setStopPending(true);
-            await BackendAPI.stopRefineSession(activeRefineSessionId);
-            message.loading({ content: 'Stopping refine...', key: REFINE_MSG_KEY, duration: 0 });
-        } catch (error) {
-            console.error("[TTAV] Failed to stop refine session:", error);
-            setStopPending(false);
-            message.error({ content: 'Failed to stop refine session.', key: REFINE_MSG_KEY });
-        }
-    };
-
     const handleUpdate = async () => {
+        if (eifSessionInfo?.isEifBundle && !eifSessionInfo.refineReady) {
+            message.info(eifSessionInfo.message || 'Adaptive refine session is still preparing.');
+            return;
+        }
         if (!selectedIndices || selectedIndices.length === 0) {
             message.warning("Please select points on the canvas first.");
             return;
@@ -731,14 +852,12 @@ export function AppCombinedView() {
             return;
         }
         isRefining.current = true;
-        setIsRefineActive(true);
-        setStopPending(false);
         // Use a stable key so any stale toast from a prior crash is destroyed first
         message.loading({ content: 'Refining layout...', key: REFINE_MSG_KEY, duration: 0 });
 
         try {
             const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
-            const startResponse = await BackendAPI.startRefineSession(
+            const response = await BackendAPI.updateFocusContext(
                 contentPath,
                 selectedIndices,
                 focusMode,
@@ -746,123 +865,14 @@ export function AppCombinedView() {
                 currentViewportBBox
             );
 
-            if (startResponse && startResponse.status === "success") {
-                const sessionId = (startResponse as any).session_id as string;
-                let focusIndices = Array.isArray((startResponse as any).focus_indices)
-                    ? (startResponse as any).focus_indices as number[]
-                    : selectedIndices;
-                let bboxIndices = Array.isArray((startResponse as any).bbox_indices)
-                    ? (startResponse as any).bbox_indices as number[]
-                    : [];
-                let trainingContextIndices: number[] = [];
-                let patchIndices: number[] = [];
-                let lastProjectionVersion = -1;
-                let finalProgress: any = null;
-                let latestSampledMetrics: any = null;
-                let resolvedBehavior: any = (startResponse as any).resolved_refine_behavior ?? null;
-                setActiveRefineSessionId(sessionId);
-
-                const applyIntermediateProjection = (refinedProjection: number[][], latestFocusIndices: number[]) => {
-                    const blendedProjection = buildBlendedProjection(
-                        oldEpochData.projection,
-                        refinedProjection,
-                        currentViewportBBox,
-                        latestFocusIndices,
-                    );
-                    const state = useGlobalStore.getState();
-                    const currentEpochData = state.allEpochData[targetEpoch] || oldEpochData;
-                    state.setValue('focusIndices', latestFocusIndices);
-                    state.setValue('allEpochData', {
-                        ...state.allEpochData,
-                        [targetEpoch]: {
-                            ...currentEpochData,
-                            projection: blendedProjection,
-                        },
-                    });
-                    return {
-                        ...currentEpochData,
-                        projection: blendedProjection,
-                    };
-                };
-
-                const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
-                while (true) {
-                    const progress = await BackendAPI.getRefineSessionProgress(sessionId, lastProjectionVersion);
-                    finalProgress = progress;
-
-                    if (Array.isArray((progress as any).focus_indices) && (progress as any).focus_indices.length > 0) {
-                        focusIndices = (progress as any).focus_indices as number[];
-                    }
-                    if (Array.isArray((progress as any).training_context_indices)) {
-                        trainingContextIndices = (progress as any).training_context_indices as number[];
-                    }
-                    if (Array.isArray((progress as any).patch_indices)) {
-                        patchIndices = (progress as any).patch_indices as number[];
-                    }
-                    if (Array.isArray((progress as any).bbox_indices)) {
-                        bboxIndices = (progress as any).bbox_indices as number[];
-                    }
-                    if ((progress as any).resolved_refine_behavior) {
-                        resolvedBehavior = (progress as any).resolved_refine_behavior;
-                    }
-                    const progressMetrics = normalizeStructuralMetrics(
-                        (progress as any).sampled_metrics
-                        ?? ((progress as any).result ? {
-                            neighbor_preservation: (progress as any).result.neighbor_preservation,
-                            mean_rank_hd: (progress as any).result.mean_rank_hd,
-                            trustworthiness: (progress as any).result.trustworthiness,
-                            continuity: (progress as any).result.continuity,
-                        } : null)
-                    );
-                    if (progressMetrics) {
-                        latestSampledMetrics = progressMetrics;
-                    }
-
-                    if (Array.isArray((progress as any).projection)) {
-                        const liveEpochData = applyIntermediateProjection((progress as any).projection as number[][], focusIndices);
-                        lastProjectionVersion = Number((progress as any).projection_version ?? lastProjectionVersion);
-                        const stepsCompleted = Number((progress as any).steps_completed ?? 0);
-                        const maxSteps = Number(
-                            resolvedBehavior?.stopping?.max_steps
-                            ?? (progress as any)?.resolved_refine_behavior?.stopping?.max_steps
-                            ?? 0
-                        );
-                        await updateDisplayedRefineMetrics(focusIndices, oldEpochData, liveEpochData, latestSampledMetrics);
-                        message.loading({
-                            content: (progress as any).stop_requested
-                                ? `Stopping refine... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps`
-                                : (stepsCompleted > 0 ? `Refining layout... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps` : 'Refining layout...'),
-                            key: REFINE_MSG_KEY,
-                            duration: 0,
-                        });
-                    } else if (latestSampledMetrics) {
-                        const liveEpochData = useGlobalStore.getState().allEpochData[targetEpoch];
-                        if (liveEpochData) {
-                            await updateDisplayedRefineMetrics(focusIndices, oldEpochData, liveEpochData, latestSampledMetrics);
-                        }
-                    }
-
-                    if ((progress as any).status === "completed") {
-                        break;
-                    }
-                    if ((progress as any).status === "failed" || (progress as any).status === "error") {
-                        throw new Error((progress as any).error || 'Refine session failed.');
-                    }
-
-                    await sleep(REFINE_DEFAULTS.progressPollMs);
-                }
-
+            if (response && response.status === "success") {
                 console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
-                console.log("[TTAV] Refine sets:", {
-                    focusCount: focusIndices.length,
-                    bboxCount: bboxIndices.length,
-                    trainingContextCount: trainingContextIndices.length,
-                    patchCount: patchIndices.length,
-                    focusSetStrategy: (startResponse as any).focus_set_strategy,
-                    resolvedBehavior,
-                    timings: (finalProgress as any)?.timings ?? (finalProgress as any)?.result?.timings ?? null,
-                });
+
+                // After refine, only projection coords and low-D neighbors change.
+                // Re-use originalNeighbors/prediction/background from oldEpochData to skip those requests.
+                const focusIndices = Array.isArray((response as any).focus_indices)
+                    ? (response as any).focus_indices as number[]
+                    : selectedIndices;
 
                 const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
                 const refinedProjection = projResp.projection || oldEpochData.projection;
@@ -872,19 +882,11 @@ export function AppCombinedView() {
                     currentVisID,
                     targetEpoch,
                     true,
-                    currentViewportBBox,
-                    focusIndices,
-                    DEFAULT_BLEND_DECAY_RATIO,
                 );
-                const blendedProjection = buildBlendedProjection(
-                    oldEpochData.projection,
-                    refinedProjection,
-                    currentViewportBBox,
-                    focusIndices,
-                );
+
                 const newEpochData = {
                     ...oldEpochData,
-                    projection: blendedProjection,
+                    projection: refinedProjection,
                     projectionNeighbors: projNeighResp.neighbors || oldEpochData.projectionNeighbors,
                     indexList: projNeighResp.index_list || oldEpochData.indexList,
                 };
@@ -893,48 +895,34 @@ export function AppCombinedView() {
                 const state = useGlobalStore.getState();
                 state.setValue('focusIndices', focusIndices);
                 state.setValue('allEpochData', { ...state.allEpochData, [targetEpoch]: newEpochData });
-                if (selectedIndices.length > 0) {
-                    setHoveredIndex(selectedIndices[0]);
-                }
 
-                let backendMetrics: any = normalizeStructuralMetrics((finalProgress as any)?.result);
-                try {
-                    backendMetrics = normalizeStructuralMetrics(await BackendAPI.getRefineMetrics(
-                        contentPath,
-                        vis_method,
-                        currentVisID,
-                        targetEpoch,
-                        focusIndices,
-                        true,
-                        currentViewportBBox,
-                        focusIndices,
-                        DEFAULT_BLEND_DECAY_RATIO,
-                    ));
-                } catch (metricError) {
-                    console.error("[TTAV] Failed to fetch refine metrics; projection update will continue.", metricError);
+                const metrics = await evaluateProjectionQuality(epoch, focusIndices, oldEpochData, newEpochData);
+                if (metrics) {
+                    const r = response as any;
+                    const backendNP = typeof r.neighbor_preservation === 'number' ? r.neighbor_preservation / 100 : metrics.avgNeighborConsistency;
+                    const backendMRH = typeof r.mean_rank_hd === 'number' ? r.mean_rank_hd : 0;
+                    const backendTrust = typeof r.trustworthiness === 'number' ? r.trustworthiness / 100 : metrics.avgTrustworthiness;
+                    const backendCont = typeof r.continuity === 'number' ? r.continuity / 100 : metrics.avgContinuity;
+                    useGlobalStore.getState().setValue('refineMetrics', {
+                        focusDisplacement: metrics.avgFocusShift,
+                        globalDrift: metrics.avgGlobalDrift,
+                        neighborPreservation: backendNP,
+                        meanRankHD: backendMRH,
+                        trustworthiness: backendTrust,
+                        continuity: backendCont,
+                    });
                 }
-                await updateDisplayedRefineMetrics(focusIndices, oldEpochData, newEpochData, backendMetrics);
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, focusIndices, newEpochData.indexList || []);
 
-                const stopReason = (finalProgress as any)?.timings?.stop_reason ?? (finalProgress as any)?.result?.timings?.stop_reason ?? '';
-                const stoppedEarly = typeof stopReason === 'string' && stopReason.startsWith('external_stop');
-                message.success({
-                    content: stoppedEarly
-                        ? `Refine stopped at epoch ${targetEpoch}. Latest blended view saved.`
-                        : `Epoch ${targetEpoch} refined! Blended view updated!`,
-                    key: REFINE_MSG_KEY
-                });
+                message.success({ content: `Epoch ${targetEpoch} refined! Refined projection updated!`, key: REFINE_MSG_KEY });
             } else {
                 message.error({ content: 'Refinement returned unexpected status.', key: REFINE_MSG_KEY });
             }
         } catch (error) {
-            console.error("[TTAV] Update failed with details:", error);
+            console.error("Update failed:", error);
             message.error({ content: 'Failed to update projection.', key: REFINE_MSG_KEY });
         } finally {
             isRefining.current = false;
-            setIsRefineActive(false);
-            setActiveRefineSessionId(null);
-            setStopPending(false);
         }
     };
     // 1. 监听全局选点，确保 selectedIndices 响应
@@ -961,9 +949,8 @@ export function AppCombinedView() {
                 */}
                 <FunctionViewPanels
                     onUpdateProjection={handleUpdate}
-                    onStopRefine={handleStopRefine}
-                    isRefining={isRefineActive}
-                    stopPending={stopPending}
+                    refineReady={!(eifSessionInfo?.isEifBundle) || eifSessionInfo.refineReady}
+                    refineStatusMessage={eifSessionInfo?.isEifBundle && !eifSessionInfo.refineReady ? eifSessionInfo.message : null}
                 />
             </div>
                         </Panel>
@@ -982,7 +969,7 @@ export function AppCombinedView() {
 }
 
 // 2. 修改组件定义，使其接收 Props
-export function FunctionViewPanels({ onUpdateProjection, onStopRefine, isRefining, stopPending }: FunctionViewPanelsProps) {
+export function FunctionViewPanels({ onUpdateProjection, refineReady = true, refineStatusMessage = null }: FunctionViewPanelsProps) {
     const [activeKey, setActiveKey] = useState<'FunctionPanel' | 'TrainingEventPanel'>('FunctionPanel');
 
     const items = [
@@ -1005,9 +992,8 @@ export function FunctionViewPanels({ onUpdateProjection, onStopRefine, isRefinin
                 {activeKey === 'FunctionPanel' && (
                     <FunctionPanel
                         onUpdateProjection={onUpdateProjection}
-                        onStopRefine={onStopRefine}
-                        isRefining={isRefining}
-                        stopPending={stopPending}
+                        refineReady={refineReady}
+                        refineStatusMessage={refineStatusMessage}
                     />
                 )}
                 {activeKey === 'TrainingEventPanel' && <TrainingEventPanel />}

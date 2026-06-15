@@ -103,6 +103,15 @@ export type BaseMutableGlobalStore = {
         trustworthiness: number;
         continuity: number;
     } | null;
+
+    eifSessionInfo: {
+        isEifBundle: boolean;
+        sampleId: string;
+        trainableSessionStatus: string;
+        refineReady: boolean;
+        message: string;
+        updatedAt: number;
+    } | null;
 };
 
 export let initMutableGlobalStore: BaseMutableGlobalStore = {
@@ -173,6 +182,8 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
 
     // Refine quality metrics
     refineMetrics: null,
+
+    eifSessionInfo: null,
 };
 
 type SetFunction<T> = (setState: (state: T) => T | Partial<T>) => void;
