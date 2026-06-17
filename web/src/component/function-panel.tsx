@@ -449,15 +449,15 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                             { label: 'Focus Displacement', value: refineMetrics.focusDisplacement, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of selected focus points after refine. Larger = more effect.' },
                             { label: 'Global Drift', value: refineMetrics.globalDrift, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of non-focus points. Smaller = more stable globally.' },
                             { label: 'NP (k=10)', value: refineMetrics.neighborPreservation, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Neighbor Preservation: fraction of high-dim top-10 neighbors that also appear in low-dim top-10. Typical 2D range: 5–40%. Higher is better.' },
-                            { label: 'HD-Nbr Rank', value: refineMetrics.meanRankHD ?? 0, format: (v: number) => v.toFixed(1), tip: 'Mean LD rank of HD top-10 neighbors (lower = better). Ideal ≈ 5.5. Crowded-but-good projections have NP=0% yet low rank (e.g. 12–20), meaning HD neighbors are just outside top-10 due to density, not misplacement.' },
+                            { label: 'HD-Nbr Rank', value: refineMetrics.meanRankHD, format: (v: number) => v.toFixed(1), tip: 'Mean LD rank of HD top-10 neighbors (lower = better). Ideal ≈ 5.5. Crowded-but-good projections have NP=0% yet low rank (e.g. 12–20), meaning HD neighbors are just outside top-10 due to density, not misplacement.' },
                             { label: 'Trustworthiness', value: refineMetrics.trustworthiness, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Are the low-dim neighbors trustworthy? Penalises points shown as neighbors in 2D that are actually far away in high-dim. Satisfying: >70%. Excellent: >85%.' },
-                            { label: 'Continuity', value: refineMetrics.continuity ?? 0, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Are high-dim neighbors preserved in 2D? Penalises high-dim neighbors that got pushed far away in the projection. Satisfying: >70%. Excellent: >85%.' },
+                            { label: 'Continuity', value: refineMetrics.continuity, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Are high-dim neighbors preserved in 2D? Penalises high-dim neighbors that got pushed far away in the projection. Satisfying: >70%. Excellent: >85%.' },
                         ].map(({ label, value, format, tip }) => (
                             <Tooltip key={label} title={tip} placement="left">
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'help' }}>
                                     <span style={{ fontSize: 11, color: '#666' }}>{label}</span>
-                                    <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'monospace', color: '#1a1a1a' }}>
-                                        {format(value)}
+                                    <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'monospace', color: value == null ? '#bbb' : '#1a1a1a' }}>
+                                        {value == null ? '—' : format(value)}
                                     </span>
                                 </div>
                             </Tooltip>

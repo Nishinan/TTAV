@@ -5,6 +5,7 @@ import json
 import uuid
 import time
 import traceback
+import threading
 from pathlib import Path
 import numpy as np
 import torch
@@ -54,6 +55,37 @@ EIF_BUNDLE_ROOT = Path("/root/project/Dataset/eif_bundles")
 EIF_STATIC_SESSION = "EIF_STATIC_BUNDLE"
 EIF_SESSION_STATUS_FILE = "eif_session_status.json"
 EIF_BUILD_TASKS = {}
+
+# Cache of fully-initialized strategy objects, keyed by (content_path, vis_method, vis_id).
+# Avoids re-creating TimeVis and re-loading vis_model.pth weights when the user
+# switches back to a previously visited sample.
+_EIF_STRATEGY_CACHE: dict[tuple, dict] = {}
+_EIF_STRATEGY_CACHE_LOCK = threading.Lock()
+
+
+def _strategy_cache_key(content_path: str, vis_method: str, vis_id: str) -> tuple:
+    return (str(Path(content_path).resolve()), str(vis_method), str(vis_id))
+
+
+def _get_cached_strategy(content_path: str, vis_method: str, vis_id: str) -> dict | None:
+    key = _strategy_cache_key(content_path, vis_method, vis_id)
+    with _EIF_STRATEGY_CACHE_LOCK:
+        return _EIF_STRATEGY_CACHE.get(key)
+
+
+def _put_cached_strategy(content_path: str, vis_method: str, vis_id: str, strategy, visualizer, config: dict):
+    key = _strategy_cache_key(content_path, vis_method, vis_id)
+    with _EIF_STRATEGY_CACHE_LOCK:
+        _EIF_STRATEGY_CACHE[key] = {"strategy": strategy, "visualizer": visualizer, "config": config}
+    print(f"[StrategyCache] Cached strategy for {Path(content_path).name} {vis_method}/{vis_id}", flush=True)
+
+
+def _invalidate_strategy_cache(content_path: str, vis_method: str, vis_id: str):
+    key = _strategy_cache_key(content_path, vis_method, vis_id)
+    with _EIF_STRATEGY_CACHE_LOCK:
+        removed = _EIF_STRATEGY_CACHE.pop(key, None)
+    if removed is not None:
+        print(f"[StrategyCache] Invalidated cache for {Path(content_path).name} {vis_method}/{vis_id}", flush=True)
 
 
 def _status_path_for_content(content_path):
@@ -199,18 +231,65 @@ def _fit_fast_trainable_session(content_path, sample_id, vis_method, vis_id, vis
 
     feat_t = torch.from_numpy(embeddings).to(dtype=torch.float32, device=device)
     proj_t = torch.from_numpy(target_projection).to(dtype=torch.float32, device=device)
+
+    # Build HD k-NN graph on embeddings for neighbor-aware training.
+    # Using both a warmup phase (regress to initial UMAP projection) and a
+    # neighbor-attraction phase keeps the global layout stable while making the
+    # encoder weights consistent with the attract/repel losses used in refine().
+    from sklearn.neighbors import NearestNeighbors as _SkNNS
+    _k_hd = min(10, len(embeddings) - 1)
+    _nbrs_fit = _SkNNS(n_neighbors=_k_hd + 1, algorithm='auto').fit(embeddings)
+    _, _nn_idx = _nbrs_fit.kneighbors(embeddings)
+    hd_neighbor_idx = _nn_idx[:, 1:]  # [N, k_hd], exclude self
+    hd_nbr_t = torch.from_numpy(embeddings[hd_neighbor_idx.flatten()]).to(dtype=torch.float32, device=device)
+    hd_nbr_t = hd_nbr_t.view(len(embeddings), _k_hd, -1)  # [N, k_hd, D]
+
+    rng_seed = np.random.default_rng(42)
+    _neg_k = min(20, len(embeddings) - 1)
+
     best_loss = float('inf')
     best_state = None
     stale_steps = 0
 
+    # Warmup steps: pure projection regression to anchor global layout.
+    warmup_steps = min(max_steps // 4, 60)
+    attract_weight = 1.0
+    anchor_weight = 2.0  # keep global layout stable via regression anchor
+
     model.train()
     for step in range(max_steps):
         optimizer.zero_grad()
-        pred_proj = model.encoder(feat_t)
+        pred_proj = model.encoder(feat_t)        # [N, 2]
         recon = model.decoder(pred_proj)
-        loss_proj = torch.mean((pred_proj - proj_t) ** 2)
+
+        # Reconstruction loss (light regulariser)
         loss_recon = torch.mean((recon - feat_t) ** 2)
-        loss = projection_weight * loss_proj + recon_weight * loss_recon
+
+        # Phase 1 (warmup): regress to initial UMAP projection for global stability
+        loss_proj = torch.mean((pred_proj - proj_t) ** 2)
+
+        if step < warmup_steps:
+            loss = loss_proj + recon_weight * loss_recon
+        else:
+            # Phase 2: neighbor attraction + global anchor
+            pred_nbr = model.encoder(hd_nbr_t.view(-1, embeddings.shape[1]))  # [N*k, 2]
+            pred_nbr = pred_nbr.view(len(embeddings), _k_hd, 2)               # [N, k, 2]
+            diff = pred_proj.unsqueeze(1) - pred_nbr                          # [N, k, 2]
+            loss_attract = diff.pow(2).sum(dim=-1).mean()
+
+            # Random negatives repulsion (sampled each step for diversity)
+            neg_idx = rng_seed.choice(len(embeddings), size=min(_neg_k, len(embeddings)), replace=False)
+            neg_t = feat_t[neg_idx]
+            pred_neg = model.encoder(neg_t)  # [neg_k, 2]
+            dist_neg = (pred_proj.unsqueeze(1) - pred_neg.unsqueeze(0)).pow(2).sum(dim=-1).sqrt()
+            margin = 1.0
+            loss_repel = torch.clamp(margin - dist_neg, min=0.0).pow(2).mean()
+
+            loss = (attract_weight * loss_attract
+                    + 0.3 * loss_repel
+                    + anchor_weight * loss_proj
+                    + recon_weight * loss_recon)
+
         loss.backward()
         optimizer.step()
 
@@ -356,15 +435,23 @@ def sync_session():
             )
 
             if _is_trainable_session_ready(req["content_path"], vis_method, vis_id):
-                config = initialize_config(
-                    req['content_path'],
-                    vis_method,
-                    vis_id,
-                    req['data_type'],
-                    req['task_type'],
-                    req['vis_config']
-                )
-                visualizer, strategy = init_visualize_component(config)
+                cached = _get_cached_strategy(req["content_path"], vis_method, vis_id)
+                if cached is not None:
+                    strategy = cached["strategy"]
+                    visualizer = cached["visualizer"]
+                    config = cached["config"]
+                    print(f"[syncSession] Reusing cached strategy for {Path(req['content_path']).name}", flush=True)
+                else:
+                    config = initialize_config(
+                        req['content_path'],
+                        vis_method,
+                        vis_id,
+                        req['data_type'],
+                        req['task_type'],
+                        req['vis_config']
+                    )
+                    visualizer, strategy = init_visualize_component(config)
+                    _put_cached_strategy(req["content_path"], vis_method, vis_id, strategy, visualizer, config)
                 update_active_session(config, visualizer, strategy)
                 active_session["eif_session_info"] = eif_session_info
                 return jsonify({
@@ -417,8 +504,6 @@ def sync_session():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-        
-import threading
 
 # Global lock: only one refine() may run at a time (strategy objects are not thread-safe).
 _refine_lock = threading.Lock()
@@ -550,6 +635,14 @@ def update_focus_context():
 # ── Session-based refine (async, with progress streaming) ─────────────────────
 _refine_sessions: dict = {}
 _refine_sessions_lock = threading.Lock()
+
+
+def normalize_content_path(content_path) -> str:
+    if not content_path:
+        content_path = active_session.get("content_path")
+    if not content_path:
+        raise ValueError("content_path is required and no active session is loaded")
+    return str(content_path).strip()
 
 
 def _prepare_refine_request(req):
@@ -1095,6 +1188,7 @@ def register_eif_bundle():
 
     if overwrite:
         invalidate_bundle_neighbor_caches(str(target_dir))
+        _invalidate_strategy_cache(str(target_dir), vis_method, vis_id)
         if method_dir.exists():
             shutil.rmtree(method_dir)
         if refined_method_dir.exists():

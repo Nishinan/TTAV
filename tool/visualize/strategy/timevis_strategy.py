@@ -17,6 +17,12 @@ from strategy.strategy_abstract import StrategyAbstractClass
 from data_provider import DataProvider
 from umap.umap_ import find_ab_params
 
+import sys as _sys
+_server_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'server'))
+if _server_dir not in _sys.path:
+    _sys.path.insert(0, _server_dir)
+from refine_behavior_config import resolve_refine_behavior_config
+
 class TimeVis(StrategyAbstractClass):
     def __init__(self, config, data_provider):
         super().__init__(config)
@@ -174,6 +180,7 @@ class TimeVis(StrategyAbstractClass):
         vis_id    = self.config['vis_id']
         content_path = self.config['content_path']
         available_epochs = self.config['available_epochs']
+        vis_cfg = self.config['vis_config']
 
         # Default current_epoch to the last available epoch
         if current_epoch is None:
@@ -288,367 +295,232 @@ class TimeVis(StrategyAbstractClass):
         self._last_training_context_indices = training_context_indices
         self._last_patch_indices = patch_indices
 
-        # --- 3b. Sample anchor points (global, excluding patch region) ---------
-        exclude_set = set(patch_indices)
-        candidate_anchors = [i for i in range(N) if i not in exclude_set]
-        rng = np.random.default_rng(seed=42)
-        n_anchors = min(300, len(candidate_anchors))
-        if n_anchors > 0:
-            anchor_indices = rng.choice(candidate_anchors, size=n_anchors, replace=False).tolist()
-            anchor_feat_np = full_feat[anchor_indices]                # [A, D]
-            anchor_z0      = full_proj_baseline[anchor_indices]       # [A, 2]
+        # --- 3b. Anchor points: ALL non-focus points --------------------------
+        # For small datasets (e.g. EIF ~50 tokens), hd_nbr_set covers nearly
+        # all N points, leaving candidate_anchors empty and mu_anchor * 0 = 0,
+        # so the encoder collapses everything.  The fix: anchor EVERY non-focus
+        # point regardless of whether it is a HD neighbor.  Combined with
+        # detaching z_edge_from in the training loop, only focus points'
+        # encoder path receives gradient — all others stay at baseline.
+        anchor_indices = [i for i in range(N) if i not in set(focus_indices)]
+        if anchor_indices:
+            anchor_feat_np = full_feat[anchor_indices]
+            anchor_z0      = full_proj_baseline[anchor_indices]
         else:
-            anchor_indices = []
             anchor_feat_np = np.zeros((0, full_feat.shape[1]), dtype=full_feat.dtype)
-            anchor_z0 = np.zeros((0, full_proj_baseline.shape[1]), dtype=full_proj_baseline.dtype)
+            anchor_z0      = np.zeros((0, full_proj_baseline.shape[1]), dtype=full_proj_baseline.dtype)
 
-        # --- 3c. Sample random negative examples (global, excluding HD neighbors) --
-        k_neg = 10
-        n_neg_per_focus = 5 * k_neg
-        neg_exclude = set(all_indices) | hd_nbr_set
-        neg_candidates = [i for i in range(N) if i not in neg_exclude]
-        n_neg_total = min(n_neg_per_focus * len(focus_indices), len(neg_candidates))
-        if n_neg_total > 0:
-            neg_indices = rng.choice(neg_candidates, size=n_neg_total, replace=False).tolist()
-            neg_feat_np = full_feat[neg_indices]                      # [n_neg, D]
-        else:
-            neg_indices = []
-            neg_feat_np = np.zeros((0, full_feat.shape[1]), dtype=full_feat.dtype)
-
-        # --- 3d. Compute adaptive margin m -----------------------------------
-        # Use the 90th-percentile of each focus point's top-20 LD distances ×1.5.
-        # The 90th-percentile (rather than median) gives a larger clearance so that
-        # non-neighbors must be pushed well beyond the local neighborhood boundary.
-        # A hard lower bound of 0.3 prevents the margin from collapsing in
-        # densely crowded regions, which would cause L_repel and L_attract to
-        # fight each other and prevent convergence.
-        focus_z0 = full_proj_baseline[focus_indices]                  # [|F|, 2]
-        _nbr_dists = []
-        for _fi in focus_indices:
-            _all_dists = np.linalg.norm(full_proj_baseline - full_proj_baseline[_fi], axis=1)
-            _all_dists[_fi] = np.inf
-            _nbr_dists.extend(np.sort(_all_dists)[:20].tolist())
-        margin_m = float(np.percentile(_nbr_dists, 90)) * 1.5
-        margin_m = max(margin_m, 0.3)
-
-        # Convert all feature arrays to tensors once
-        focus_feat_t   = torch.from_numpy(full_feat[focus_indices].copy()).float().to(self.device)
-        anchor_feat_t  = torch.from_numpy(anchor_feat_np).float().to(self.device)
-        anchor_z0_t    = torch.from_numpy(anchor_z0).float().to(self.device)
-        neg_feat_t     = torch.from_numpy(neg_feat_np).float().to(self.device)
-        # Pre-compute intra-focus pairwise structure targets (computed once, reused every step).
+        # --- 4. Direct 2D coordinate optimisation (no encoder fine-tuning) --------
+        # Fine-tuning the encoder changes ALL points' projections through the shared
+        # f(x) function, causing global drift that anchor loss cannot fully prevent
+        # (especially on small EIF datasets where every point is a HD neighbour).
         #
-        # Why this works better than a temporal anchor or a simple hinge repulsion:
-        #   • Temporal anchor (mu * ||z - z0||²) prevents collapse but also prevents any
-        #     movement → NP stays low.  It treats all motion as bad, not just collapse.
-        #   • Hinge repulsion on non-HD pairs misses pairs that ARE mutual HD neighbours yet
-        #     still collapse (they have no repulsion mask entry).
-        #   • Pairwise structure loss ((d_LD(i,j) - α·d_HD(i,j))²) directly encodes the
-        #     desired geometry: focus points may compress toward the centre, but their
-        #     RELATIVE distances must stay proportional to HD space.  Since every pair has
-        #     d_HD > 0, the target d_LD > 0, so co-location is always penalised regardless
-        #     of whether the pair is in each other's HD-neighbour set.
-        n_focus = len(focus_indices)
-        hd_pairwise_scaled_t = None
-        if n_focus > 1:
-            focus_feats_np = full_feat[focus_indices]                      # [n_focus, D]
-            hd_pw = np.linalg.norm(
-                focus_feats_np[:, None, :] - focus_feats_np[None, :, :],
-                axis=-1,
-            )                                                               # [n_focus, n_focus]
-            # Scale HD distances so the mean pairwise distance maps to
-            # target_radius = 25 % of the local neighbourhood margin.
-            # This compresses the focus cluster enough that all HD neighbours
-            # rank in the LD top-10, while keeping them visibly separated.
-            _mean_hd = float(hd_pw[hd_pw > 0].mean()) if (hd_pw > 0).any() else 1.0
-            target_radius = margin_m * 0.25
-            alpha_structure = target_radius / (_mean_hd + 1e-8)
-            hd_pairwise_scaled_t = torch.from_numpy(
-                (hd_pw * alpha_structure).astype(np.float32)
-            ).to(self.device)                                               # [n_focus, n_focus]
+        # Solution: keep the encoder frozen.  Treat the 2D coordinates of the focus
+        # points as the sole trainable parameters.  All other points stay exactly at
+        # their baseline positions — global layout is preserved by construction.
+        #
+        # UmapLoss operates on 2D space directly:
+        #   positive pairs  = (focus_z, baseline_nbr_z)  — attract neighbours
+        #   negative pairs  = UmapLoss internal shuffle of baseline_nbr_z — repel non-nbrs
+        # Because baseline_nbr_z are constants, gradients flow only through focus_z.
 
-        # For each focus point, pre-build tensor of its HD neighbor features
-        # Shape: list of tensors, each [k_hd, D]
-        focus_hd_nbr_feats = []
+        focus_z = torch.nn.Parameter(
+            torch.from_numpy(full_proj_baseline[focus_indices].copy()).float().to(self.device)
+        )
+        optimizer = torch.optim.Adam([focus_z], lr=0.01)
+
+        # Build fixed neighbour target positions (constant — never optimised)
+        _edge_from_parts = []
+        k_hd_per_focus   = []
         for fi in focus_indices:
             nbr_idx = hd_neighbors_all[fi][:10]
-            focus_hd_nbr_feats.append(
-                torch.from_numpy(full_feat[nbr_idx].copy()).float().to(self.device)
+            k_hd_per_focus.append(len(nbr_idx))
+            _edge_from_parts.append(
+                torch.from_numpy(full_proj_baseline[nbr_idx].copy()).float().to(self.device)
             )
-
-        # --- 4. Fine-tune a dedicated local visualizer copy ---------------------
-        # Keep the global visualizer untouched; the copied local visualizer is
-        # trained only for the current refine request and used to patch outputs.
-        local_visualizer = copy.deepcopy(self.visualize_model).to(self.device)
-        encoder_layers = list(local_visualizer.encoder.children())
-        trainable_params = []
-        linear_count = 0
-        for layer in reversed(encoder_layers):
-            if isinstance(layer, torch.nn.Linear):
-                for p in layer.parameters():
-                    p.requires_grad = True
-                trainable_params += list(layer.parameters())
-                linear_count += 1
-                if linear_count >= 2:
-                    break
-        for _, param in local_visualizer.named_parameters():
-            if not param.requires_grad:
-                continue
-            if not any(param is tp for tp in trainable_params):
-                param.requires_grad = False
-
-        # Pre-batch all focus points and their HD neighbors for efficient forward pass.
-        # focus_hd_nbr_feats[i] has shape [k_hd, D]; stack into [n_focus*k_hd, D].
-        all_nbr_feat_t = torch.cat(focus_hd_nbr_feats, dim=0)  # [n_focus*k_hd, D]
-        k_hd_per_focus = [f.shape[0] for f in focus_hd_nbr_feats]
-
-        optimizer = torch.optim.Adam(trainable_params, lr=0.005)
-        local_visualizer.train()
-
-        # In crowded regions (small margin) repulsion fights attraction — reduce it.
-        # margin >= 0.5: normal repulsion; margin < 0.3 (clamped floor): disable repulsion.
-        gamma_repel = float(np.clip((margin_m - 0.3) / 0.2, 0.0, 1.0))
-        mu_anchor   = 10.0  # anchor constraint weight
-        # Weight for the intra-focus pairwise structure loss.
-        # Higher values → stronger structure preservation, harder to collapse,
-        # but also harder for the attract loss to compress the cluster.
-        # Default 1.5 gives a good balance: cluster compresses ~60 % toward HD
-        # neighbours while keeping all pairwise separations visible.
-        gamma_structure = float(vis_cfg.get("refine_structure_weight", 1.5))
-
-        full_feat_t = torch.from_numpy(full_feat).float().to(self.device)
+        edge_from_fixed_t = torch.cat(_edge_from_parts, dim=0)  # [n_edges, 2] — constant
 
         behavior_cfg = resolve_refine_behavior_config(vis_cfg)
-        progress_cfg = behavior_cfg["progressive_updates"]
-        stopping_cfg = behavior_cfg["stopping"]
+        _progress_cfg = behavior_cfg["progressive_updates"]
+        _snapshot_every = max(1, int(_progress_cfg.get("snapshot_every_steps", 30)))
 
-        log_every_steps = int(vis_cfg.get("refine_log_every_steps", 50))
-        progress_enabled = bool(progress_callback and progress_cfg.get("enabled", False))
-        snapshot_every_steps = max(1, int(progress_cfg.get("snapshot_every_steps", 3)))
-        sampled_metrics_enabled = bool(progress_callback and progress_cfg.get("enable_sampled_metrics", True))
-        sample_metrics_every_steps = max(1, int(progress_cfg.get("sample_metrics_every_steps", 100)))
+        _loss_window     = []
+        _WINDOW          = 20
+        _MIN_STEPS       = int(self.config['vis_config'].get('refine_min_steps', 80))
+        _REL_TOL         = 5e-4
+        _MAX_STEPS       = int(self.config['vis_config'].get('refine_max_steps', 1000))
+        _PATIENCE        = int(self.config['vis_config'].get('refine_patience', 120))
+        _MIN_DELTA       = float(self.config['vis_config'].get('refine_loss_min_delta', 1e-4))
+        _TIME_LIMIT_S    = float(self.config['vis_config'].get('refine_time_limit_s', 45.0))
+        _best_loss       = float('inf')
+        _stale_steps     = 0
 
-        enable_max_steps = bool(stopping_cfg.get("enable_max_steps", True))
-        max_steps = max(1, int(stopping_cfg.get("max_steps", 20000)))
-        enable_time_budget = bool(stopping_cfg.get("enable_time_budget", False))
-        time_budget_seconds = stopping_cfg.get("time_budget_seconds", None)
-        time_budget_seconds = None if time_budget_seconds in (None, "", False) else float(time_budget_seconds)
-        enable_loss_converged = bool(stopping_cfg.get("enable_loss_converged", True))
-        stop_priority = list(stopping_cfg.get("priority", ["loss_converged", "time_budget", "max_steps"]))
-        safety_loop_cap = max(max_steps, int(stopping_cfg.get("safety_loop_cap", 200000)))
-
-        # Loss-convergence early stop: track L_attract over a sliding window.
-        # NP is meaningless as a stopping signal when 2-D cannot faithfully
-        # represent high-D neighborhoods (NP stays 0% even while the layout
-        # is genuinely improving). L_attract measures whether HD neighbors are
-        # still being pulled closer, which is the actual optimisation goal.
-        _loss_window  = []   # recent L_attract values
-        _WINDOW       = 20   # check over last 20 steps
-        _MIN_STEPS    = int(self.config['vis_config'].get('refine_min_steps', 80))
-        _REL_TOL      = 5e-4 # stop if (max-min)/max < tol over the window
-        _MAX_STEPS    = int(self.config['vis_config'].get('refine_max_steps', 1000))
-        _PATIENCE     = int(self.config['vis_config'].get('refine_patience', 120))
-        _MIN_DELTA    = float(self.config['vis_config'].get('refine_loss_min_delta', 1e-4))
-        _TIME_LIMIT_S = float(self.config['vis_config'].get('refine_time_limit_s', 45.0))
-        _best_total_loss = float('inf')
-        _stale_steps = 0
-
-        print(f"[TimeVis] refine early-stop config: max_steps={_MAX_STEPS}, min_steps={_MIN_STEPS}, patience={_PATIENCE}, min_delta={_MIN_DELTA}, time_limit_s={_TIME_LIMIT_S}")
+        print(f"[TimeVis] coord-opt refine: n_focus={len(focus_indices)}, "
+              f"n_edges={edge_from_fixed_t.shape[0]}, max_steps={_MAX_STEPS}, "
+              f"time_limit_s={_TIME_LIMIT_S}")
 
         for step in range(_MAX_STEPS):
             optimizer.zero_grad()
 
-            z_focus   = local_visualizer.encoder(focus_feat_t)    # [n_focus, 2]
-            z_all_nbr = local_visualizer.encoder(all_nbr_feat_t)  # [n_focus*k_hd, 2]
-            z_neg     = local_visualizer.encoder(neg_feat_t) if neg_feat_t.shape[0] > 0 else None
-            z_anchors = local_visualizer.encoder(anchor_feat_t) if anchor_feat_t.shape[0] > 0 else None
+            # Rebuild edge_to each step from the current focus_z values
+            edge_to_t = torch.cat([
+                focus_z[i].unsqueeze(0).expand(k_hd_per_focus[i], -1)
+                for i in range(len(focus_indices))
+            ], dim=0)  # [n_edges, 2]
 
-            l_attract = torch.tensor(0., device=self.device)
-            l_repel   = torch.tensor(0., device=self.device)
-            nbr_offset = 0
-
-            for idx in range(len(focus_indices)):
-                k_i = k_hd_per_focus[idx]
-                z_i    = z_focus[idx].unsqueeze(0)               # [1, 2]
-                z_nbrs = z_all_nbr[nbr_offset:nbr_offset + k_i] # [k_i, 2]
-                nbr_offset += k_i
-
-                # Attract HD neighbors
-                l_attract = l_attract + (z_i - z_nbrs).pow(2).sum(dim=1).mean()
-
-                # Repel random negatives (fixed set, no full inference in loop)
-                if z_neg is not None and z_neg.shape[0] > 0:
-                    dist_repel = (z_i - z_neg).pow(2).sum(dim=1).sqrt()
-                    hinge = torch.clamp(margin_m - dist_repel, min=0.0)
-                    l_repel = l_repel + hinge.pow(2).mean()
-
-            n_f = max(len(focus_indices), 1)
-            l_attract = l_attract / n_f
-            l_repel   = l_repel   / n_f
-
-            if z_anchors is not None and z_anchors.shape[0] > 0:
-                l_anchor = (z_anchors - anchor_z0_t).pow(2).sum(dim=1).mean()
-            else:
-                l_anchor = torch.tensor(0., device=self.device)
-
-            # Intra-focus pairwise structure loss.
-            # Forces the LD pairwise distances within the focus set to be proportional
-            # to their HD pairwise distances (scaled by alpha_structure so the cluster
-            # fits inside the local neighbourhood).  This simultaneously:
-            #   (a) prevents collapse — every pair has a positive HD distance → positive
-            #       LD target, so co-location is penalised for ALL pairs, including
-            #       those that are mutual HD neighbours (the gap left by hinge repulsion).
-            #   (b) preserves local geometry — the internal topology of the focus cluster
-            #       mirrors the HD structure rather than being arbitrarily deformed.
-            #   (c) allows alignment — the whole cluster can compress toward centre
-            #       because α rescales the targets to fit inside target_radius.
-            l_structure = torch.tensor(0., device=self.device)
-            if n_focus > 1 and gamma_structure > 0 and hd_pairwise_scaled_t is not None:
-                diff_ff = z_focus.unsqueeze(0) - z_focus.unsqueeze(1)        # [n, n, 2]
-                dist_ff = diff_ff.pow(2).sum(dim=-1).clamp(min=1e-8).sqrt()  # [n, n]
-                l_structure = (dist_ff - hd_pairwise_scaled_t).pow(2).mean()
-
-            loss_total = (l_attract
-                          + gamma_repel * l_repel
-                          + mu_anchor * l_anchor
-                          + gamma_structure * l_structure)
-            loss_total.backward()
+            l_umap = self.umap_fn(edge_to_t, edge_from_fixed_t)
+            l_umap.backward()
             optimizer.step()
 
-            current_total_loss = float(loss_total.detach().item())
-            if current_total_loss + _MIN_DELTA < _best_total_loss:
-                _best_total_loss = current_total_loss
+            cur_loss = float(l_umap.detach().item())
+            if cur_loss + _MIN_DELTA < _best_loss:
+                _best_loss   = cur_loss
                 _stale_steps = 0
             else:
                 _stale_steps += 1
 
-            _loss_window.append(l_attract.item())
+            _loss_window.append(cur_loss)
             if len(_loss_window) > _WINDOW:
                 _loss_window.pop(0)
 
             if step % 50 == 0:
-                print(f"[TimeVis] step={step:4d}  L_attract={l_attract.item():.4f}  "
-                      f"L_anchor={l_anchor.item():.5f}  "
-                      f"L_structure={l_structure.item():.4f}  "
-                      f"L_total={current_total_loss:.5f}  stale={_stale_steps}  "
-                      f"t={time.time()-start_time:.1f}s")
+                print(f"[TimeVis] step={step:4d}  L_umap={cur_loss:.4f}  "
+                      f"stale={_stale_steps}  t={time.time()-start_time:.1f}s")
 
             if _PATIENCE > 0 and step >= _MIN_STEPS and _stale_steps >= _PATIENCE:
-                print(f"[TimeVis] Early stop at step {step}: no total-loss improvement for {_stale_steps} steps (best={_best_total_loss:.6f})")
+                print(f"[TimeVis] Early stop at step {step}: stale {_stale_steps} steps")
                 break
 
-            # Loss-convergence early stop (only after _MIN_STEPS)
             if step >= _MIN_STEPS and len(_loss_window) == _WINDOW:
-                _w_max = max(_loss_window)
-                _w_min = min(_loss_window)
+                _w_max, _w_min = max(_loss_window), min(_loss_window)
                 if _w_max > 0 and (_w_max - _w_min) / _w_max < _REL_TOL:
-                    print(f"[TimeVis] Loss converged at step {step}: "
-                          f"L_attract range={_w_max-_w_min:.6f} < tol")
+                    print(f"[TimeVis] Loss converged at step {step}")
                     break
 
             if _TIME_LIMIT_S > 0 and time.time() - start_time > _TIME_LIMIT_S:
                 print(f"[TimeVis] Time limit at step {step} ({_TIME_LIMIT_S}s)")
                 break
 
-        # --- Compute T, C, NP for focus points using full-dataset distances ------
-        # z_eval was computed in the last NP-check iteration inside the loop.
-        # Re-compute here to ensure it uses the final model state.
-        self.visualize_model.eval()
-        with torch.no_grad():
-            z_final = local_visualizer.encoder(full_feat_t)  # [N, 2]
-        z_np = z_final.cpu().numpy()  # [N, 2]
+            # Progress snapshot: global layout = baseline; only focus coords updated
+            if progress_callback and (step + 1) % _snapshot_every == 0:
+                _snap_z = full_proj_baseline.copy()
+                _snap_z[focus_indices] = focus_z.detach().cpu().numpy()
+                progress_callback({
+                    "steps_completed": step + 1,
+                    "projection": _snap_z.tolist(),
+                    "focus_indices": list(focus_indices),
+                    "training_context_indices": list(training_context_indices),
+                    "patch_indices": list(patch_indices),
+                })
+
+            if should_stop_callback and should_stop_callback():
+                print(f"[TimeVis] Stop requested at step {step}")
+                break
+
+        # Build final projection: baseline everywhere, optimised coords for focus
+        z_np = full_proj_baseline.copy()
+        z_np[focus_indices] = focus_z.detach().cpu().numpy()
+
+        # Guard k so it never exceeds the number of other points (e.g. very small N).
+        k     = min(10, N - 1)
+        K_ext = min(200, N - 1)
 
         trust_sum = 0.0
         cont_sum  = 0.0
         np_sum    = 0.0
-        mrh_sum   = 0.0   # Mean Rank of HD neighbors in LD space (lower = better)
+        mrh_sum   = 0.0
 
-        k = 10
-        # Extended neighborhood to compute meaningful ranks: top K_ext points
-        # gives penalty a real range instead of collapsing near zero.
-        K_ext = min(200, N - 1)
+        try:
+            for fi_glob in focus_indices:
+                # High-dim ranks (argsort over all N, excluding self)
+                hd_feat_fi = full_feat[fi_glob]
+                hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
+                hd_dists[fi_glob] = np.inf
+                hd_rank = np.argsort(hd_dists)
 
-        for fi_glob in focus_indices:
-            # High-dim ranks (argsort over all N, excluding self)
-            hd_feat_fi = full_feat[fi_glob]
-            hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
-            hd_dists[fi_glob] = np.inf
-            hd_rank = np.argsort(hd_dists)   # index array: hd_rank[r] = point at rank r
+                # Low-dim ranks
+                ld_dists = np.linalg.norm(z_np - z_np[fi_glob], axis=1)
+                ld_dists[fi_glob] = np.inf
+                ld_rank = np.argsort(ld_dists)
 
-            # Low-dim ranks
-            ld_dists = np.linalg.norm(z_np - z_np[fi_glob], axis=1)
-            ld_dists[fi_glob] = np.inf
-            ld_rank = np.argsort(ld_dists)
+                # Rank lookup: point_idx → 1-based rank within K_ext
+                hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
+                ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
 
-            # Build rank lookup: point_idx → 1-based rank (only within K_ext)
-            # Used for T/C penalty computation (capped at K_ext for normalisation).
-            hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
-            ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
+                # Full LD rank lookup for MRH (covers all N-1 non-self points)
+                ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
 
-            # Full LD rank lookup for MRH — must cover all N points so HD
-            # neighbors that landed far away in 2D get their true rank, not 201.
-            ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
+                hd_topk = set(int(hd_rank[r]) for r in range(k) if int(hd_rank[r]) != fi_glob)
+                ld_topk = set(int(ld_rank[r]) for r in range(k) if int(ld_rank[r]) != fi_glob)
 
-            hd_topk = set(hd_rank[:k].tolist())
-            ld_topk = set(ld_rank[:k].tolist())
+                # NP: strict top-k set intersection
+                denom_np = max(k, 1)
+                np_sum += len(hd_topk & ld_topk) / denom_np
 
-            # NP: strict top-k set intersection
-            np_sum += len(hd_topk & ld_topk) / k
+                # MRH: mean LD rank of HD top-k neighbors
+                mrh_vals = [ld_rank_full.get(int(j), N) for j in hd_topk]
+                mrh_sum += float(np.mean(mrh_vals)) if mrh_vals else float(N)
 
-            # MRH: average LD rank of the HD top-k neighbors (full-range lookup).
-            # Ideal ≈ 5.5 (perfectly centred in top-10).
-            # Crowded-but-good: MRH ≈ 10–30 (just outside top-10 due to density).
-            # Truly bad projection: MRH >> 100.
-            mrh_sum += float(np.mean([
-                ld_rank_full[j] for j in hd_topk
-            ]))
+                # Trustworthiness penalty: fake LD neighbors (in LD but not HD top-k)
+                t_penalty = 0.0
+                for j in (ld_topk - hd_topk):
+                    r_hd = hd_rank_of.get(int(j), K_ext + 1)
+                    t_penalty += max(0, r_hd - k)
 
-            # Trustworthiness: penalise fake low-D neighbors (in LD but not HD top-k)
-            # Penalty = HD rank - k; if HD rank > K_ext, use K_ext as conservative bound.
-            t_penalty = 0.0
-            for j in (ld_topk - hd_topk):
-                r_hd = hd_rank_of.get(j, K_ext + 1)
-                t_penalty += max(0, r_hd - k)
+                # Continuity penalty: missing HD neighbors (in HD but not LD top-k)
+                c_penalty = 0.0
+                for j in (hd_topk - ld_topk):
+                    r_ld = ld_rank_of.get(int(j), K_ext + 1)
+                    c_penalty += max(0, r_ld - k)
 
-            # Continuity: penalise missing HD neighbors (in HD but not LD top-k)
-            c_penalty = 0.0
-            for j in (hd_topk - ld_topk):
-                r_ld = ld_rank_of.get(j, K_ext + 1)
-                c_penalty += max(0, r_ld - k)
+                # Per-point worst-case: k fake neighbors each at max rank K_ext
+                worst = k * (K_ext - k)
+                trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
+                cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
 
-            # Normalizer: worst-case penalty for one point with k fake neighbors,
-            # each at rank K_ext.  This gives T/C a meaningful [0,1] range
-            # for a single focus point rather than the global N-point formula.
-            worst = k * (K_ext - k)
-            trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
-            cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
+            n_f = max(len(focus_indices), 1)
+            final_np    = np_sum  / n_f * 100.0
+            final_mrh   = mrh_sum / n_f
+            final_trust = max(0.0, trust_sum / n_f * 100.0)
+            final_cont  = max(0.0, cont_sum  / n_f * 100.0)
 
-        n_f = max(len(focus_indices), 1)
-        final_np    = np_sum    / n_f * 100.0
-        final_mrh   = mrh_sum   / n_f          # raw rank number, not a percentage
-        final_trust = max(0.0, trust_sum / n_f * 100.0)
-        final_cont  = max(0.0, cont_sum  / n_f * 100.0)
+            self._last_refine_np    = final_np
+            self._last_refine_mrh   = final_mrh
+            self._last_refine_trust = final_trust
+            self._last_refine_cont  = final_cont
+        except Exception as _metrics_err:
+            print(f"[TimeVis] WARNING: metrics computation failed: {_metrics_err}")
+            import traceback as _tb; _tb.print_exc()
+            self._last_refine_np    = None
+            self._last_refine_mrh   = None
+            self._last_refine_trust = None
+            self._last_refine_cont  = None
+            final_np = final_mrh = final_trust = final_cont = float('nan')
 
-        self._last_refine_np    = final_np
-        self._last_refine_mrh   = final_mrh
-        self._last_refine_trust = final_trust
-        self._last_refine_cont  = final_cont
-
-        print(f"[TimeVis] Anchor-constrained refine done: "
+        print(f"[TimeVis] coord-opt refine done: "
               f"steps={step+1}  NP={final_np:.1f}%  MRH={final_mrh:.1f}  "
               f"T={final_trust:.1f}%  C={final_cont:.1f}%  "
-              f"margin={margin_m:.3f}  t={time.time()-start_time:.1f}s")
+              f"t={time.time()-start_time:.1f}s")
 
-        # --- 5. Full-inference projection for current_epoch --------------------
-        # Patch using the trained local visualizer while keeping the global
-        # visualizer untouched for future sessions.
-        self._patch_epoch(current_epoch, all_indices, model=local_visualizer)
-        self._last_local_visualizer = local_visualizer
+        # --- 5. Write patched projection directly (no encoder re-run) -----------
+        # z_np = baseline with only focus coords updated.  Non-focus points are
+        # untouched by construction — no encoder fine-tuning happened.
+        refined_dir = os.path.join(
+            content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
+            'epochs', f'epoch_{current_epoch}'
+        )
+        os.makedirs(refined_dir, exist_ok=True)
+        np.save(os.path.join(refined_dir, 'projection.npy'), z_np)
 
-        print(f"[TimeVis] Subset-patch refine finished in {time.time() - start_time:.2f}s "
-              f"({len(all_indices)} points patched, epoch={current_epoch})")
+        # Store the coordinate delta so patch_other_epochs can apply the same
+        # spatial shift to other epochs without re-running the optimiser.
+        self._last_focus_delta = focus_z.detach().cpu().numpy() - full_proj_baseline[focus_indices]
+        self._last_local_visualizer = None  # no encoder model in coord-opt mode
 
-        # Store all_indices so patch_other_epochs() can reuse them without re-running kNN.
+        print(f"[TimeVis] coord-opt refine finished in {time.time() - start_time:.2f}s "
+              f"(epoch={current_epoch}, {len(focus_indices)} focus points moved)")
+
+        # Store all_indices so patch_other_epochs() can reuse them.
         self._last_refine_indices = all_indices
 
         # --- 6. Background ablation (non-blocking) ----------------------------
@@ -997,23 +869,58 @@ class TimeVis(StrategyAbstractClass):
         np.save(os.path.join(refined_dir, 'projection.npy'), full_proj)
 
     def patch_other_epochs(self, skip_epoch):
-        """Patch all available epochs except skip_epoch using the last local visualizer."""
+        """Patch all available epochs except skip_epoch."""
         import threading
-        all_indices = getattr(self, '_last_refine_indices', None)
-        local_visualizer = getattr(self, '_last_local_visualizer', None)
-        if not all_indices or local_visualizer is None:
-            return
+        import numpy as np, os
         available_epochs = self.config['available_epochs']
         other_epochs = [e for e in available_epochs if e != skip_epoch]
+        if not other_epochs:
+            return
 
-        def _run():
-            for e in other_epochs:
-                try:
-                    self._patch_epoch(e, all_indices, model=local_visualizer)
-                except Exception as ex:
-                    print(f"[TimeVis] Background patch epoch {e} failed: {ex}")
-            print(f"[TimeVis] Background patch complete for {len(other_epochs)} other epochs.")
+        focus_delta    = getattr(self, '_last_focus_delta', None)
+        focus_indices  = getattr(self, '_last_focus_indices', None)
+        local_visualizer = getattr(self, '_last_local_visualizer', None)
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+        vis_method   = self.config['vis_method']
+        vis_id       = self.config['vis_id']
+        content_path = self.config['content_path']
+
+        if focus_delta is not None and focus_indices is not None:
+            # Coord-opt mode: apply the same 2D delta to the baseline projection
+            # of each other epoch.  No encoder re-run needed.
+            def _run_delta():
+                for e in other_epochs:
+                    try:
+                        baseline_path = os.path.join(
+                            content_path, 'visualize', f"{vis_method}_{vis_id}",
+                            'epochs', f'epoch_{e}', 'projection.npy'
+                        )
+                        if not os.path.exists(baseline_path):
+                            continue
+                        proj = np.load(baseline_path).copy()
+                        proj[focus_indices] += focus_delta
+                        refined_dir = os.path.join(
+                            content_path, 'visualize', f"{vis_method}_{vis_id}_refined",
+                            'epochs', f'epoch_{e}'
+                        )
+                        os.makedirs(refined_dir, exist_ok=True)
+                        np.save(os.path.join(refined_dir, 'projection.npy'), proj)
+                    except Exception as ex:
+                        print(f"[TimeVis] Background delta-patch epoch {e} failed: {ex}")
+                print(f"[TimeVis] Background delta-patch complete for {len(other_epochs)} epochs.")
+            threading.Thread(target=_run_delta, daemon=True).start()
+
+        elif local_visualizer is not None:
+            # Encoder fine-tune mode (legacy): re-run encoder for each epoch
+            all_indices = getattr(self, '_last_refine_indices', None)
+            if not all_indices:
+                return
+            def _run():
+                for e in other_epochs:
+                    try:
+                        self._patch_epoch(e, all_indices, model=local_visualizer)
+                    except Exception as ex:
+                        print(f"[TimeVis] Background patch epoch {e} failed: {ex}")
+                print(f"[TimeVis] Background patch complete for {len(other_epochs)} epochs.")
+            threading.Thread(target=_run, daemon=True).start()
 

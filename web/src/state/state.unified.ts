@@ -109,9 +109,9 @@ export type BaseMutableGlobalStore = {
         focusDisplacement: number;
         globalDrift: number;
         neighborPreservation: number;
-        meanRankHD: number;
-        trustworthiness: number;
-        continuity: number;
+        meanRankHD: number | null;
+        trustworthiness: number | null;
+        continuity: number | null;
     } | null;
 
     eifSessionInfo: {

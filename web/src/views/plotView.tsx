@@ -799,13 +799,13 @@ async function updateDisplayedRefineMetrics(
         neighborPreservation: backendMetrics?.neighbor_preservation != null
             ? backendMetrics.neighbor_preservation / 100
             : (frontendResult?.avgNeighborConsistency ?? 0),
-        meanRankHD: backendMetrics?.mean_rank_hd ?? 0,
+        meanRankHD: backendMetrics?.mean_rank_hd ?? null,
         trustworthiness: backendMetrics?.trustworthiness != null
             ? backendMetrics.trustworthiness / 100
-            : (frontendResult?.avgTrustworthiness ?? 0),
+            : null,
         continuity: backendMetrics?.continuity != null
             ? backendMetrics.continuity / 100
-            : (frontendResult?.avgContinuity ?? 0),
+            : null,
     });
 }
 
