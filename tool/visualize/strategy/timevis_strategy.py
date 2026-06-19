@@ -23,6 +23,45 @@ if _server_dir not in _sys.path:
     _sys.path.insert(0, _server_dir)
 from refine_behavior_config import resolve_refine_behavior_config
 
+def _compute_focus_metrics(snap_z, focus_indices, hd_cache, N, k, K_ext):
+    """Compute NP, MRH, Trustworthiness, Continuity for the given 2D snapshot.
+
+    hd_cache: dict mapping focus_index → {'topk': set[int], 'rank_of': dict[int,int]}
+    Reuses precomputed HD rankings so only LD distances are computed here (fast).
+    """
+    np_sum = mrh_sum = trust_sum = cont_sum = 0.0
+    for fi in focus_indices:
+        ld_dists = np.linalg.norm(snap_z - snap_z[fi], axis=1)
+        ld_dists[fi] = np.inf
+        ld_rank = np.argsort(ld_dists)
+
+        ld_rank_of   = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
+        ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
+
+        hd_topk    = hd_cache[fi]['topk']
+        hd_rank_of = hd_cache[fi]['rank_of']
+        ld_topk    = set(int(ld_rank[r]) for r in range(k))
+
+        np_sum += len(hd_topk & ld_topk) / max(k, 1)
+
+        mrh_vals = [ld_rank_full.get(j, N) for j in hd_topk]
+        mrh_sum += float(np.mean(mrh_vals)) if mrh_vals else float(N)
+
+        t_penalty = sum(max(0, hd_rank_of.get(j, K_ext + 1) - k) for j in (ld_topk - hd_topk))
+        c_penalty = sum(max(0, ld_rank_of.get(j,  K_ext + 1) - k) for j in (hd_topk - ld_topk))
+        worst = k * (K_ext - k)
+        trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
+        cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
+
+    n_f = max(len(focus_indices), 1)
+    return {
+        "neighbor_preservation": np_sum  / n_f * 100.0,
+        "mean_rank_hd":          mrh_sum / n_f,
+        "trustworthiness":  max(0.0, trust_sum / n_f * 100.0),
+        "continuity":       max(0.0, cont_sum  / n_f * 100.0),
+    }
+
+
 class TimeVis(StrategyAbstractClass):
     def __init__(self, config, data_provider):
         super().__init__(config)
@@ -344,6 +383,19 @@ class TimeVis(StrategyAbstractClass):
         _progress_cfg = behavior_cfg["progressive_updates"]
         _snapshot_every = max(1, int(_progress_cfg.get("snapshot_every_steps", 30)))
 
+        # Precompute HD rank lookup for each focus point once (reused in snapshots + final)
+        _k_metrics = min(10, N - 1)
+        _K_ext     = min(200, N - 1)
+        _hd_cache: dict = {}
+        for _fi in focus_indices:
+            _hd_dists = np.linalg.norm(full_feat - full_feat[_fi], axis=1)
+            _hd_dists[_fi] = np.inf
+            _hd_rank = np.argsort(_hd_dists)
+            _hd_cache[_fi] = {
+                'topk':    set(int(_hd_rank[r]) for r in range(_k_metrics)),
+                'rank_of': {int(_hd_rank[r]): r + 1 for r in range(_K_ext)},
+            }
+
         _loss_window     = []
         _WINDOW          = 20
         _MIN_STEPS       = int(self.config['vis_config'].get('refine_min_steps', 80))
@@ -405,13 +457,21 @@ class TimeVis(StrategyAbstractClass):
             if progress_callback and (step + 1) % _snapshot_every == 0:
                 _snap_z = full_proj_baseline.copy()
                 _snap_z[focus_indices] = focus_z.detach().cpu().numpy()
-                progress_callback({
+                try:
+                    _snap_metrics = _compute_focus_metrics(
+                        _snap_z, focus_indices, _hd_cache, N, _k_metrics, _K_ext)
+                except Exception:
+                    _snap_metrics = None
+                _snap_payload: dict = {
                     "steps_completed": step + 1,
                     "projection": _snap_z.tolist(),
                     "focus_indices": list(focus_indices),
                     "training_context_indices": list(training_context_indices),
                     "patch_indices": list(patch_indices),
-                })
+                }
+                if _snap_metrics is not None:
+                    _snap_payload["sampled_metrics"] = _snap_metrics
+                progress_callback(_snap_payload)
 
             if should_stop_callback and should_stop_callback():
                 print(f"[TimeVis] Stop requested at step {step}")
@@ -421,68 +481,12 @@ class TimeVis(StrategyAbstractClass):
         z_np = full_proj_baseline.copy()
         z_np[focus_indices] = focus_z.detach().cpu().numpy()
 
-        # Guard k so it never exceeds the number of other points (e.g. very small N).
-        k     = min(10, N - 1)
-        K_ext = min(200, N - 1)
-
-        trust_sum = 0.0
-        cont_sum  = 0.0
-        np_sum    = 0.0
-        mrh_sum   = 0.0
-
         try:
-            for fi_glob in focus_indices:
-                # High-dim ranks (argsort over all N, excluding self)
-                hd_feat_fi = full_feat[fi_glob]
-                hd_dists = np.linalg.norm(full_feat - hd_feat_fi, axis=1)
-                hd_dists[fi_glob] = np.inf
-                hd_rank = np.argsort(hd_dists)
-
-                # Low-dim ranks
-                ld_dists = np.linalg.norm(z_np - z_np[fi_glob], axis=1)
-                ld_dists[fi_glob] = np.inf
-                ld_rank = np.argsort(ld_dists)
-
-                # Rank lookup: point_idx → 1-based rank within K_ext
-                hd_rank_of = {int(hd_rank[r]): r + 1 for r in range(K_ext)}
-                ld_rank_of = {int(ld_rank[r]): r + 1 for r in range(K_ext)}
-
-                # Full LD rank lookup for MRH (covers all N-1 non-self points)
-                ld_rank_full = {int(ld_rank[r]): r + 1 for r in range(N - 1)}
-
-                hd_topk = set(int(hd_rank[r]) for r in range(k) if int(hd_rank[r]) != fi_glob)
-                ld_topk = set(int(ld_rank[r]) for r in range(k) if int(ld_rank[r]) != fi_glob)
-
-                # NP: strict top-k set intersection
-                denom_np = max(k, 1)
-                np_sum += len(hd_topk & ld_topk) / denom_np
-
-                # MRH: mean LD rank of HD top-k neighbors
-                mrh_vals = [ld_rank_full.get(int(j), N) for j in hd_topk]
-                mrh_sum += float(np.mean(mrh_vals)) if mrh_vals else float(N)
-
-                # Trustworthiness penalty: fake LD neighbors (in LD but not HD top-k)
-                t_penalty = 0.0
-                for j in (ld_topk - hd_topk):
-                    r_hd = hd_rank_of.get(int(j), K_ext + 1)
-                    t_penalty += max(0, r_hd - k)
-
-                # Continuity penalty: missing HD neighbors (in HD but not LD top-k)
-                c_penalty = 0.0
-                for j in (hd_topk - ld_topk):
-                    r_ld = ld_rank_of.get(int(j), K_ext + 1)
-                    c_penalty += max(0, r_ld - k)
-
-                # Per-point worst-case: k fake neighbors each at max rank K_ext
-                worst = k * (K_ext - k)
-                trust_sum += 1.0 - t_penalty / worst if worst > 0 else 1.0
-                cont_sum  += 1.0 - c_penalty / worst if worst > 0 else 1.0
-
-            n_f = max(len(focus_indices), 1)
-            final_np    = np_sum  / n_f * 100.0
-            final_mrh   = mrh_sum / n_f
-            final_trust = max(0.0, trust_sum / n_f * 100.0)
-            final_cont  = max(0.0, cont_sum  / n_f * 100.0)
+            _final = _compute_focus_metrics(z_np, focus_indices, _hd_cache, N, _k_metrics, _K_ext)
+            final_np    = _final["neighbor_preservation"]
+            final_mrh   = _final["mean_rank_hd"]
+            final_trust = _final["trustworthiness"]
+            final_cont  = _final["continuity"]
 
             self._last_refine_np    = final_np
             self._last_refine_mrh   = final_mrh

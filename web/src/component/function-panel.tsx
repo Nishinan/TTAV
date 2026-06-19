@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
 import { SyncOutlined } from '@ant-design/icons';
+import { BoxSelect, MousePointer2, X } from 'lucide-react';
 type SampleTag = {
     num: number;
     title: string;
@@ -35,22 +36,22 @@ const CompactCheckboxGroup = styled(Checkbox.Group)`
     font-weight: 600;
     cursor: pointer;
     transition: background-color 0.2s ease;
-    background-color: #ffffff;
-    border: 1px solid #d9d9d9;
-    
+    background-color: var(--surface-color, #ffffff);
+    border: 1px solid var(--layout-border-color, #d9d9d9);
+
     &:hover {
-      background-color: #f5f5f5;
-      border-color: #3278F0;
+      background-color: var(--token-active-color, #f5f5f5);
+      border-color: var(--accent-blue, #3278F0);
     }
   }
 
   .ant-checkbox-checked .ant-checkbox-inner {
-    background-color: #3278F0;
-    border-color: #3278F0;
+    background-color: var(--accent-blue, #3278F0);
+    border-color: var(--accent-blue, #3278F0);
     width: 14px;
     height: 14px;
   }
-  
+
   .ant-checkbox-inner {
     width: 14px;
     height: 14px;
@@ -385,6 +386,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         <Button
             size="small"
             block
+            icon={boxSelectActive ? <MousePointer2 size={12} /> : <BoxSelect size={12} />}
             onClick={() => setBoxSelectActive(!boxSelectActive)}
             style={{
                 marginBottom: 6,
@@ -392,30 +394,34 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                 color: boxSelectActive ? '#fff' : undefined,
                 borderColor: boxSelectActive ? '#7c3aed' : undefined,
                 fontWeight: boxSelectActive ? 600 : undefined,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 4,
             }}
         >
-            {boxSelectActive ? '⬛ 框选模式 ON — 再次点击退出' : '☐ 开始框选'}
+            {boxSelectActive ? 'Box Select: ON — click to exit' : 'Start Box Select'}
         </Button>
         {refineFocusType === 'tiered' && (
             <div style={{ fontSize: '11px', color: '#6b21a8', lineHeight: 1.5 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
                     <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '2px solid #f59e0b', background: 'none' }} />
-                    <span><b>{selectedIndices.length}</b> primary（点击添加，Ctrl+点击移除）</span>
+                    <span><b>{selectedIndices.length}</b> primary (click to add, Ctrl+click to remove)</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '1.5px dashed #7c3aed', background: 'none' }} />
-                    <span><b>{secondaryIndices.length}</b> secondary（框选，仅扩展上下文）</span>
+                    <span><b>{secondaryIndices.length}</b> secondary (box select, context only)</span>
                     {secondaryIndices.length > 0 && (
-                        <Button size="small" style={{ padding: '0 4px', height: 18, fontSize: 10 }} danger
+                        <Button size="small" icon={<X size={10} />} style={{ padding: '0 4px', height: 18, fontSize: 10 }} danger
                             onClick={() => { setSecondaryIndices([]); setSecondaryBoxes([]); }}>
-                            清除
+                            Clear
                         </Button>
                     )}
                 </div>
             </div>
         )}
         {refineFocusType === 'uniform' && (
-            <div style={{ fontSize: '11px', color: '#888' }}>框选区域：所有点设为 focus。</div>
+            <div style={{ fontSize: '11px', color: '#888' }}>Box selection sets all points as focus.</div>
         )}
     </div>
 
@@ -485,7 +491,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                     </div>
                 )}
             </FunctionalBlock>
-            <FunctionalBlock label="Categories">
+            <FunctionalBlock label="Categories" defaultCollapsed={true}>
                 <ComponentBlock>
                     <div className="class-list">
                         {
@@ -564,7 +570,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                     )}
                 </ComponentBlock>
             </FunctionalBlock>
-            <FunctionalBlock label="Settings">
+            <FunctionalBlock label="Settings" defaultCollapsed={true}>
                 <ComponentBlock>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -652,7 +658,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                     </div>
                 </ComponentBlock>
             </FunctionalBlock>
-            <FunctionalBlock label="Filter">
+            <FunctionalBlock label="Filter" defaultCollapsed={true}>
                 <ComponentBlock>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                         <CompactCheckboxGroup
@@ -668,7 +674,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                     </div>
                 </ComponentBlock>
             </FunctionalBlock>
-            <FunctionalBlock label="Highlight">
+            <FunctionalBlock label="Highlight" defaultCollapsed={true}>
                 <HighlightOptionBlock />
             </FunctionalBlock>
         </div>

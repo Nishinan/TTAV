@@ -800,12 +800,14 @@ async function updateDisplayedRefineMetrics(
             ? backendMetrics.neighbor_preservation / 100
             : (frontendResult?.avgNeighborConsistency ?? 0),
         meanRankHD: backendMetrics?.mean_rank_hd ?? null,
+        // Backend values are percentages (0-100); frontend values already fractions (0-1).
+        // Fall back to frontend computation during intermediate refine steps.
         trustworthiness: backendMetrics?.trustworthiness != null
             ? backendMetrics.trustworthiness / 100
-            : null,
+            : (frontendResult?.avgTrustworthiness ?? null),
         continuity: backendMetrics?.continuity != null
             ? backendMetrics.continuity / 100
-            : null,
+            : (frontendResult?.avgContinuity ?? null),
     });
 }
 

@@ -781,6 +781,7 @@ export const ChartComponent = memo(() => {
     const [trailRefresh, setTrailRefresh] = useState(0);
     useEffect(() => { setTrailRefresh((v) => v + 1); }, [selectedIndices]);
 
+
     const neighborOverlayProps = useMemo(() => {
         if (!prepared || !epochData) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors, secondaryIndices, setSecondaryIndices, secondaryBoxes } as any;
         const idsByPos = prepared.dataPoints.map((p) => p.identifier as number);
