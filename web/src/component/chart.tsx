@@ -877,34 +877,30 @@ export const ChartComponent = memo(() => {
         const x1 = Math.min(boxDrag.startX, curX), x2 = Math.max(boxDrag.startX, curX);
         const y1 = Math.min(boxDrag.startY, curY), y2 = Math.max(boxDrag.startY, curY);
         if (prepared && viewportState) {
-            // Use the actual SVG element's bounding rect so our coords match proxy.location() exactly.
-            const svgEl = atlasRef.current?.querySelector('svg');
-            const svgRect = svgEl?.getBoundingClientRect();
-            const svgW = svgRect?.width ?? overlayRect.width;
-            const svgH = svgRect?.height ?? overlayRect.height;
-            const svgOX = svgRect ? svgRect.left - overlayRect.left : 0;
-            const svgOY = svgRect ? svgRect.top - overlayRect.top : 0;
-            if (svgH <= 0) { setBoxDrag(null); return; }
+            // Use the overlay div's CSS dimensions directly.
+            // viewportState.scale is calibrated in CSS pixels
+            // (1 data unit = scale * cssHalfH CSS pixels), so we must NOT use
+            // the SVG element's physical-pixel width/height attribute here.
+            const W = overlayRect.width;
+            const H = overlayRect.height;
+            if (H <= 0) { setBoxDrag(null); return; }
 
             const { x: vx, y: vy, scale } = viewportState;
-            const halfH = svgH / 2;
-            // Coords relative to SVG origin
-            const toSvgX = (ox: number) => ox - svgOX;
-            const toSvgY = (oy: number) => oy - svgOY;
-            // SVG → data
-            const toDataX = (sx: number) => vx + (sx - svgW / 2) / (scale * halfH);
-            const toDataY = (sy: number) => vy - (sy - halfH) / (scale * halfH);
+            const halfH = H / 2;
+            // CSS → data coordinate conversion
+            const toDataX = (cx: number) => vx + (cx - W / 2) / (scale * halfH);
+            const toDataY = (cy: number) => vy - (cy - halfH) / (scale * halfH);
 
             const boxIds: number[] = [];
             for (let i = 0; i < prepared.simpleData.x.length; i++) {
-                const sx = svgW / 2 + (prepared.simpleData.x[i] - vx) * scale * halfH;
-                const sy = halfH - (prepared.simpleData.y[i] - vy) * scale * halfH;
-                // Compare in SVG space
-                if (sx >= toSvgX(x1) && sx <= toSvgX(x2) && sy >= toSvgY(y1) && sy <= toSvgY(y2))
+                // Project data point into CSS pixel space
+                const px = W / 2 + (prepared.simpleData.x[i] - vx) * scale * halfH;
+                const py = halfH - (prepared.simpleData.y[i] - vy) * scale * halfH;
+                if (px >= x1 && px <= x2 && py >= y1 && py <= y2)
                     boxIds.push(prepared.dataPoints[i].identifier as number);
             }
             const dataBox: [number, number, number, number] = [
-                toDataX(toSvgX(x1)), toDataY(toSvgY(y1)), toDataX(toSvgX(x2)), toDataY(toSvgY(y2)),
+                toDataX(x1), toDataY(y1), toDataX(x2), toDataY(y2),
             ];
             if (refineFocusType === 'tiered') {
                 const primarySet = new Set(selectedIndices);

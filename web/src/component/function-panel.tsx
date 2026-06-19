@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
 import { SyncOutlined } from '@ant-design/icons';
-import { BoxSelect, MousePointer2, X } from 'lucide-react';
+import { BoxSelect, MousePointer2, X, XCircle, RefreshCw } from 'lucide-react';
 type SampleTag = {
     num: number;
     title: string;
@@ -341,153 +341,176 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                 }
             </FunctionalBlock>
 <FunctionalBlock label="Precision Control">
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-        <span style={{ fontSize: '12px' }}>Focus Mode</span>
+    {/* Row: Focus Type */}
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Focus Type</span>
         <Select
             size="small"
-            value={focusMode}
-            style={{ width: '120px' }}
-            onChange={(value: FocusMode) => {
-                setFocusMode(value);
-                // 注意：这里不再自动触发异步重训，只改 UI 状态
+            value={refineFocusType}
+            style={{ width: 110 }}
+            onChange={(v: RefineFocusType) => {
+                setRefineFocusType(v);
+                if (v === 'uniform') { setSecondaryIndices([]); setSecondaryBoxes([]); }
             }}
             options={[
-                { value: 'coarse', label: 'Coarse' },
-                { value: 'balanced', label: 'Balanced' },
-                { value: 'fine', label: 'Fine' },
+                { value: 'uniform', label: 'All Focus' },
+                { value: 'tiered', label: 'Tiered' },
             ]}
         />
     </div>
-    
-    <div className='alt-text' style={{ fontSize: '11px', lineHeight: '1.4', marginBottom: '12px', color: '#888' }}>
-        {focusMode === 'coarse' && 'Visual highlight only.'}
-        {focusMode === 'balanced' && 'Increase sampling weight.'}
-        {focusMode === 'fine' && 'Enable LoRA local adaptation.'}
-    </div>
 
-    {/* Focus type + box select */}
-    <div style={{ marginBottom: '8px', border: '1px solid #e5e7eb', borderRadius: 6, padding: '8px', background: '#faf5ff' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-            <span style={{ fontSize: '12px', fontWeight: 600, color: '#6b21a8' }}>Focus Type</span>
-            <Select
-                size="small"
-                value={refineFocusType}
-                style={{ width: '120px' }}
-                onChange={(v: RefineFocusType) => {
-                    setRefineFocusType(v);
-                    if (v === 'uniform') { setSecondaryIndices([]); setSecondaryBoxes([]); }
-                }}
-                options={[
-                    { value: 'uniform', label: 'All Focus' },
-                    { value: 'tiered', label: 'Tiered' },
-                ]}
-            />
-        </div>
-        <Button
-            size="small"
-            block
-            icon={boxSelectActive ? <MousePointer2 size={12} /> : <BoxSelect size={12} />}
-            onClick={() => setBoxSelectActive(!boxSelectActive)}
-            style={{
-                marginBottom: 6,
-                background: boxSelectActive ? '#7c3aed' : undefined,
-                color: boxSelectActive ? '#fff' : undefined,
-                borderColor: boxSelectActive ? '#7c3aed' : undefined,
-                fontWeight: boxSelectActive ? 600 : undefined,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 4,
-            }}
-        >
-            {boxSelectActive ? 'Box Select: ON — click to exit' : 'Start Box Select'}
-        </Button>
-        {refineFocusType === 'tiered' && (
-            <div style={{ fontSize: '11px', color: '#6b21a8', lineHeight: 1.5 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                    <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '2px solid #f59e0b', background: 'none' }} />
-                    <span><b>{selectedIndices.length}</b> primary (click to add, Ctrl+click to remove)</span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', border: '1.5px dashed #7c3aed', background: 'none' }} />
-                    <span><b>{secondaryIndices.length}</b> secondary (box select, context only)</span>
-                    {secondaryIndices.length > 0 && (
-                        <Button size="small" icon={<X size={10} />} style={{ padding: '0 4px', height: 18, fontSize: 10 }} danger
-                            onClick={() => { setSecondaryIndices([]); setSecondaryBoxes([]); }}>
-                            Clear
-                        </Button>
-                    )}
-                </div>
+    {/* Box Select button */}
+    <Button
+        size="small"
+        block
+        icon={boxSelectActive ? <MousePointer2 size={12} /> : <BoxSelect size={12} />}
+        onClick={() => setBoxSelectActive(!boxSelectActive)}
+        style={{
+            marginBottom: 8,
+            background: boxSelectActive ? 'var(--accent-blue)' : undefined,
+            color: boxSelectActive ? '#fff' : undefined,
+            borderColor: boxSelectActive ? 'var(--accent-blue)' : undefined,
+            fontWeight: boxSelectActive ? 600 : undefined,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 4,
+        }}
+    >
+        {boxSelectActive ? 'Box Select: ON — click to exit' : 'Start Box Select'}
+    </Button>
+
+    {/* Point counts */}
+    {refineFocusType === 'tiered' ? (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6, marginBottom: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', border: '2px solid var(--color-warning)', flexShrink: 0 }} />
+                <span><b style={{ color: 'var(--text-primary)' }}>{selectedIndices.length}</b> primary</span>
             </div>
-        )}
-        {refineFocusType === 'uniform' && (
-            <div style={{ fontSize: '11px', color: '#888' }}>Box selection sets all points as focus.</div>
-        )}
-    </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', border: '1.5px dashed var(--accent-blue)', flexShrink: 0 }} />
+                <span><b style={{ color: 'var(--text-primary)' }}>{secondaryIndices.length}</b> secondary</span>
+                {secondaryIndices.length > 0 && (
+                    <Button size="small" icon={<X size={10} />} style={{ padding: '0 4px', height: 16, fontSize: 10, marginLeft: 'auto' }} danger
+                        onClick={() => { setSecondaryIndices([]); setSecondaryBoxes([]); }}>
+                        Clear
+                    </Button>
+                )}
+            </div>
+        </div>
+    ) : (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: 'var(--accent-blue)', marginRight: 6 }} />
+            <b style={{ color: 'var(--text-primary)' }}>{selectedIndices.length}</b> points selected
+        </div>
+    )}
 
-    {/* 显式 Update 按钮 */}
-    <Button 
-        type="primary" 
-        block 
+    {/* Update button */}
+    <Button
+        type="primary"
+        block
         size="small"
         icon={<SyncOutlined />}
         disabled={!refineReady}
-        // 调用从父组件 AppCombinedView 传下来的异步处理函数
         onClick={onUpdateProjection}
-        style={{ 
-            marginTop: '8px', 
-            borderRadius: '4px',
-            fontWeight: 500 
-        }}
+        style={{ borderRadius: 4, fontWeight: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
     >
-        {refineReady ? 'Update Projection' : 'Preparing Adaptive Refine...'}
+        {refineReady ? 'Update Projection' : 'Preparing...'}
     </Button>
     {!refineReady && refineStatusMessage && (
-        <div className='alt-text' style={{ fontSize: '11px', lineHeight: '1.4', marginTop: '8px', color: '#888' }}>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, marginTop: 6 }}>
             {refineStatusMessage}
         </div>
     )}
 </FunctionalBlock>
             <FunctionalBlock label="Refine Quality">
                 {refineMetrics ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '2px 0' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                        {/* ── POSITION group ── */}
+                        <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4 }}>
+                            Position
+                        </div>
                         {[
-                            { label: 'Focus Displacement', value: refineMetrics.focusDisplacement, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of selected focus points after refine. Larger = more effect.' },
-                            { label: 'Global Drift', value: refineMetrics.globalDrift, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of non-focus points. Smaller = more stable globally.' },
-                            { label: 'NP (k=10)', value: refineMetrics.neighborPreservation, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Neighbor Preservation: fraction of high-dim top-10 neighbors that also appear in low-dim top-10. Typical 2D range: 5–40%. Higher is better.' },
-                            { label: 'HD-Nbr Rank', value: refineMetrics.meanRankHD, format: (v: number) => v.toFixed(1), tip: 'Mean LD rank of HD top-10 neighbors (lower = better). Ideal ≈ 5.5. Crowded-but-good projections have NP=0% yet low rank (e.g. 12–20), meaning HD neighbors are just outside top-10 due to density, not misplacement.' },
-                            { label: 'Trustworthiness', value: refineMetrics.trustworthiness, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Are the low-dim neighbors trustworthy? Penalises points shown as neighbors in 2D that are actually far away in high-dim. Satisfying: >70%. Excellent: >85%.' },
-                            { label: 'Continuity', value: refineMetrics.continuity, format: (v: number) => `${(v * 100).toFixed(1)}%`, tip: 'Are high-dim neighbors preserved in 2D? Penalises high-dim neighbors that got pushed far away in the projection. Satisfying: >70%. Excellent: >85%.' },
+                            { label: 'Displacement', value: refineMetrics.focusDisplacement, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of focus points. Larger = more effect.' },
+                            { label: 'Global Drift', value: refineMetrics.globalDrift, format: (v: number) => v.toFixed(4), tip: 'Average 2D movement of non-focus points. Smaller = more stable.' },
                         ].map(({ label, value, format, tip }) => (
                             <Tooltip key={label} title={tip} placement="left">
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'help' }}>
-                                    <span style={{ fontSize: 11, color: '#666' }}>{label}</span>
-                                    <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'monospace', color: value == null ? '#bbb' : '#1a1a1a' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'help', marginBottom: 3 }}>
+                                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{label}</span>
+                                    <span style={{ fontSize: 11, fontWeight: 600, fontFamily: 'var(--metric-value-font)', color: value == null ? 'var(--text-muted)' : 'var(--text-primary)' }}>
                                         {value == null ? '—' : format(value)}
                                     </span>
                                 </div>
                             </Tooltip>
                         ))}
-                        {/* Mini bar: Focus Displacement vs Global Drift ratio */}
-                        <div style={{ marginTop: 4 }}>
-                            <div style={{ fontSize: 10, color: '#999', marginBottom: 2 }}>Focus / Drift ratio</div>
-                            <div style={{ height: 6, background: '#f0f0f0', borderRadius: 3, overflow: 'hidden' }}>
+
+                        {/* ── STRUCTURE group ── */}
+                        <div style={{ borderTop: '1px solid var(--layout-border-color)', margin: '6px 0 4px' }} />
+                        <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4 }}>
+                            Structure
+                        </div>
+                        {[
+                            {
+                                label: 'NP (k=10)', value: refineMetrics.neighborPreservation,
+                                format: (v: number) => `${(v * 100).toFixed(1)}%`,
+                                dot: (v: number) => v * 100 >= 25 ? 'var(--color-success)' : v * 100 >= 10 ? 'var(--color-warning)' : 'var(--color-error)',
+                                tip: 'Neighbor Preservation: fraction of HD top-10 neighbors in LD top-10. Range 5–40%. Higher is better.',
+                            },
+                            {
+                                label: 'HD Rank', value: refineMetrics.meanRankHD,
+                                format: (v: number) => v.toFixed(1),
+                                dot: (v: number) => v <= 10 ? 'var(--color-success)' : v <= 25 ? 'var(--color-warning)' : 'var(--color-error)',
+                                tip: 'Mean LD rank of HD top-10 neighbors. Lower is better. Ideal ≈ 5.5.',
+                            },
+                            {
+                                label: 'Trustworthiness', value: refineMetrics.trustworthiness,
+                                format: (v: number) => `${(v * 100).toFixed(1)}%`,
+                                dot: (v: number) => v * 100 >= 85 ? 'var(--color-success)' : v * 100 >= 70 ? 'var(--color-warning)' : 'var(--color-error)',
+                                tip: 'Are LD neighbors trustworthy? Penalises false LD neighbors. Satisfying: >70%. Excellent: >85%.',
+                            },
+                            {
+                                label: 'Continuity', value: refineMetrics.continuity,
+                                format: (v: number) => `${(v * 100).toFixed(1)}%`,
+                                dot: (v: number) => v * 100 >= 85 ? 'var(--color-success)' : v * 100 >= 70 ? 'var(--color-warning)' : 'var(--color-error)',
+                                tip: 'Are HD neighbors preserved in LD? Penalises missing HD neighbors in projection. Satisfying: >70%. Excellent: >85%.',
+                            },
+                        ].map(({ label, value, format, dot, tip }) => (
+                            <Tooltip key={label} title={tip} placement="left">
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'help', marginBottom: 3 }}>
+                                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{label}</span>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        <span style={{ fontSize: 11, fontWeight: 600, fontFamily: 'var(--metric-value-font)', color: value == null ? 'var(--text-muted)' : 'var(--text-primary)' }}>
+                                            {value == null ? '—' : format(value)}
+                                        </span>
+                                        {value != null && (
+                                            <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: dot(value), flexShrink: 0 }} />
+                                        )}
+                                    </div>
+                                </div>
+                            </Tooltip>
+                        ))}
+
+                        {/* ── Focus / Drift ratio bar ── */}
+                        <div style={{ borderTop: '1px solid var(--layout-border-color)', marginTop: 6, paddingTop: 6 }}>
+                            <div style={{ height: 5, background: 'var(--layout-border-color)', borderRadius: 3, overflow: 'hidden' }}>
                                 <div style={{
                                     height: '100%',
-                                    width: `${Math.min(100, refineMetrics.globalDrift > 0 ? Math.min(refineMetrics.focusDisplacement / (refineMetrics.focusDisplacement + refineMetrics.globalDrift) * 100, 100) : 100)}%`,
-                                    background: 'linear-gradient(90deg, #52c41a, #1890ff)',
+                                    width: `${Math.min(100, refineMetrics.globalDrift > 0
+                                        ? Math.min(refineMetrics.focusDisplacement / (refineMetrics.focusDisplacement + refineMetrics.globalDrift) * 100, 100)
+                                        : 100)}%`,
+                                    background: 'linear-gradient(90deg, var(--color-success), var(--accent-blue))',
                                     borderRadius: 3,
                                     transition: 'width 0.4s ease',
                                 }} />
                             </div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#aaa', marginTop: 1 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
                                 <span>focus</span><span>drift</span>
                             </div>
                         </div>
                     </div>
                 ) : (
-                    <div style={{ fontSize: 11, color: '#aaa', textAlign: 'center', padding: '8px 0' }}>
-                        Run Update to see metrics
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '10px 0' }}>
+                        Run Update Projection to see metrics
                     </div>
                 )}
             </FunctionalBlock>
@@ -515,12 +538,8 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                 <ComponentBlock>
                     {selectedItems.length > 0 && (
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                            <span style={{ fontSize: 12, color: '#666' }}>{selectedItems.length} selected</span>
-                            <Button
-                                size="small"
-                                danger
-                                onClick={() => setSelectedIndices([])}
-                            >
+                            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{selectedItems.length} selected</span>
+                            <Button size="small" danger onClick={() => setSelectedIndices([])}>
                                 Clear All
                             </Button>
                         </div>
@@ -551,12 +570,12 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                     </div>
                     {selectedRelations.length > 0 && (
                         <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                            <div style={{ fontSize: 12, color: '#666', fontWeight: 600 }}>Selected Relations</div>
+                            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>Relations</div>
                             {selectedRelations.map((relation) => (
-                                <div key={relation.key} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 12 }}>
-                                    <span style={{ color: '#1f2937' }}>{relation.left.num}</span>
-                                    <span style={{ color: '#9ca3af' }}>↔</span>
-                                    <span style={{ color: '#1f2937' }}>{relation.right.num}</span>
+                                <div key={relation.key} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
+                                    <span style={{ color: 'var(--text-primary)' }}>{relation.left.num}</span>
+                                    <span style={{ color: 'var(--text-muted)' }}>↔</span>
+                                    <span style={{ color: 'var(--text-primary)' }}>{relation.right.num}</span>
                                     {relation.hdMutual && <Tag color="red">HD↔</Tag>}
                                     {relation.hdOneWay && <Tag color="volcano">HD→</Tag>}
                                     {relation.ldMutual && <Tag color="blue">LD↔</Tag>}
@@ -572,57 +591,45 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
             </FunctionalBlock>
             <FunctionalBlock label="Settings" defaultCollapsed={true}>
                 <ComponentBlock>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Point Size</span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {/* Point Size */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Point Size</span>
                             <Slider
-                                min={1}
-                                max={5}
-                                step={1}
-                                dots
-                                marks={pointSizeMarks}
+                                min={1} max={5} step={1} dots marks={pointSizeMarks}
                                 value={pointSize}
                                 onChange={(v) => setPointSize(v as number)}
-                                style={{ minWidth: 80, flex: 1 }}
+                                style={{ flex: 1, minWidth: 60 }}
                             />
                         </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Mode</span>
+
+                        <div style={{ borderTop: '1px solid var(--layout-border-color)', margin: '2px 0' }} />
+
+                        {/* Mode */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Mode</span>
                             <Select
-                                size="small"
-                                style={{ width: 240 }}
-                                value={mode}
-                                onChange={(v) => setMode(v)}
+                                size="small" style={{ flex: 1 }} value={mode} onChange={(v) => setMode(v)}
                                 options={[
                                     { label: 'Points', value: 'points' },
                                     { label: 'Density', value: 'density' },
                                 ]}
                             />
                         </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Neighbors</span>
+
+                        {/* Neighbors */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Neighbors</span>
                             <Select
-                                size="small"
-                                style={{ width: 240 }}
+                                size="small" style={{ flex: 1 }}
                                 value={
                                     revealOriginalNeighbors && revealProjectionNeighbors ? 'both'
-                                    : (revealOriginalNeighbors ? 'original'
-                                    : (revealProjectionNeighbors ? 'projection' : 'none'))
+                                    : revealOriginalNeighbors ? 'original'
+                                    : revealProjectionNeighbors ? 'projection' : 'none'
                                 }
                                 onChange={(v) => {
-                                    if (v === 'none') {
-                                        setRevealOriginalNeighbors(false);
-                                        setRevealProjectionNeighbors(false);
-                                    } else if (v === 'original') {
-                                        setRevealOriginalNeighbors(true);
-                                        setRevealProjectionNeighbors(false);
-                                    } else if (v === 'projection') {
-                                        setRevealOriginalNeighbors(false);
-                                        setRevealProjectionNeighbors(true);
-                                    } else if (v === 'both') {
-                                        setRevealOriginalNeighbors(true);
-                                        setRevealProjectionNeighbors(true);
-                                    }
+                                    setRevealOriginalNeighbors(v === 'original' || v === 'both');
+                                    setRevealProjectionNeighbors(v === 'projection' || v === 'both');
                                 }}
                                 options={[
                                     { label: 'None', value: 'none' },
@@ -632,29 +639,21 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                 ]}
                             />
                         </div>
-                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
-                            <span style={{ minWidth: 80, fontSize: 12, fontWeight: 600 }}>Display</span>
-                            <div style={{ border: '1px solid #d9d9d9', borderRadius: 6, padding: '8px', background: '#ffffff', width: 240 }}>
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                        <span style={{ fontSize: 12 }}>Show Label</span>
-                                        <Switch size="small" checked={showLabel} onChange={(v) => setShowLabel(v)} />
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                        <span style={{ fontSize: 12 }}>Show Index</span>
-                                        <Switch size="small" checked={showIndex} onChange={(v) => setShowIndex(v)} />
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                        <span style={{ fontSize: 12 }}>Show Trail</span>
-                                        <Switch size="small" checked={showTrail} onChange={(v) => setShowTrail(v)} />
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                        <span style={{ fontSize: 12 }}>Show Background</span>
-                                        <Switch size="small" checked={showBackground} onChange={(v) => setShowBackground(v)} />
-                                    </div>
-                                </div>
+
+                        <div style={{ borderTop: '1px solid var(--layout-border-color)', margin: '2px 0' }} />
+
+                        {/* Display switches — flat rows, no nested card */}
+                        {[
+                            { label: 'Show Label',      checked: showLabel,      onChange: setShowLabel },
+                            { label: 'Show Index',      checked: showIndex,      onChange: setShowIndex },
+                            { label: 'Show Trail',      checked: showTrail,      onChange: setShowTrail },
+                            { label: 'Show Background', checked: showBackground, onChange: setShowBackground },
+                        ].map(({ label, checked, onChange }) => (
+                            <div key={label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{label}</span>
+                                <Switch size="small" checked={checked} onChange={(v) => onChange(v)} />
                             </div>
-                        </div>
+                        ))}
                     </div>
                 </ComponentBlock>
             </FunctionalBlock>
@@ -688,8 +687,8 @@ function HighlightOptionBlock() {
     const { highlightData, setHighlightData } = useDefaultStore(["highlightData", "setHighlightData"]);
 
     const [highlightTypes, setHighlightTypes] = useState([
-        { type: 'prediction_error', label: 'Prediction Error', enabled: false, icon: '❌', description: 'Samples with wrong prediction at current epoch.' },
-        { type: 'prediction_flip', label: 'Prediction Flip', enabled: false, icon: '🔄', description: 'Samples with prediction flip at current epoch.' }
+        { type: 'prediction_error', label: 'Prediction Error', enabled: false, icon: 'error', description: 'Samples with wrong prediction at current epoch.' },
+        { type: 'prediction_flip', label: 'Prediction Flip', enabled: false, icon: 'flip', description: 'Samples with prediction flip at current epoch.' }
     ]);
 
     const handleToggleHighlightType = (type: string) => {
@@ -720,10 +719,12 @@ function HighlightOptionBlock() {
                     style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}
                 >
                     <div style={{ display: 'flex', alignItems: 'center' }}>
-                        <div className="highlight-icon" style={{ marginRight: '8px', fontSize: '12px' }}>
-                            {highlight.icon}
+                        <div className="highlight-icon" style={{ marginRight: '8px', display: 'flex', alignItems: 'center' }}>
+                            {highlight.icon === 'error'
+                                ? <XCircle size={13} color="var(--color-error)" />
+                                : <RefreshCw size={13} color="var(--color-warning)" />}
                         </div>
-                        <div className="highlight-label" style={{ fontSize: '12px' }} >
+                        <div className="highlight-label" style={{ fontSize: 11, color: 'var(--text-primary)' }}>
                             {highlight.label}
                         </div>
                     </div>
