@@ -25,6 +25,8 @@ interface TimelineProps {
 
 function Timeline({ epoch, epochs, progress, onSwitchEpoch }: TimelineProps) {
     const stableEpochs = useStableEpochs(epochs);
+    const { refinedEpochs } = useDefaultStore(['refinedEpochs']);   // C2
+    const refinedSet = useMemo(() => new Set(refinedEpochs), [refinedEpochs]);
     const [isPlaying, setIsPlaying] = useState(false);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const currentEpochIndexRef = useRef<number>(stableEpochs.indexOf(epoch));
@@ -172,8 +174,21 @@ function Timeline({ epoch, epochs, progress, onSwitchEpoch }: TimelineProps) {
                             const fill = isLoaded
                                 ? (isActive ? 'var(--accent-blue, #3278F0)' : 'var(--accent-blue-light, #72A8F0)')
                                 : 'var(--layout-border-color, #e0e0e0)';
+                            const isRefined = refinedSet.has(node.value);
                             return (
                                 <g key={index} transform={`translate(${node.x}, ${node.y})`}>
+                                    {/* C2: green ring marks epochs whose refined projection is ready */}
+                                    {isRefined && (
+                                        <circle
+                                            r="11"
+                                            fill="none"
+                                            stroke="var(--color-success, #22c55e)"
+                                            strokeWidth="2"
+                                            style={{ transition: 'all 0.4s ease-in-out' }}
+                                        >
+                                            <title>Refined</title>
+                                        </circle>
+                                    )}
                                     <circle
                                         r="8"
                                         fill={fill}
@@ -227,21 +242,26 @@ export function MainBlock() {
     const { epoch, setEpoch } = useDefaultStore(['epoch', 'setEpoch']);
     const { availableEpochs } = useDefaultStore(['availableEpochs']);
     const { progress } = useDefaultStore(['progress']);
+    const { eifSessionInfo } = useDefaultStore(['eifSessionInfo']);
+
+    const isEifMode = !!eifSessionInfo?.isEifBundle;
 
     return (
         <div className="canvas-column">
             <ChartComponent />
-            <div id="footer">
-                <Timeline
-                    epoch={epoch}
-                    epochs={availableEpochs}
-                    progress={progress}
-                    onSwitchEpoch={(e) => {
-                        setEpoch(e);
-                        notifyEpochSwitch(e);
-                    }}
-                />
-            </div>
+            {!isEifMode && (
+                <div id="footer">
+                    <Timeline
+                        epoch={epoch}
+                        epochs={availableEpochs}
+                        progress={progress}
+                        onSwitchEpoch={(e) => {
+                            setEpoch(e);
+                            notifyEpochSwitch(e);
+                        }}
+                    />
+                </div>
+            )}
         </div>
     );
 }

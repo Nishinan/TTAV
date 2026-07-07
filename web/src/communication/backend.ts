@@ -104,13 +104,21 @@ export function startRefineSession(
     currentEpoch?: number,
     zoomBBox?: ViewportBBox | null,
     secondaryIndices?: number[],
-    options?: NetworkOptions
+    options?: NetworkOptions,
+    topK?: number,
+    priority?: number
 ) {
     const data: Record<string, any> = {
         "content_path": contentPath,
         "selected_indices": selectedIndices,
         "focus_mode": focusMode,
     };
+    if (topK !== undefined && topK !== null) {
+        data["refine_top_k"] = topK;
+    }
+    if (priority !== undefined && priority !== null) {
+        data["refine_priority"] = priority;
+    }
     if (currentEpoch !== undefined) {
         data["current_epoch"] = currentEpoch;
     }
@@ -126,6 +134,39 @@ export function startRefineSession(
         data["secondary_indices"] = secondaryIndices;
     }
     return basicPostWithJsonResponse('/startRefineSession', data, options);
+}
+
+// B3 Undo: revert refinement to the pre-refine baseline. epoch omitted → all epochs.
+export function discardRefine(
+    contentPath: string,
+    visMethod: string,
+    visId: string,
+    epoch?: number,
+    options?: NetworkOptions
+) {
+    const data: Record<string, any> = {
+        "content_path": contentPath,
+        "vis_method": visMethod,
+        "vis_id": visId,
+    };
+    if (epoch !== undefined && epoch !== null) {
+        data["epoch"] = epoch;
+    }
+    return basicPostWithJsonResponse('/discardRefine', data, options);
+}
+
+// C2: which epochs currently have a refined projection on disk.
+export function getRefinedEpochs(
+    contentPath: string,
+    visMethod: string,
+    visId: string,
+    options?: NetworkOptions
+) {
+    return basicPostWithJsonResponse('/refinedEpochs', {
+        "content_path": contentPath,
+        "vis_method": visMethod,
+        "vis_id": visId,
+    }, options);
 }
 
 export function getRefineSessionProgress(
@@ -246,6 +287,7 @@ export function getProjectionNeighbors(
     blendBBox?: ViewportBBox | null,
     blendFocusIndices?: number[] | null,
     blendDecayRatio?: number,
+    projectionData?: number[][] | null,
     options?: NetworkOptions
 ) {
     const data: Record<string, any> = {
@@ -255,19 +297,25 @@ export function getProjectionNeighbors(
         "epoch": epoch,
         "refine_flag": refineFlag
     };
-    if (blendBBox) {
-        data["blend_bbox"] = {
-            "x_min": blendBBox.xMin,
-            "x_max": blendBBox.xMax,
-            "y_min": blendBBox.yMin,
-            "y_max": blendBBox.yMax,
-        };
-    }
-    if (blendFocusIndices && blendFocusIndices.length > 0) {
-        data["blend_focus_indices"] = blendFocusIndices;
-    }
-    if (blendDecayRatio !== undefined) {
-        data["blend_decay_ratio"] = blendDecayRatio;
+    if (projectionData && projectionData.length > 0) {
+        // Pass the already-blended projection so the backend computes neighbors
+        // from exactly the same coordinates that are displayed.
+        data["projection_data"] = projectionData;
+    } else {
+        if (blendBBox) {
+            data["blend_bbox"] = {
+                "x_min": blendBBox.xMin,
+                "x_max": blendBBox.xMax,
+                "y_min": blendBBox.yMin,
+                "y_max": blendBBox.yMax,
+            };
+        }
+        if (blendFocusIndices && blendFocusIndices.length > 0) {
+            data["blend_focus_indices"] = blendFocusIndices;
+        }
+        if (blendDecayRatio !== undefined) {
+            data["blend_decay_ratio"] = blendDecayRatio;
+        }
     }
     return basicPostWithJsonResponse('/getProjectionNeighbors', data, options);
 }

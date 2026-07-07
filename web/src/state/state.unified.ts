@@ -122,6 +122,26 @@ export type BaseMutableGlobalStore = {
         message: string;
         updatedAt: number;
     } | null;
+
+    // Refine status for LIVE badge
+    refineStatus: 'idle' | 'running' | 'done';
+    refineProgress: { completed: number; total: number };
+
+    // Which of the selected focus points to show neighbor lines for
+    neighborDisplayIndices: number[];
+
+    // C3: neighborhood size (top-k) the refine objective preserves. Range 3–20.
+    refineTopK: number;
+
+    // B1: accuracy↔layout tradeoff for refine, 0 (preserve layout) … 1 (max accuracy).
+    refinePriority: number;
+
+    // B3: when true, the plot shows the pre-refine baseline (originalProjection)
+    // instead of the refined projection — a non-destructive before/after toggle.
+    showPreRefine: boolean;
+
+    // C2: epochs that currently have a refined projection (for timeline marking).
+    refinedEpochs: number[];
 };
 
 export let initMutableGlobalStore: BaseMutableGlobalStore = {
@@ -200,6 +220,14 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     refineMetrics: null,
 
     eifSessionInfo: null,
+
+    refineStatus: 'idle',
+    refineProgress: { completed: 0, total: 0 },
+    neighborDisplayIndices: [],
+    refineTopK: 10,
+    refinePriority: 0.5,
+    showPreRefine: false,
+    refinedEpochs: [],
 };
 
 type SetFunction<T> = (setState: (state: T) => T | Partial<T>) => void;

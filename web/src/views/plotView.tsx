@@ -828,6 +828,8 @@ export function AppCombinedView() {
         setHoveredIndex,
         eifSessionInfo,
         secondaryIndices,
+        refineTopK,
+        refinePriority,
     } = useDefaultStore([
         'contentPath',
         'selectedIndices',
@@ -841,6 +843,8 @@ export function AppCombinedView() {
         'setHoveredIndex',
         'eifSessionInfo',
         'secondaryIndices',
+        'refineTopK',
+        'refinePriority',
     ]);
 // 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
     const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
@@ -904,6 +908,8 @@ export function AppCombinedView() {
             return;
         }
         isRefining.current = true;
+        useGlobalStore.getState().setValue('refineStatus', 'running');
+        useGlobalStore.getState().setValue('refineProgress', { completed: 0, total: 0 });
         message.loading({ content: 'Refining layout...', key: REFINE_MSG_KEY, duration: 0 });
 
         try {
@@ -915,6 +921,9 @@ export function AppCombinedView() {
                 epoch,
                 currentViewportBBox,
                 secondaryIndices && secondaryIndices.length > 0 ? secondaryIndices : undefined,
+                undefined,
+                refineTopK,
+                refinePriority,
             );
 
             if (startResponse && (startResponse as any).status === "success") {
@@ -997,11 +1006,27 @@ export function AppCombinedView() {
                             ?? (progress as any)?.resolved_refine_behavior?.stopping?.max_steps
                             ?? 0
                         );
+                        useGlobalStore.getState().setValue('refineProgress', { completed: stepsCompleted, total: maxSteps });
                         await updateDisplayedRefineMetrics(focusIndices, oldEpochData, liveEpochData, latestSampledMetrics);
+
+                        // A2: enrich the progress message with live neighbor status
+                        // (NP %, how many neighbors still out of place, and whether
+                        // the single-focus escalation is actively pushing harder).
+                        const live = (progress as any).refine_live;
+                        let statusBits = `${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps`;
+                        if (live && typeof live.np === 'number') {
+                            statusBits += ` · NP ${live.np.toFixed(0)}%`;
+                        }
+                        if (live && typeof live.unsatisfied_count === 'number' && live.unsatisfied_count > 0) {
+                            statusBits += ` · ${live.unsatisfied_count} neighbor${live.unsatisfied_count > 1 ? 's' : ''} left`;
+                        }
+                        if (live && live.escalating) {
+                            statusBits += ` · pushing ×${live.rank_scale}`;
+                        }
                         message.loading({
                             content: (progress as any).stop_requested
-                                ? `Stopping refine... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps`
-                                : (stepsCompleted > 0 ? `Refining layout... ${stepsCompleted}${maxSteps > 0 ? ` / ${maxSteps}` : ''} steps` : 'Refining layout...'),
+                                ? `Stopping refine... ${statusBits}`
+                                : (stepsCompleted > 0 ? `Refining layout... ${statusBits}` : 'Refining layout...'),
                             key: REFINE_MSG_KEY,
                             duration: 0,
                         });
@@ -1027,21 +1052,23 @@ export function AppCombinedView() {
 
                 const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
                 const refinedProjection = projResp.projection || oldEpochData.projection;
+                const blendedProjection = buildBlendedProjection(
+                    blendBaseline,
+                    refinedProjection,
+                    currentViewportBBox,
+                    focusIndices,
+                );
+                // Compute neighbors from the exact blended positions being displayed.
+                // Sending projectionData lets the backend use the same coordinates
+                // as the visual — prevents neighbor lines pointing to wrong positions.
                 const projNeighResp = await BackendAPI.getProjectionNeighbors(
                     contentPath,
                     vis_method,
                     currentVisID,
                     targetEpoch,
                     true,
-                    currentViewportBBox,
-                    focusIndices,
-                    DEFAULT_BLEND_DECAY_RATIO,
-                );
-                const blendedProjection = buildBlendedProjection(
-                    blendBaseline,
-                    refinedProjection,
-                    currentViewportBBox,
-                    focusIndices,
+                    null, null, undefined,
+                    blendedProjection,
                 );
                 const newEpochData = {
                     ...oldEpochData,
@@ -1062,7 +1089,45 @@ export function AppCombinedView() {
                 await updateDisplayedRefineMetrics(focusIndices, oldEpochData, newEpochData, backendMetrics);
                 calculateDisplacementStats(oldEpochData.projection, newEpochData.projection, focusIndices, newEpochData.indexList || []);
 
-                message.success({ content: `Epoch ${targetEpoch} refined! Refined projection updated!`, key: REFINE_MSG_KEY });
+                // B2: surface the refine outcome so the single-vs-multi promise is
+                // explicit — a single point converges to 100%, whereas multi-focus
+                // (or a non-planar neighborhood) is best-effort. refine_status.message
+                // is generated by the backend (D2).
+                const refineStatus = (finalProgress as any)?.result?.refine_status;
+                const npStr = refineStatus && typeof refineStatus.final_np === 'number'
+                    ? `${refineStatus.final_np.toFixed(0)}%` : null;
+                if (refineStatus && refineStatus.converged === false) {
+                    message.warning({
+                        content: `Epoch ${targetEpoch} refined${npStr ? ` (NP ${npStr})` : ''}. ${refineStatus.message ?? ''}`,
+                        key: REFINE_MSG_KEY,
+                        duration: 6,
+                    });
+                } else {
+                    message.success({
+                        content: `Epoch ${targetEpoch} refined!${npStr ? ` ${npStr} top-10 neighbor accuracy.` : ' Refined projection updated!'}`,
+                        key: REFINE_MSG_KEY,
+                    });
+                }
+                useGlobalStore.getState().setValue('refineStatus', 'done');
+                window.setTimeout(() => {
+                    if (useGlobalStore.getState().refineStatus === 'done') {
+                        useGlobalStore.getState().setValue('refineStatus', 'idle');
+                    }
+                }, 3000);
+
+                // C2: refresh which epochs are refined (current epoch now; the rest
+                // fill in as the background patch_other_epochs completes — re-poll).
+                const refreshRefinedEpochs = async () => {
+                    try {
+                        const r = await BackendAPI.getRefinedEpochs(contentPath, vis_method, currentVisID);
+                        if (Array.isArray((r as any).refined_epochs)) {
+                            useGlobalStore.getState().setValue('refinedEpochs', (r as any).refined_epochs as number[]);
+                        }
+                    } catch { /* non-critical */ }
+                };
+                refreshRefinedEpochs();
+                window.setTimeout(refreshRefinedEpochs, 3000);
+                window.setTimeout(refreshRefinedEpochs, 8000);
             } else {
                 message.error({ content: 'Refinement returned unexpected status.', key: REFINE_MSG_KEY });
             }
@@ -1071,6 +1136,9 @@ export function AppCombinedView() {
             message.error({ content: 'Failed to update projection.', key: REFINE_MSG_KEY });
         } finally {
             isRefining.current = false;
+            if (useGlobalStore.getState().refineStatus === 'running') {
+                useGlobalStore.getState().setValue('refineStatus', 'idle');
+            }
         }
     };
     // 1. 监听全局选点，确保 selectedIndices 响应
@@ -1079,48 +1147,48 @@ export function AppCombinedView() {
     console.log("Global Selection confirmed:", selectedIndices);
 }, [selectedIndices]);
 
+    const isEifMode = !!eifSessionInfo?.isEifBundle;
+
     return (
         <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
-            <PanelGroup direction="vertical" style={{ flex: 1, display: "flex" }} autoSaveId="plot-view-root">
-                <Panel defaultSize={76} minSize={40}>
-                    <PanelGroup direction="horizontal" style={{ height: "100%", display: "flex" }} autoSaveId="plot-view-layout">
-                        <Panel defaultSize={70} minSize={20}>
-                            <div style={{ display: "flex", width: "100%", height: "100%" }}>
-                                <MainBlock />
-                            </div>
-                        </Panel>
-                        <PanelResizeHandle className="subtle-resize-handle" hitAreaMargins={{ coarse: 12, fine: 6 }} />
-                        <Panel defaultSize={30} minSize={8} maxSize={60} collapsible collapsedSize={0}>
-                           <div style={{ width: '100%', height: '100%', borderLeft: '1px solid #ccc' }}>
-                
-                <FunctionViewPanels
-                    onUpdateProjection={handleUpdate}
-                    refineReady={!(eifSessionInfo?.isEifBundle) || eifSessionInfo.refineReady}
-                    refineStatusMessage={eifSessionInfo?.isEifBundle && !eifSessionInfo.refineReady ? eifSessionInfo.message : null}
-                />
+            <div style={{ flex: 1, minHeight: 0 }}>
+                <PanelGroup direction="horizontal" style={{ height: "100%", display: "flex" }} autoSaveId="plot-view-layout">
+                    <Panel defaultSize={70} minSize={20}>
+                        <div style={{ display: "flex", width: "100%", height: "100%" }}>
+                            <MainBlock />
+                        </div>
+                    </Panel>
+                    <PanelResizeHandle className="subtle-resize-handle" hitAreaMargins={{ coarse: 12, fine: 6 }} />
+                    <Panel defaultSize={30} minSize={8} maxSize={60} collapsible collapsedSize={0}>
+                        <div style={{ width: '100%', height: '100%', borderLeft: '1px solid #ccc' }}>
+                            <FunctionViewPanels
+                                onUpdateProjection={handleUpdate}
+                                refineReady={!isEifMode || eifSessionInfo!.refineReady}
+                                refineStatusMessage={isEifMode && !eifSessionInfo!.refineReady ? eifSessionInfo!.message : null}
+                            />
+                        </div>
+                    </Panel>
+                </PanelGroup>
             </div>
-                        </Panel>
-                    </PanelGroup>
-                </Panel>
-                <PanelResizeHandle className="subtle-resize-handle-horizontal" />
-                <Panel defaultSize={24} minSize={8} maxSize={50} collapsible collapsedSize={0}>
-                    <div style={{ width: '100%', height: '100%', borderTop: '1px solid #ccc' }}>
-                        <BottomDock />
-                    </div>
-                </Panel>
-            </PanelGroup>
+            {!isEifMode && (
+                <div style={{ height: 200, flexShrink: 0, borderTop: '1px solid #ccc' }}>
+                    <BottomDock />
+                </div>
+            )}
             <MessageHandler />
         </div>
     );
 }
 
-// 2. 修改组件定义，使其接收 Props
 export function FunctionViewPanels({ onUpdateProjection, refineReady = true, refineStatusMessage = null }: FunctionViewPanelsProps) {
+    const { eifSessionInfo } = useDefaultStore(['eifSessionInfo']);
+    const isEifMode = !!eifSessionInfo?.isEifBundle;
+
     const [activeKey, setActiveKey] = useState<'FunctionPanel' | 'TrainingEventPanel'>('FunctionPanel');
 
     const items = [
         { key: 'FunctionPanel', label: <span style={{ fontSize: 12 }}>Functions</span> },
-        { key: 'TrainingEventPanel', label: <span style={{ fontSize: 12 }}>Training Events</span> },
+        ...(!isEifMode ? [{ key: 'TrainingEventPanel', label: <span style={{ fontSize: 12 }}>Training Events</span> }] : []),
     ];
 
     return (
@@ -1142,7 +1210,7 @@ export function FunctionViewPanels({ onUpdateProjection, refineReady = true, ref
                         refineStatusMessage={refineStatusMessage}
                     />
                 )}
-                {activeKey === 'TrainingEventPanel' && <TrainingEventPanel />}
+                {activeKey === 'TrainingEventPanel' && !isEifMode && <TrainingEventPanel />}
             </div>
         </div>
     );

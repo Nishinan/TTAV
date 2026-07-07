@@ -5,6 +5,63 @@ import { transferArray2Color } from './utils';
 import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition } from '../utils/neighborDiagnostics';
 
 // ---------------------------------------------------------------------------
+// RefineStatusBadge — glass pill overlay on top-right of the canvas.
+// Reads refineStatus and refineProgress from Zustand.
+// ---------------------------------------------------------------------------
+function RefineStatusBadge() {
+    const { refineStatus, refineProgress } = useDefaultStore(['refineStatus', 'refineProgress']);
+    if (refineStatus === 'idle') return null;
+
+    const isDone = refineStatus === 'done';
+    const { completed, total } = refineProgress;
+    const stepsLabel = total > 0 ? ` ${completed} / ${total}` : completed > 0 ? ` ${completed}` : '';
+
+    return (
+        <div style={{
+            position: 'absolute',
+            top: 10,
+            right: 12,
+            zIndex: 200,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 10px',
+            borderRadius: 20,
+            background: 'rgba(255,255,255,0.18)',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            border: `1px solid ${isDone ? 'var(--color-success, #22c55e)' : 'var(--accent-blue, #3278F0)'}`,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+            fontSize: 11,
+            fontWeight: 600,
+            color: isDone ? 'var(--color-success, #22c55e)' : 'var(--accent-blue, #3278F0)',
+            pointerEvents: 'none',
+            userSelect: 'none',
+            whiteSpace: 'nowrap',
+        }}>
+            {isDone ? (
+                <>
+                    <span style={{ fontSize: 12 }}>✓</span>
+                    <span>Refined</span>
+                </>
+            ) : (
+                <>
+                    <span style={{
+                        display: 'inline-block',
+                        width: 7,
+                        height: 7,
+                        borderRadius: '50%',
+                        background: 'var(--accent-blue, #3278F0)',
+                        animation: 'ttav-pulse 1.2s ease-in-out infinite',
+                    }} />
+                    <span>Refining{stepsLabel}</span>
+                </>
+            )}
+        </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
 // NeighborOverlay — module-scope so the class reference is stable across
 // renders. embedding-atlas calls update() rather than creating new instances.
 // Box selection is handled by a React overlay div in ChartComponent instead.
@@ -93,20 +150,23 @@ class NeighborOverlay {
         this.el.appendChild(this.svg);
         this.svg.addEventListener('click', this.handleClickBound);
         this.defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-        const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-        marker.setAttribute('id', 'trail-arrow');
-        marker.setAttribute('viewBox', '0 0 10 10');
-        marker.setAttribute('markerUnits', 'userSpaceOnUse');
-        marker.setAttribute('markerWidth', '10');
-        marker.setAttribute('markerHeight', '10');
-        marker.setAttribute('refX', '8');
-        marker.setAttribute('refY', '5');
-        marker.setAttribute('orient', 'auto');
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        path.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
-        path.setAttribute('fill', '#7F8C8D');
-        marker.appendChild(path);
-        this.defs.appendChild(marker);
+        const makeMarker = (id: string, color: string) => {
+            const m = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+            m.setAttribute('id', id);
+            m.setAttribute('viewBox', '0 0 10 10');
+            m.setAttribute('markerUnits', 'userSpaceOnUse');
+            m.setAttribute('markerWidth', '9');
+            m.setAttribute('markerHeight', '9');
+            m.setAttribute('refX', '8');
+            m.setAttribute('refY', '5');
+            m.setAttribute('orient', 'auto');
+            const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            p.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
+            p.setAttribute('fill', color);
+            m.appendChild(p);
+            return m;
+        };
+        this.defs.appendChild(makeMarker('trail-arrow', '#7F8C8D'));
         this.svg.appendChild(this.defs);
         this.render();
     }
@@ -167,62 +227,88 @@ class NeighborOverlay {
     render() {
         if (!this.svg) return;
         this.clear();
-        const { center, hdOnly, ldOnly, overlap, dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
-        const centerLoc = center ? this.proxy.location(center.x, center.y) : null;
-        const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-        const drawNeighbor = (
-            nid: number,
-            style: { color: string; lineWidth: number; ringWidth: number; lineOpacity?: number; ringOpacity?: number }
-        ) => {
-            let x: number, y: number;
-            const renderedPos = this.props.posMap?.get(nid);
-            if (renderedPos != null) {
-                x = dataX[renderedPos];
-                y = dataY[renderedPos];
-            } else {
-                const projectionPos = rawIndexToProjectionPosition(nid, this.props.indexList);
-                const coord = this.props.fullProjection?.[projectionPos];
-                if (!coord) return;
-                x = coord[0];
-                y = coord[1];
+        const { dataX, dataY, pointSize, revealOriginalNeighbors, revealProjectionNeighbors } = this.props;
+
+        // Support both single-center (legacy) and multi-center (multi-focus) modes.
+        const multiGroups: Array<{ center: any; hdOnly: number[]; ldOnly: number[]; overlap: number[] }> =
+            this.props.multiCenterGroups ?? [];
+        const groups = multiGroups.length > 0
+            ? multiGroups
+            : (this.props.center
+                ? [{ center: this.props.center, hdOnly: this.props.hdOnly ?? [], ldOnly: this.props.ldOnly ?? [], overlap: this.props.overlap ?? [] }]
+                : []);
+
+        const STYLE_HD_ONLY = { color: '#E74C3C', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+        const STYLE_LD_ONLY = { color: '#2E86DE', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
+        const STYLE_OVERLAP = { color: '#95A5A6', lineWidth: 1.2, ringWidth: 1.8, lineOpacity: 0.75, ringOpacity: 0.85 };
+
+        if (groups.length > 0 && (revealOriginalNeighbors || revealProjectionNeighbors)) {
+            const neighborGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+            const drawNeighborFrom = (
+                fromLoc: { x: number; y: number },
+                nid: number,
+                style: { color: string; lineWidth: number; ringWidth: number; lineOpacity?: number; ringOpacity?: number }
+            ) => {
+                let x: number, y: number;
+                const renderedPos = this.props.posMap?.get(nid);
+                if (renderedPos != null) {
+                    x = dataX[renderedPos];
+                    y = dataY[renderedPos];
+                } else {
+                    const projectionPos = rawIndexToProjectionPosition(nid, this.props.indexList);
+                    const coord = this.props.fullProjection?.[projectionPos];
+                    if (!coord) return;
+                    x = coord[0];
+                    y = coord[1];
+                }
+                const loc = this.proxy.location(x, y);
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', String(fromLoc.x));
+                line.setAttribute('y1', String(fromLoc.y));
+                line.setAttribute('x2', String(loc.x));
+                line.setAttribute('y2', String(loc.y));
+                line.setAttribute('stroke', style.color);
+                line.setAttribute('stroke-width', String(style.lineWidth));
+                line.setAttribute('stroke-linecap', 'round');
+                if (style.lineOpacity != null) line.setAttribute('stroke-opacity', String(style.lineOpacity));
+                neighborGroup.appendChild(line);
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', String(loc.x));
+                circle.setAttribute('cy', String(loc.y));
+                circle.setAttribute('r', String(pointSize + 1.5));
+                circle.setAttribute('fill', 'none');
+                circle.setAttribute('stroke', style.color);
+                circle.setAttribute('stroke-width', String(style.ringWidth));
+                if (style.ringOpacity != null) circle.setAttribute('stroke-opacity', String(style.ringOpacity));
+                neighborGroup.appendChild(circle);
+            };
+
+            for (const group of groups) {
+                const groupCenterLoc = this.proxy.location(group.center.x, group.center.y);
+                if (!groupCenterLoc) continue;
+                if (revealOriginalNeighbors || revealProjectionNeighbors)
+                    group.overlap.forEach((nid: number) => drawNeighborFrom(groupCenterLoc, nid, STYLE_OVERLAP));
+                if (revealOriginalNeighbors)
+                    group.hdOnly.forEach((nid: number) => drawNeighborFrom(groupCenterLoc, nid, STYLE_HD_ONLY));
+                if (revealProjectionNeighbors)
+                    group.ldOnly.forEach((nid: number) => drawNeighborFrom(groupCenterLoc, nid, STYLE_LD_ONLY));
             }
-            const loc = this.proxy.location(x, y);
-            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-            line.setAttribute('x1', String(centerLoc.x));
-            line.setAttribute('y1', String(centerLoc.y));
-            line.setAttribute('x2', String(loc.x));
-            line.setAttribute('y2', String(loc.y));
-            line.setAttribute('stroke', style.color);
-            line.setAttribute('stroke-width', String(style.lineWidth));
-            line.setAttribute('stroke-linecap', 'round');
-            if (style.lineOpacity != null) line.setAttribute('stroke-opacity', String(style.lineOpacity));
-            neighborGroup.appendChild(line);
-            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            circle.setAttribute('cx', String(loc.x));
-            circle.setAttribute('cy', String(loc.y));
-            circle.setAttribute('r', String(pointSize + 1.5));
-            circle.setAttribute('fill', 'none');
-            circle.setAttribute('stroke', style.color);
-            circle.setAttribute('stroke-width', String(style.ringWidth));
-            if (style.ringOpacity != null) circle.setAttribute('stroke-opacity', String(style.ringOpacity));
-            neighborGroup.appendChild(circle);
-        };
-        const STYLE_HD_ONLY  = { color: '#E74C3C', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
-        const STYLE_LD_ONLY  = { color: '#2E86DE', lineWidth: 1.6, ringWidth: 2.1, lineOpacity: 0.95, ringOpacity: 0.95 };
-        const STYLE_OVERLAP  = { color: '#95A5A6', lineWidth: 1.2, ringWidth: 1.8, lineOpacity: 0.75, ringOpacity: 0.85 };
-        if (centerLoc) {
-            if (revealOriginalNeighbors || revealProjectionNeighbors) overlap.forEach((nid: number) => drawNeighbor(nid, STYLE_OVERLAP));
-            if (revealOriginalNeighbors)  hdOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_HD_ONLY));
-            if (revealProjectionNeighbors) ldOnly.forEach((nid: number) => drawNeighbor(nid, STYLE_LD_ONLY));
             this.svg.appendChild(neighborGroup);
-            const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            centerCircle.setAttribute('cx', String(centerLoc.x));
-            centerCircle.setAttribute('cy', String(centerLoc.y));
-            centerCircle.setAttribute('r', String(pointSize + 2));
-            centerCircle.setAttribute('fill', 'none');
-            centerCircle.setAttribute('stroke', '#666');
-            centerCircle.setAttribute('stroke-width', '2');
-            this.svg.appendChild(centerCircle);
+
+            // Focus-point center circles for all groups
+            for (const group of groups) {
+                const groupCenterLoc = this.proxy.location(group.center.x, group.center.y);
+                if (!groupCenterLoc) continue;
+                const centerCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                centerCircle.setAttribute('cx', String(groupCenterLoc.x));
+                centerCircle.setAttribute('cy', String(groupCenterLoc.y));
+                centerCircle.setAttribute('r', String(pointSize + 2));
+                centerCircle.setAttribute('fill', 'none');
+                centerCircle.setAttribute('stroke', '#666');
+                centerCircle.setAttribute('stroke-width', '2');
+                this.svg.appendChild(centerCircle);
+            }
             if (this.props.showTrail) {
                 const trailGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
                 const epochs = this.props.availableEpochs || [];
@@ -267,8 +353,6 @@ class NeighborOverlay {
                 }
                 this.svg.appendChild(trailGroup);
             }
-        } else {
-            this.svg.appendChild(neighborGroup);
         }
 
         // Secondary boxes (tiered mode): draw union polygon outline
@@ -406,6 +490,7 @@ class NeighborOverlay {
             }
             this.svg.appendChild(textGroup);
         }
+
     }
 
     update(nextProps: Partial<any>) {
@@ -489,8 +574,16 @@ export const ChartComponent = memo(() => {
     const { setCurrentViewportBBox } = useDefaultStore(["setCurrentViewportBBox"]);
     const { boxSelectActive, refineFocusType, secondaryIndices, setSecondaryIndices, secondaryBoxes, setSecondaryBoxes } =
         useDefaultStore(["boxSelectActive", "refineFocusType", "secondaryIndices", "setSecondaryIndices", "secondaryBoxes", "setSecondaryBoxes"]);
+    const { neighborDisplayIndices } = useDefaultStore(["neighborDisplayIndices"]);
+    const { showPreRefine } = useDefaultStore(["showPreRefine"]);
 
-    const epochData = allEpochData[epoch];
+    // B3: non-destructive before/after toggle — when showPreRefine is on, render
+    // the pre-refine baseline (originalProjection) as the projection so every
+    // downstream derivation (points, neighbors, overlay) reflects the "before".
+    const _rawEpochData = allEpochData[epoch];
+    const epochData = (showPreRefine && _rawEpochData?.originalProjection)
+        ? { ..._rawEpochData, projection: _rawEpochData.originalProjection }
+        : _rawEpochData;
     const activePointId = selectedIndices[0] ?? hoveredIndex;
 
     // plot view helpers
@@ -783,75 +876,71 @@ export const ChartComponent = memo(() => {
 
 
     const neighborOverlayProps = useMemo(() => {
-        if (!prepared || !epochData) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: new Float32Array(0), dataY: new Float32Array(0), pointSize, revealOriginalNeighbors, revealProjectionNeighbors, secondaryIndices, setSecondaryIndices, secondaryBoxes } as any;
-        const idsByPos = prepared.dataPoints.map((p) => p.identifier as number);
-        if (activePointId === undefined) return { center: null, hdOnly: [], ldOnly: [], overlap: [], dataX: prepared.simpleData.x as Float32Array, dataY: prepared.simpleData.y as Float32Array, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, idsByPos, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, currentEpoch: epoch, setSelectedIndices, selectedIndices, secondaryIndices, setSecondaryIndices, secondaryBoxes } as any;
-
-        // Both originalNeighbors and projectionNeighbors are indexed by PROJECTION POSITION
-        // and contain PROJECTION POSITIONS (not raw indices). Convert accordingly.
-        const activePointPos = rawIndexToProjectionPosition(activePointId, epochData.indexList);
-
-        // HD neighbors from originalProjection (pre-refine baseline).
-        const hdPositions: number[] = epochData.originalNeighbors?.[activePointPos] ?? [];
-        const hdAll: number[] = convertNeighborPositionsToRawIndices(hdPositions, epochData.indexList);
-
-        // LD neighbors: use the pre-refine baseline projection (originalProjection) when
-        // available. During refine animation, buildBlendedProjection sets all focus points
-        // to weight=1, so they collapse onto the center in the blended projection. Computing
-        // LD nearest-neighbors from the blended projection would return the same set as HD
-        // neighbors, making all lines zero-length and invisible. The originalProjection gives
-        // a stable, meaningful LD neighborhood so lines remain visible throughout training.
-        // Endpoints are still drawn at current blended positions (via posMap / dataX / dataY).
-        const ldProjection = epochData.originalProjection ?? epochData.projection;
-        const ldPositions = computeProjectionNeighborPositionsForPoint(
-            activePointId,
-            ldProjection,
-            epochData.indexList,
-            10
-        );
-        const ldAll = convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList);
-
-        const hdSet = new Set<number>(hdAll);
-        const ldSet = new Set<number>(ldAll);
-
-        // Center: use posMap (same source as rendered data) for reliable screen coordinates.
-        const centerPos = posMap.get(activePointId);
-        const center = centerPos == null ? null : prepared.dataPoints[centerPos];
-
-        // Three-color classification — endpoints always at CURRENT blended positions:
-        //   red  (hdOnly)  = HD neighbors not yet in LD space → alignment gap; lines shorten as refine works
-        //   blue (ldOnly)  = original LD neighbors not in HD space → lengthen as focus point moves toward HD
-        //   gray (overlap) = appears after refine completes and backend refreshes projectionNeighbors
-        return {
-            center,
-            hdOnly: hdAll.filter((nid: number) => !ldSet.has(nid)),
-            ldOnly: ldAll.filter((nid: number) => !hdSet.has(nid)),
-            overlap: hdAll.filter((nid: number) => ldSet.has(nid)),
-            dataX: prepared.simpleData.x as Float32Array,
-            dataY: prepared.simpleData.y as Float32Array,
-            fullProjection: epochData.projection,
-            indexList: epochData.indexList,
+        const baseProps = {
+            dataX: prepared?.simpleData?.x as Float32Array ?? new Float32Array(0),
+            dataY: prepared?.simpleData?.y as Float32Array ?? new Float32Array(0),
+            fullProjection: epochData?.projection,
+            indexList: epochData?.indexList,
             pointSize,
             revealOriginalNeighbors,
             revealProjectionNeighbors,
-            idsByPos,
-            showLabel,
-            showIndex,
-            labelDict,
-            textData,
-            inherentLabelData,
-            viewportState,
-            showTrail,
-            availableEpochs,
-            allEpochData,
-            currentEpoch: epoch,
-            setSelectedIndices,
-            selectedIndices,
-            secondaryIndices,
-            setSecondaryIndices,
-            secondaryBoxes,
+            idsByPos: prepared?.dataPoints?.map((p) => p.identifier as number) ?? [],
+            showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState,
+            showTrail, availableEpochs, allEpochData, currentEpoch: epoch,
+            setSelectedIndices, selectedIndices, secondaryIndices, setSecondaryIndices, secondaryBoxes,
         };
-    }, [prepared, epochData, activePointId, selectedIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
+        if (!prepared || !epochData) return { ...baseProps, center: null, multiCenterGroups: [] } as any;
+
+        // Determine which point IDs to show neighbor lines for.
+        // When points are selected: use neighborDisplayIndices (user-checked subset).
+        // When only hovering: use the hovered point.
+        const focusIds: number[] = selectedIndices.length > 0
+            ? neighborDisplayIndices.filter(i => selectedIndices.includes(i))
+            : (activePointId !== undefined ? [activePointId] : []);
+
+        // Use the currently-displayed projection for LD neighbor computation.
+        // originalProjection is the pre-refine baseline — using it after refine
+        // causes blue lines to be drawn to stale positions from the old layout.
+        const ldProjection = epochData.projection;
+
+        // Build neighbor groups for every focus point.
+        const multiCenterGroups: Array<{ center: any; hdOnly: number[]; ldOnly: number[]; overlap: number[] }> = [];
+        for (const fid of focusIds) {
+            const focusPos = rawIndexToProjectionPosition(fid, epochData.indexList);
+
+            const hdPositions: number[] = epochData.originalNeighbors?.[focusPos] ?? [];
+            const hdAll = convertNeighborPositionsToRawIndices(hdPositions, epochData.indexList);
+
+            const ldPositions = computeProjectionNeighborPositionsForPoint(fid, ldProjection, epochData.indexList, 10);
+            const ldAll = convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList);
+
+            const hdSet = new Set<number>(hdAll);
+            const ldSet = new Set<number>(ldAll);
+
+            const centerPos = posMap.get(fid);
+            const center = centerPos == null ? null : prepared.dataPoints[centerPos];
+            if (!center) continue;
+
+            multiCenterGroups.push({
+                center,
+                hdOnly: hdAll.filter((nid: number) => !ldSet.has(nid)),
+                ldOnly: ldAll.filter((nid: number) => !hdSet.has(nid)),
+                overlap: hdAll.filter((nid: number) => ldSet.has(nid)),
+            });
+        }
+
+        // Primary center (first group) kept for trail rendering.
+        const primaryGroup = multiCenterGroups[0] ?? null;
+
+        return {
+            ...baseProps,
+            center: primaryGroup?.center ?? null,
+            hdOnly:  primaryGroup?.hdOnly  ?? [],
+            ldOnly:  primaryGroup?.ldOnly  ?? [],
+            overlap: primaryGroup?.overlap ?? [],
+            multiCenterGroups,
+        };
+    }, [prepared, epochData, activePointId, selectedIndices, neighborDisplayIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
 
     // ---- box select overlay state & handlers ----
     const [boxDrag, setBoxDrag] = useState<{ startX: number; startY: number; curX: number; curY: number } | null>(null);
@@ -986,7 +1075,9 @@ export const ChartComponent = memo(() => {
             }}
         >
             <div style={{ position: 'relative', flex: 1 }}>
+                <style>{`@keyframes ttav-pulse{0%,100%{opacity:1}50%{opacity:0.35}}`}</style>
                 {content ?? <div style={{ width: '100%', height: '100%' }} />}
+                <RefineStatusBadge />
                 {boxSelectActive && (
                     <div
                         style={{ position: 'absolute', inset: 0, cursor: 'crosshair', zIndex: 100, userSelect: 'none' }}

@@ -559,15 +559,23 @@ def update_focus_context():
 
         if vis_method == "TimeVis":
             hd_k = int(active_session.get("vis_config", {}).get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+            effective_bbox = None if selected_indices else zoom_bbox
             focus_indices, focus_summary = build_focus_set(
                 content_path=content_path,
                 vis_method=vis_method,
                 vis_id=active_session["vis_id"],
                 epoch=current_epoch,
                 seed_indices=selected_indices,
-                zoom_bbox=zoom_bbox,
+                zoom_bbox=effective_bbox,
                 hd_k=hd_k,
             )
+            print(f"[server] build_focus_set: seeds={len(selected_indices)}, bbox_used={effective_bbox is not None}, focus_size={len(focus_indices)}")
+
+        # Option A: seeds are the attract/ranking targets; expansion → context.
+        refine_focus_indices, secondary_indices = _split_focus_targets(
+            selected_indices, focus_indices, secondary_indices)
+        print(f"[server] refine targets={len(refine_focus_indices)} (seeds), "
+              f"context/secondary={len(secondary_indices)}")
 
         mask = strategy.get_focus_mask(focus_indices)
         strategy.update_ttav_context(focus_indices, focus_mode, mask)
@@ -580,11 +588,13 @@ def update_focus_context():
         elif vis_method in ("DVI", "TimeVis"):
             print("Start refining visualization model...")
             strategy.refine(
-                focus_indices=focus_indices,
+                focus_indices=refine_focus_indices,
                 neighbor_indices=[],
                 current_epoch=current_epoch,
                 epochs_to_update=10,
                 secondary_indices=secondary_indices if secondary_indices else None,
+                top_k=req.get("refine_top_k"),
+                priority=req.get("refine_priority"),
             )
             if current_epoch is not None:
                 vis_id = active_session["vis_id"]
@@ -621,6 +631,7 @@ def update_focus_context():
             "focus_bbox_count":      focus_summary["bbox_count"],
             "focus_hd_neighbor_count": focus_summary["hd_neighbor_count"],
             "focus_indices":         focus_indices,
+            "refine_status":         getattr(strategy, "_last_refine_status", None),
         })
 
     except Exception as e:
@@ -643,6 +654,27 @@ def normalize_content_path(content_path) -> str:
     if not content_path:
         raise ValueError("content_path is required and no active session is loaded")
     return str(content_path).strip()
+
+
+def _split_focus_targets(selected_indices, focus_indices, secondary_indices):
+    """Option A: when the user explicitly selects points, ONLY those seeds are
+    ranking/attract targets — so a single click becomes a genuine single-focus
+    refine (len==1) and the escalation path can guarantee 100% top-10. The
+    build_focus_set expansion (seeds' HD neighbors, etc.) is demoted to context
+    and merged into secondary_indices (shape/context, not attract targets).
+
+    When there is no explicit selection (bbox/region refine), the whole focus
+    set stays as targets → multi-focus best-effort, unchanged.
+
+    Returns (refine_focus_indices, merged_secondary_indices).
+    """
+    seed_set = {int(i) for i in (selected_indices or [])}
+    if not seed_set:
+        return list(focus_indices), list(secondary_indices or [])
+    refine_focus = sorted(seed_set)
+    context = {int(i) for i in focus_indices} - seed_set
+    merged_secondary = sorted({int(i) for i in (secondary_indices or [])} | context)
+    return refine_focus, merged_secondary
 
 
 def _prepare_refine_request(req):
@@ -677,15 +709,26 @@ def _prepare_refine_request(req):
 
     if vis_method == "TimeVis":
         hd_k = int(vis_config.get("refine_hd_k", REFINE_RUNTIME_DEFAULTS["focus_hd_k"]))
+        # Only use zoom_bbox when the user hasn't explicitly selected specific points.
+        # If selected_indices is non-empty, the user wants to refine those points only;
+        # adding the full viewport bbox would expand focus to all visible points.
+        effective_bbox = None if selected_indices else zoom_bbox
         focus_indices, focus_summary = build_focus_set(
             content_path=content_path,
             vis_method=vis_method,
             vis_id=vis_id,
             epoch=current_epoch,
             seed_indices=selected_indices,
-            zoom_bbox=zoom_bbox,
+            zoom_bbox=effective_bbox,
             hd_k=hd_k,
         )
+        print(f"[server _prepare] build_focus_set: seeds={len(selected_indices)}, bbox_used={effective_bbox is not None}, focus_size={len(focus_indices)}")
+
+    # Option A: seeds are the attract/ranking targets; expansion → context.
+    refine_focus_indices, merged_secondary = _split_focus_targets(
+        selected_indices, focus_indices, secondary_indices)
+    print(f"[server _prepare] refine targets={len(refine_focus_indices)} "
+          f"(seeds), context/secondary={len(merged_secondary)}")
 
     return {
         "content_path": content_path,
@@ -697,11 +740,14 @@ def _prepare_refine_request(req):
         "visualizer": visualizer,
         "vis_method": vis_method,
         "vis_id": vis_id,
-        "focus_indices": focus_indices,
+        "focus_indices": focus_indices,            # expanded set — for mask/UI highlight
+        "refine_focus_indices": refine_focus_indices,  # seeds only — refine attract targets
         "focus_summary": focus_summary,
         "bbox_indices": focus_summary.get("bbox_indices", []),
         "resolved_refine_behavior": resolved_refine_behavior,
-        "secondary_indices": secondary_indices,
+        "secondary_indices": merged_secondary,
+        "top_k": req.get("refine_top_k"),          # C3: neighborhood size (None → session default)
+        "priority": req.get("refine_priority"),    # B1: accuracy↔layout tradeoff (None → default)
     }
 
 
@@ -714,6 +760,7 @@ def _run_refine_request(prepared_req, progress_callback=None):
     vis_method = prepared_req["vis_method"]
     vis_id = prepared_req["vis_id"]
     focus_indices = prepared_req["focus_indices"]
+    refine_focus_indices = prepared_req.get("refine_focus_indices", focus_indices)
     focus_summary = prepared_req["focus_summary"]
     bbox_indices = prepared_req.get("bbox_indices", [])
     secondary_indices = prepared_req.get("secondary_indices", [])
@@ -732,7 +779,7 @@ def _run_refine_request(prepared_req, progress_callback=None):
     elif vis_method in ("DVI", "TimeVis"):
         print("Start refining visualization model...")
         strategy.refine(
-            focus_indices=focus_indices,
+            focus_indices=refine_focus_indices,
             neighbor_indices=[],
             current_epoch=current_epoch,
             epochs_to_update=10,
@@ -740,6 +787,8 @@ def _run_refine_request(prepared_req, progress_callback=None):
             should_stop_callback=prepared_req.get("should_stop_callback"),
             progress_refresh_indices=bbox_indices,
             secondary_indices=secondary_indices if secondary_indices else None,
+            top_k=prepared_req.get("top_k"),
+            priority=prepared_req.get("priority"),
         )
         if current_epoch is not None:
             patched_indices = getattr(strategy, "_last_patch_indices", None)
@@ -772,6 +821,7 @@ def _run_refine_request(prepared_req, progress_callback=None):
         "bbox_indices":          bbox_indices,
         "training_context_indices": getattr(strategy, "_last_training_context_indices", focus_indices),
         "patch_indices":         getattr(strategy, "_last_patch_indices", focus_indices),
+        "refine_status":         getattr(strategy, "_last_refine_status", None),
         "resolved_refine_behavior": resolved_refine_behavior,
     }
 
@@ -806,6 +856,8 @@ def _run_refine_session_worker(session_id, prepared_req):
                 session_fields["projection"] = payload.get("projection")
             if "sampled_metrics" in payload:
                 session_fields["sampled_metrics"] = payload.get("sampled_metrics")
+            if "refine_live" in payload:
+                session_fields["refine_live"] = payload.get("refine_live")
             _update_refine_session(session_id, **session_fields)
 
         prepared_req["should_stop_callback"] = _should_stop_callback
@@ -904,6 +956,7 @@ def get_refine_session_progress():
             "patch_indices": session.get("patch_indices", []),
             "bbox_indices": session.get("bbox_indices", []),
             "sampled_metrics": session.get("sampled_metrics"),
+            "refine_live": session.get("refine_live"),
             "stop_requested": bool(session.get("stop_requested", False)),
             "resolved_refine_behavior": session.get("resolved_refine_behavior"),
             "result": session.get("result"),
@@ -930,6 +983,74 @@ def stop_refine_session():
             session["status"] = "stopping"
 
     return jsonify({"status": "success", "session_id": session_id, "stop_requested": True})
+
+
+@app.route('/discardRefine', methods=['POST'])
+@cross_origin()
+def discard_refine():
+    """B3 Undo: revert refinement by deleting the _refined projection(s) so the
+    graceful fallback in load_projection() serves the original baseline again.
+
+    epoch omitted → discard ALL refined epochs (full revert to baseline);
+    epoch given  → discard just that epoch. Refined neighbor caches are
+    invalidated for each removed epoch.
+    """
+    req = request.get_json() or {}
+    content_path = req.get("content_path")
+    vis_method   = req.get("vis_method")
+    vis_id       = req.get("vis_id")
+    epoch        = req.get("epoch", None)
+
+    if not (content_path and vis_method and vis_id is not None):
+        return jsonify({"status": "error", "message": "content_path, vis_method, vis_id required"}), 400
+
+    refined_root = os.path.join(content_path, 'visualize', f"{vis_method}_{vis_id}_refined", 'epochs')
+    removed = []
+    if os.path.isdir(refined_root):
+        if epoch is not None:
+            epoch_dirs = [f'epoch_{epoch}']
+        else:
+            epoch_dirs = [d for d in os.listdir(refined_root) if d.startswith('epoch_')]
+        for d in epoch_dirs:
+            proj_path = os.path.join(refined_root, d, 'projection.npy')
+            if os.path.exists(proj_path):
+                try:
+                    os.remove(proj_path)
+                    _ep = d[len('epoch_'):]
+                    removed.append(_ep)
+                    try:
+                        invalidate_projection_neighbors_cache(content_path, vis_method, vis_id, _ep)
+                    except Exception as _ce:
+                        print(f"[discardRefine] neighbor cache invalidate failed for {d}: {_ce}")
+                except OSError as _oe:
+                    print(f"[discardRefine] could not remove {proj_path}: {_oe}")
+
+    print(f"[discardRefine] reverted {len(removed)} epoch(s) to baseline: {removed}")
+    return jsonify({"status": "success", "removed_epochs": removed})
+
+
+@app.route('/refinedEpochs', methods=['POST'])
+@cross_origin()
+def refined_epochs():
+    """C2: list epochs that currently have a refined projection on disk, so the
+    timeline can mark refined vs pending (background patch fills the rest in)."""
+    req = request.get_json() or {}
+    content_path = req.get("content_path")
+    vis_method   = req.get("vis_method")
+    vis_id       = req.get("vis_id")
+    if not (content_path and vis_method and vis_id is not None):
+        return jsonify({"status": "error", "message": "content_path, vis_method, vis_id required"}), 400
+
+    root = os.path.join(content_path, 'visualize', f"{vis_method}_{vis_id}_refined", 'epochs')
+    eps = []
+    if os.path.isdir(root):
+        for d in os.listdir(root):
+            if d.startswith('epoch_') and os.path.exists(os.path.join(root, d, 'projection.npy')):
+                try:
+                    eps.append(int(d[len('epoch_'):]))
+                except ValueError:
+                    pass
+    return jsonify({"status": "success", "refined_epochs": sorted(eps)})
 
 
 @app.route('/startVisualizing', methods = ["POST"])
@@ -1549,8 +1670,17 @@ def get_projection_neighbors():
     blend_decay_ratio = float(req.get('blend_decay_ratio', REFINE_RUNTIME_DEFAULTS['blend_decay_ratio']))
     blend_focus_indices = req.get('blend_focus_indices') or []
 
+    projection_data = req.get('projection_data')  # pre-blended projection from frontend
+
     try:
-        if blend_bbox is not None or blend_focus_indices:
+        if projection_data is not None:
+            # Use the exact projection the frontend is displaying — guarantees that
+            # neighbor lines are computed from the same coordinates as the visual.
+            neighbors, index_list = calculate_projection_neighbors_for_projection(
+                content_path,
+                projection_data,
+            )
+        elif blend_bbox is not None or blend_focus_indices:
             blended_projection = build_runtime_blended_projection(
                 content_path,
                 vis_method,

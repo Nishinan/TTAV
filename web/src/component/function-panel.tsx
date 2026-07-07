@@ -1,5 +1,6 @@
-import { AutoComplete, Input, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button, Tooltip } from 'antd';
+import { AutoComplete, Input, InputNumber, List, Tag, RefSelectProps, Checkbox, Switch, Select, Slider, Button, Tooltip, message } from 'antd';
 import { useDefaultStore, FocusMode, RefineFocusType } from '../state/state.unified';
+import * as BackendAPI from '../communication/backend';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
@@ -106,6 +107,7 @@ function hexToRgbArray(hex: string): [number, number, number] {
     return [r, g, b];
 }
 
+
 export function FunctionPanel({ onUpdateProjection, refineReady = true, refineStatusMessage = null }: FunctionPanelProps) {
     const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode, epoch, allEpochData } =
         useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode", "epoch", "allEpochData"]);
@@ -114,18 +116,57 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         useDefaultStore(["revealOriginalNeighbors", "revealProjectionNeighbors", "setRevealOriginalNeighbors", "setRevealProjectionNeighbors"]);
     const { showIndex, showLabel, showBackground, showTrail, setShowIndex, setShowLabel, setShowBackground, setShowTrail } =
         useDefaultStore(["showIndex","showLabel","showBackground","showTrail","setShowIndex","setShowLabel","setShowBackground","setShowTrail"]);
-// Get focusMode and its auto-generated setter
     const { focusMode, setFocusMode } = useDefaultStore(['focusMode', 'setFocusMode']);
     const { boxSelectActive, setBoxSelectActive, refineFocusType, setRefineFocusType, secondaryIndices, setSecondaryIndices, setSecondaryBoxes } =
         useDefaultStore(['boxSelectActive', 'setBoxSelectActive', 'refineFocusType', 'setRefineFocusType', 'secondaryIndices', 'setSecondaryIndices', 'setSecondaryBoxes']);
+    const { neighborDisplayIndices, setNeighborDisplayIndices } =
+        useDefaultStore(['neighborDisplayIndices', 'setNeighborDisplayIndices']);
+    const { refineTopK, setRefineTopK } =
+        useDefaultStore(['refineTopK', 'setRefineTopK']);
+    const { refinePriority, setRefinePriority } =
+        useDefaultStore(['refinePriority', 'setRefinePriority']);
+    const { showPreRefine, setShowPreRefine } =
+        useDefaultStore(['showPreRefine', 'setShowPreRefine']);
+    const { contentPath, vis_method, visID, setValue } =
+        useDefaultStore(['contentPath', 'vis_method', 'visID', 'setValue']);
+
+    // B3 Undo: discard the refined result on the backend (graceful fallback then
+    // serves the baseline) and revert the current epoch's displayed projection.
+    const handleResetRefine = async () => {
+        const ed = allEpochData[epoch];
+        try {
+            await BackendAPI.discardRefine(contentPath, vis_method, visID);
+        } catch (e) {
+            console.error('discardRefine failed', e);
+        }
+        if (ed?.originalProjection) {
+            setValue('allEpochData', { ...allEpochData, [epoch]: { ...ed, projection: ed.originalProjection } });
+        }
+        setShowPreRefine(false);
+        setValue('refineMetrics', null);
+        setValue('refinedEpochs', []);   // C2: nothing refined after a full revert
+        message.success('Refinement reverted to baseline.');
+    };
     
     useEffect(() => {
-        if (pointSize < 1) {
-            setPointSize(1);
-        } else if (pointSize > 5) {
-            setPointSize(5);
-        }
+        if (pointSize < 1) setPointSize(1);
+        else if (pointSize > 5) setPointSize(5);
     }, [pointSize, setPointSize]);
+
+    // Keep neighborDisplayIndices in sync with selectedIndices:
+    // single selection → auto-show; multiple → keep intersection, default to first
+    useEffect(() => {
+        if (selectedIndices.length === 0) {
+            setNeighborDisplayIndices([]);
+        } else if (selectedIndices.length === 1) {
+            setNeighborDisplayIndices([selectedIndices[0]]);
+        } else {
+            const sel = new Set(selectedIndices);
+            const kept = neighborDisplayIndices.filter(i => sel.has(i));
+            setNeighborDisplayIndices(kept.length > 0 ? kept : [selectedIndices[0]]);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedIndices]);
 
     const pointSizeMarks: Record<number, string> = { 1: '1', 2: '2', 3: '3', 4: '4', 5: '5' };
     const pointSizeLabel = pointSizeMarks[pointSize] ?? pointSize.toString();
@@ -507,6 +548,29 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                 <span>focus</span><span>drift</span>
                             </div>
                         </div>
+
+                        {/* B3: non-destructive before/after toggle */}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
+                            <Tooltip title="Show the pre-refine baseline layout. Toggle to compare before vs after — nothing is discarded.">
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Show baseline (before)</span>
+                            </Tooltip>
+                            <Switch
+                                size="small"
+                                checked={showPreRefine}
+                                onChange={(v) => setShowPreRefine(v)}
+                            />
+                        </div>
+
+                        {/* B3: undo — revert the refinement back to baseline */}
+                        <Button
+                            size="small"
+                            danger
+                            icon={<RefreshCw size={12} />}
+                            style={{ marginTop: 6, width: '100%' }}
+                            onClick={handleResetRefine}
+                        >
+                            Reset refine (revert to baseline)
+                        </Button>
                     </div>
                 ) : (
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '10px 0' }}>
@@ -639,6 +703,73 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                 ]}
                             />
                         </div>
+
+                        {/* C3: neighborhood size (top-k) the refine objective preserves */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Tooltip title="Number of nearest neighbors refine tries to align (HD top-k = LD top-k). Range 3–20.">
+                                <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine top-k</span>
+                            </Tooltip>
+                            <InputNumber
+                                size="small" style={{ flex: 1 }}
+                                min={3} max={20} step={1} precision={0}
+                                value={refineTopK}
+                                onChange={(v) => {
+                                    if (typeof v === 'number' && !Number.isNaN(v)) {
+                                        setRefineTopK(Math.max(3, Math.min(20, Math.round(v))));
+                                    }
+                                }}
+                            />
+                        </div>
+
+                        {/* B1: accuracy ↔ layout tradeoff */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Tooltip title="Preserve layout: keep the current arrangement (may accept <100% neighbor accuracy). Max accuracy: pull neighbors in aggressively, allowing more layout distortion.">
+                                <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine goal</span>
+                            </Tooltip>
+                            <Select
+                                size="small" style={{ flex: 1 }}
+                                value={refinePriority <= 0.3 ? 'layout' : refinePriority >= 0.7 ? 'accuracy' : 'balanced'}
+                                onChange={(v) => {
+                                    setRefinePriority(v === 'layout' ? 0.15 : v === 'accuracy' ? 0.9 : 0.5);
+                                }}
+                                options={[
+                                    { label: 'Preserve layout', value: 'layout' },
+                                    { label: 'Balanced', value: 'balanced' },
+                                    { label: 'Max accuracy', value: 'accuracy' },
+                                ]}
+                            />
+                        </div>
+
+                        {/* Show-neighbor checklist — only when multiple points selected */}
+                        {selectedIndices.length > 1 && (revealOriginalNeighbors || revealProjectionNeighbors) && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, paddingLeft: 4 }}>
+                                <span style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 1 }}>
+                                    Show neighbors for:
+                                </span>
+                                {selectedIndices.map((idx) => {
+                                    const checked = neighborDisplayIndices.includes(idx);
+                                    return (
+                                        <label key={idx} style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={checked}
+                                                onChange={(e) => {
+                                                    if (e.target.checked) {
+                                                        setNeighborDisplayIndices([...neighborDisplayIndices, idx]);
+                                                    } else {
+                                                        setNeighborDisplayIndices(neighborDisplayIndices.filter(i => i !== idx));
+                                                    }
+                                                }}
+                                                style={{ width: 12, height: 12, accentColor: 'var(--accent-blue, #3278F0)', cursor: 'pointer' }}
+                                            />
+                                            <span style={{ fontSize: 11, color: 'var(--primary-text)' }}>
+                                                #{idx}
+                                            </span>
+                                        </label>
+                                    );
+                                })}
+                            </div>
+                        )}
 
                         <div style={{ borderTop: '1px solid var(--layout-border-color)', margin: '2px 0' }} />
 

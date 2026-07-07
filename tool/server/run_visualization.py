@@ -94,9 +94,9 @@ def initialize_config(content_path, vis_method, vis_id, data_type, task_type, vi
     if 'b_n_epochs' not in vc:
         vc['b_n_epochs'] = 0
     if 'refine_max_steps' not in vc:
-        vc['refine_max_steps'] = 800
+        vc['refine_max_steps'] = 10000
     if 'refine_min_steps' not in vc:
-        vc['refine_min_steps'] = 800
+        vc['refine_min_steps'] = 100
     if 'refine_patience' not in vc:
         vc['refine_patience'] = 0
     if 'refine_loss_min_delta' not in vc:

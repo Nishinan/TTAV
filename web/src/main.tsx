@@ -1,25 +1,27 @@
 import React from 'react';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import WebSideBar from './component/webSideBar';
 import { AppCombinedView } from './views/plotView';
+import { useDefaultStore } from './state/state.unified';
 import './index.css';
 
 function RootLayout() {
+  const { eifSessionInfo } = useDefaultStore(['eifSessionInfo']);
+  const isEifMode = !!eifSessionInfo?.isEifBundle;
+
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <PanelGroup direction="horizontal" style={{ flex: 1, display: 'flex' }} autoSaveId="root-horizontal">
-        <Panel defaultSize={22} minSize={16} maxSize={35} collapsible collapsedSize={0}>
-          <div style={{ width: '100%', height: '100%', borderRight: '1px solid #ccc' }}>
+    <div style={{ width: '100%', height: '100%', display: 'flex' }}>
+      {!isEifMode && (
+        <>
+          <div style={{ width: 220, flexShrink: 0, height: '100%', borderRight: '1px solid #ccc', overflow: 'hidden' }}>
             <WebSideBar />
           </div>
-        </Panel>
-        <PanelResizeHandle className="subtle-resize-handle" hitAreaMargins={{ coarse: 12, fine: 6 }} />
-        <Panel defaultSize={78} minSize={40}>
-          <AppCombinedView />
-        </Panel>
-      </PanelGroup>
+        </>
+      )}
+      <div style={{ flex: 1, minWidth: 0, height: '100%' }}>
+        <AppCombinedView />
+      </div>
     </div>
   );
 }

@@ -32,6 +32,14 @@ REFINE_BEHAVIOR_DEFAULTS = {
         "loss_rel_tol": 5e-4,
         "priority": ["loss_converged", "time_budget", "max_steps"],
         "safety_loop_cap": 200000,
+        # Wall-clock caps for the encoder-finetune refine loop.
+        # Multi-focus: kept tight so the user is not left waiting on a request
+        # that (due to conflicting neighborhoods) may never reach 100%.
+        # Single-focus (len==1): generous — a single seed's HD top-10 == LD top-10
+        # is geometrically achievable, so we give the escalation path room to
+        # actually reach it instead of being cut off mid-way.
+        "time_limit_seconds": 90.0,
+        "time_limit_single_seconds": 300.0,
     },
 }
 
@@ -84,6 +92,11 @@ def resolve_refine_behavior_config(vis_config=None) -> dict:
             stop_cfg["enable_time_budget"] = True
     if "refine_enable_time_budget" in vis_config:
         stop_cfg["enable_time_budget"] = bool(vis_config.get("refine_enable_time_budget"))
+
+    if "refine_time_limit_s" in vis_config:
+        stop_cfg["time_limit_seconds"] = float(vis_config.get("refine_time_limit_s"))
+    if "refine_time_limit_single_s" in vis_config:
+        stop_cfg["time_limit_single_seconds"] = float(vis_config.get("refine_time_limit_single_s"))
 
     if "refine_enable_loss_converged" in vis_config:
         stop_cfg["enable_loss_converged"] = bool(vis_config.get("refine_enable_loss_converged"))
