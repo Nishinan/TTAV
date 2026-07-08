@@ -6,6 +6,24 @@ import { ComponentBlock, FunctionalBlock } from './custom/basic-components';
 import { styled } from 'styled-components';
 import { SyncOutlined } from '@ant-design/icons';
 import { BoxSelect, MousePointer2, X, XCircle, RefreshCw } from 'lucide-react';
+import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition, computeAllPointsNeighborPreservation } from '../utils/neighborDiagnostics';
+import {
+    computeConfidentlyWrong, computeOscillation, computeHdImpurity, computeCartography,
+    computePartnerRankIssues, computePairDistanceTrend, computeAlignmentNeighborhoodImpurity,
+} from '../utils/suspectSignals';
+
+const CLASSIFICATION_SUSPECT_OPTIONS = [
+    { value: 'confidently_wrong', label: 'Confidently wrong' },
+    { value: 'oscillation', label: 'Oscillating' },
+    { value: 'hd_impurity', label: 'HD neighborhood impurity' },
+    { value: 'cartography_hard', label: 'Cartography: hard-to-learn' },
+    { value: 'cartography_ambiguous', label: 'Cartography: ambiguous' },
+];
+const ALIGNMENT_SUSPECT_OPTIONS = [
+    { value: 'partner_rank', label: 'Partner beyond top-k' },
+    { value: 'pair_distance_trend', label: 'Diverging pairs' },
+    { value: 'alignment_impurity', label: 'Neighborhood impurity' },
+];
 type SampleTag = {
     num: number;
     title: string;
@@ -108,6 +126,15 @@ function hexToRgbArray(hex: string): [number, number, number] {
 }
 
 
+function LensLegendDot({ color, label }: { color: string; label: string }) {
+    return (
+        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, display: 'inline-block', flexShrink: 0 }} />
+            {label}
+        </span>
+    );
+}
+
 export function FunctionPanel({ onUpdateProjection, refineReady = true, refineStatusMessage = null }: FunctionPanelProps) {
     const { tokenList, labelDict, colorDict, setColorDict, selectedIndices, setSelectedIndices, setShownData, pointSize, setPointSize, mode, setMode, epoch, allEpochData } =
         useDefaultStore(["tokenList","labelDict", "colorDict", "setColorDict", "selectedIndices", "setSelectedIndices", "setShownData", "pointSize", "setPointSize", "mode", "setMode", "epoch", "allEpochData"]);
@@ -129,6 +156,17 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         useDefaultStore(['showPreRefine', 'setShowPreRefine']);
     const { contentPath, vis_method, visID, setValue } =
         useDefaultStore(['contentPath', 'vis_method', 'visID', 'setValue']);
+    const { inherentLabelData, setHoveredIndex } =
+        useDefaultStore(['inherentLabelData', 'setHoveredIndex']);
+    const { distortionLensOn, setDistortionLensOn } =
+        useDefaultStore(['distortionLensOn', 'setDistortionLensOn']);
+    const { activeRefineSessionId } =
+        useDefaultStore(['activeRefineSessionId']);
+    const { refineStatus } = useDefaultStore(['refineStatus']);
+    const { showRefineTrails, setShowRefineTrails } =
+        useDefaultStore(['showRefineTrails', 'setShowRefineTrails']);
+    const { refineSessions } = useDefaultStore(['refineSessions']);
+    const { taskType, alignment } = useDefaultStore(['taskType', 'alignment']);
 
     // B3 Undo: discard the refined result on the backend (graceful fallback then
     // serves the baseline) and revert the current epoch's displayed projection.
@@ -143,6 +181,7 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
             setValue('allEpochData', { ...allEpochData, [epoch]: { ...ed, projection: ed.originalProjection } });
         }
         setShowPreRefine(false);
+        setShowRefineTrails(false);      // K: nothing to point at after a revert
         setValue('refineMetrics', null);
         setValue('refinedEpochs', []);   // C2: nothing refined after a full revert
         message.success('Refinement reverted to baseline.');
@@ -174,6 +213,22 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
     function changeLabelColor(i: number, newColor: [number, number, number]) {
         setColorDict(new Map([...colorDict, [i, newColor]]));
     }
+
+    // J: progressive disclosure — refine expert params live in a collapsed
+    // "Advanced" group inside Precision Control, off the default path.
+    const [advancedOpen, setAdvancedOpen] = useState(false);
+
+    // Suspect Samples: task-aware data-quality diagnostics, a second lens
+    // alongside the projection-focused Distortion Lens.
+    const [suspectSignal, setSuspectSignal] = useState<string>('confidently_wrong');
+    // Accepts both the extension's enum value ('Code-Retrieval') and the
+    // string real EIF-jump sessions actually send ('Alignment') — the two
+    // callers never agreed on one name.
+    const isAlignmentTask = taskType === 'Code-Retrieval' || taskType === 'Alignment';
+    const suspectSignalOptions = isAlignmentTask ? ALIGNMENT_SUSPECT_OPTIONS : CLASSIFICATION_SUSPECT_OPTIONS;
+    const effectiveSuspectSignal = suspectSignalOptions.some((o) => o.value === suspectSignal)
+        ? suspectSignal
+        : suspectSignalOptions[0].value;
 
     // NOTE always add state as middle dependency
     const [searchValue, setSearchValue] = useState('');
@@ -323,6 +378,165 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         return relations;
     }, [allEpochData, epoch, selectedIndices, selectedItems]);
 
+    // Focus Neighbors: HD top-k of the primary selected point, each row marked
+    // satisfied (currently also an LD top-k neighbor) or not — a text-legible
+    // complement to the red/blue rings drawn on the canvas.
+    const focusNeighborRows = useMemo(() => {
+        const epochData = allEpochData[epoch];
+        if (!epochData || selectedIndices.length === 0) return [];
+        const focusId = selectedIndices[0];
+        const focusPos = rawIndexToProjectionPosition(focusId, epochData.indexList);
+        const hdPositions = (epochData.originalNeighbors?.[focusPos] ?? []).slice(0, refineTopK);
+        const hdIds = convertNeighborPositionsToRawIndices(hdPositions, epochData.indexList);
+        const ldPositions = computeProjectionNeighborPositionsForPoint(focusId, epochData.projection, epochData.indexList, refineTopK);
+        const ldIdSet = new Set(convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList));
+
+        return hdIds.map((id, i) => ({
+            id,
+            hdRank: i + 1,
+            satisfied: ldIdSet.has(id),
+            label: tokenList?.[id] ?? labelDict.get(inherentLabelData[id]) ?? '',
+        }));
+    }, [allEpochData, epoch, selectedIndices, refineTopK, tokenList, labelDict, inherentLabelData]);
+
+    const focusNeighborSatisfiedCount = focusNeighborRows.filter((row) => row.satisfied).length;
+
+    // B: Most Distorted — global (not view-filtered) recommendation list so
+    // users have somewhere to start instead of hunting for a bad point by eye.
+    const mostDistortedPoints = useMemo(() => {
+        const epochData = allEpochData[epoch];
+        const npMap = computeAllPointsNeighborPreservation(
+            epochData?.originalNeighbors,
+            epochData?.projectionNeighbors,
+            epochData?.indexList,
+            refineTopK,
+        );
+        return Array.from(npMap.entries())
+            .sort((a, b) => a[1] - b[1])
+            .slice(0, 10)
+            .map(([id, np]) => ({ id, np, label: tokenList?.[id] ?? labelDict.get(inherentLabelData[id]) ?? '' }));
+    }, [allEpochData, epoch, refineTopK, tokenList, labelDict, inherentLabelData]);
+
+    // C: session history helpers — a per-run outcome label plus JSON download
+    // and Markdown-table copy for reports.
+    const fmtNp = (v: number | null) => (v == null ? '—' : `${(v * 100).toFixed(0)}%`);
+    const sessionOutcome = (r: typeof refineSessions[number]) =>
+        r.stoppedByUser ? 'stopped' : r.converged === true ? 'converged' : r.converged === false ? (r.exitReason ?? 'partial') : 'done';
+
+    const handleExportSessionsJson = () => {
+        const blob = new Blob([JSON.stringify(refineSessions, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `refine-sessions-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    const handleCopySessionsMarkdown = async () => {
+        const header = '| Time | Epoch | Focus | k | Priority | NP before → after | Duration | Outcome |\n|---|---|---|---|---|---|---|---|';
+        const rows = refineSessions.map((r) => {
+            const focus = `#${r.focusIds[0]}${r.focusIds.length > 1 ? ` +${r.focusIds.length - 1}` : ''}`;
+            return `| ${new Date(r.timestamp).toLocaleTimeString()} | ${r.epoch} | ${focus} | ${r.topK} | ${r.priority} | ${fmtNp(r.npBefore)} → ${fmtNp(r.npAfter)} | ${(r.durationMs / 1000).toFixed(0)}s | ${sessionOutcome(r)} |`;
+        });
+        try {
+            await navigator.clipboard.writeText([header, ...rows].join('\n'));
+            message.success('History copied as Markdown.');
+        } catch {
+            message.error('Clipboard unavailable — use Export JSON instead.');
+        }
+    };
+
+    type SuspectDisplayRow = { key: string; title: string; detail: string; ids: number[] };
+
+    // Live refine polling replaces the whole `allEpochData` object every ~200ms
+    // even though it only ever patches `projection`/`projectionNeighbors` for
+    // the epoch being refined — prediction/predProbability/originalNeighbors
+    // (everything the classification and HD-based alignment signals read)
+    // never change from refine. Depending on this epoch-keys fingerprint
+    // (a primitive string, stable across those in-place patches) instead of
+    // the `allEpochData` object reference itself avoids re-running the O(E·N)
+    // Cartography/softmax scan on every refine tick. The one signal that does
+    // read live LD projections (pair distance trend) intentionally only
+    // refreshes on natural triggers (epoch switch, new epoch load, signal
+    // change) rather than live during an in-progress refine — it's a
+    // full-run convergence check, not a live refine monitor.
+    const epochKeysFingerprint = Object.keys(allEpochData).sort((a, b) => Number(a) - Number(b)).join(',');
+
+    // Suspect Samples: dispatch to the selected signal and format a uniform,
+    // explainable row (title + why-flagged detail) — never a bare score.
+    const suspectRows = useMemo<SuspectDisplayRow[]>(() => {
+        const epochData = allEpochData[epoch];
+        const label = (id: number) => tokenList?.[id] ?? labelDict.get(inherentLabelData[id]) ?? '';
+        const pairTitle = (ids: [number, number]) => `#${ids[0]} ↔ #${ids[1]}`;
+
+        if (isAlignmentTask) {
+            switch (effectiveSuspectSignal) {
+                case 'pair_distance_trend':
+                    return computePairDistanceTrend(alignment, allEpochData).slice(0, 10).map((r) => ({
+                        key: pairTitle(r.pairIds), title: pairTitle(r.pairIds), ids: r.pairIds,
+                        detail: `LD dist ${r.firstDist.toFixed(2)} → ${r.lastDist.toFixed(2)} (${r.delta >= 0 ? '+' : ''}${r.delta.toFixed(2)})`,
+                    }));
+                case 'alignment_impurity':
+                    return computeAlignmentNeighborhoodImpurity(alignment, epochData, refineTopK).slice(0, 10).map((r) => ({
+                        key: pairTitle(r.pairIds), title: pairTitle(r.pairIds), ids: r.pairIds,
+                        detail: `${(r.purity * 100).toFixed(0)}% of HD neighbors share this cluster`,
+                    }));
+                case 'partner_rank':
+                default:
+                    return computePartnerRankIssues(alignment, epochData, refineTopK).slice(0, 10).map((r) => ({
+                        key: pairTitle(r.pairIds), title: pairTitle(r.pairIds), ids: r.pairIds,
+                        detail: r.withinTopK ? `partner rank ${r.rank} of top-${refineTopK}` : `partner beyond top-${refineTopK}`,
+                    }));
+            }
+        }
+
+        switch (effectiveSuspectSignal) {
+            case 'oscillation':
+                return computeOscillation(allEpochData).slice(0, 10).map((r) => ({
+                    key: String(r.id), title: `#${r.id} ${label(r.id)}`, ids: [r.id],
+                    detail: `flipped ${r.flips}× across ${r.epochsSeen} epochs`,
+                }));
+            case 'hd_impurity':
+                return computeHdImpurity(epochData, inherentLabelData, refineTopK).slice(0, 10).map((r) => ({
+                    key: String(r.id), title: `#${r.id} ${label(r.id)}`, ids: [r.id],
+                    detail: `${r.sameLabelCount}/${r.total} HD neighbors share this label`,
+                }));
+            case 'cartography_hard':
+                return computeCartography(allEpochData, inherentLabelData)
+                    .sort((a, b) => a.confidence - b.confidence).slice(0, 10).map((r) => ({
+                        key: String(r.id), title: `#${r.id} ${label(r.id)}`, ids: [r.id],
+                        detail: `conf ${(r.confidence * 100).toFixed(0)}% · var ${(r.variability * 100).toFixed(0)}% · correct ${(r.correctness * 100).toFixed(0)}%`,
+                    }));
+            case 'cartography_ambiguous':
+                return computeCartography(allEpochData, inherentLabelData)
+                    .sort((a, b) => b.variability - a.variability).slice(0, 10).map((r) => ({
+                        key: String(r.id), title: `#${r.id} ${label(r.id)}`, ids: [r.id],
+                        detail: `var ${(r.variability * 100).toFixed(0)}% · conf ${(r.confidence * 100).toFixed(0)}% · correct ${(r.correctness * 100).toFixed(0)}%`,
+                    }));
+            case 'confidently_wrong':
+            default:
+                return computeConfidentlyWrong(epochData, inherentLabelData).slice(0, 10).map((r) => ({
+                    key: String(r.id), title: `#${r.id} ${label(r.id)}`, ids: [r.id],
+                    detail: `conf ${(r.confidence * 100).toFixed(0)}% → predicted "${labelDict.get(r.predictedLabel) ?? r.predictedLabel}" (true: "${labelDict.get(r.trueLabel) ?? r.trueLabel}")`,
+                }));
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isAlignmentTask, effectiveSuspectSignal, epochKeysFingerprint, epoch, alignment, refineTopK, inherentLabelData, labelDict, tokenList]);
+
+    // D: stop a running refine early and keep its current (intermediate) result
+    // instead of waiting out the full 90s/300s budget.
+    const handleStopRefine = async () => {
+        if (!activeRefineSessionId) return;
+        try {
+            await BackendAPI.stopRefineSession(activeRefineSessionId);
+            message.info('Stopping refine — keeping current result...');
+        } catch (e) {
+            console.error('stopRefineSession failed', e);
+            message.error('Failed to stop refine.');
+        }
+    };
+
     return (
         <div className="info-column">
             <FunctionalBlock label="Search">
@@ -463,7 +677,107 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
             {refineStatusMessage}
         </div>
     )}
+    {/* D: stop a running refine early and keep the current intermediate result */}
+    {refineStatus === 'running' && activeRefineSessionId && (
+        <Button
+            size="small"
+            block
+            icon={<X size={12} />}
+            onClick={handleStopRefine}
+            style={{ marginTop: 6, borderRadius: 4 }}
+        >
+            Stop &amp; keep current result
+        </Button>
+    )}
+
+    {/* J: expert refine params, collapsed by default */}
+    <div
+        onClick={() => setAdvancedOpen(!advancedOpen)}
+        style={{ marginTop: 10, fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}
+    >
+        {advancedOpen ? '▾' : '▸'} Advanced
+    </div>
+    {advancedOpen && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
+            {/* C3: neighborhood size (top-k) the refine objective preserves */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Tooltip title="Number of nearest neighbors refine tries to align (HD top-k = LD top-k). Range 3–20.">
+                    <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine top-k</span>
+                </Tooltip>
+                <InputNumber
+                    size="small" style={{ flex: 1 }}
+                    min={3} max={20} step={1} precision={0}
+                    value={refineTopK}
+                    onChange={(v) => {
+                        if (typeof v === 'number' && !Number.isNaN(v)) {
+                            setRefineTopK(Math.max(3, Math.min(20, Math.round(v))));
+                        }
+                    }}
+                />
+            </div>
+            {/* B1: accuracy ↔ layout tradeoff */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Tooltip title="Preserve layout: keep the current arrangement (may accept <100% neighbor accuracy). Max accuracy: pull neighbors in aggressively, allowing more layout distortion.">
+                    <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine goal</span>
+                </Tooltip>
+                <Select
+                    size="small" style={{ flex: 1 }}
+                    value={refinePriority <= 0.3 ? 'layout' : refinePriority >= 0.7 ? 'accuracy' : 'balanced'}
+                    onChange={(v) => {
+                        setRefinePriority(v === 'layout' ? 0.15 : v === 'accuracy' ? 0.9 : 0.5);
+                    }}
+                    options={[
+                        { label: 'Preserve layout', value: 'layout' },
+                        { label: 'Balanced', value: 'balanced' },
+                        { label: 'Max accuracy', value: 'accuracy' },
+                    ]}
+                />
+            </div>
+        </div>
+    )}
 </FunctionalBlock>
+            {selectedIndices.length > 0 && (
+                <FunctionalBlock label="Focus Neighbors">
+                    {focusNeighborRows.length > 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                    HD top-{refineTopK} of #{selectedIndices[0]}
+                                </span>
+                                <span style={{
+                                    fontSize: 11, fontWeight: 600,
+                                    color: focusNeighborSatisfiedCount === focusNeighborRows.length ? 'var(--color-success)' : 'var(--text-primary)',
+                                }}>
+                                    {focusNeighborSatisfiedCount}/{focusNeighborRows.length} in LD
+                                </span>
+                            </div>
+                            <div style={{ maxHeight: 180, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                {focusNeighborRows.map((row) => (
+                                    <div
+                                        key={row.id}
+                                        onMouseEnter={() => setHoveredIndex(row.id)}
+                                        onMouseLeave={() => setHoveredIndex(undefined)}
+                                        style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 4px', fontSize: 11 }}
+                                    >
+                                        <span style={{
+                                            display: 'inline-block', width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                                            background: row.satisfied ? 'var(--color-success)' : 'var(--color-error)',
+                                        }} />
+                                        <span style={{ color: 'var(--text-muted)', minWidth: 16 }}>{row.hdRank}</span>
+                                        <span style={{ color: 'var(--text-primary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            #{row.id}{row.label ? ` ${row.label}` : ''}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    ) : (
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '10px 0' }}>
+                            No HD neighbor data for this point yet.
+                        </div>
+                    )}
+                </FunctionalBlock>
+            )}
             <FunctionalBlock label="Refine Quality">
                 {refineMetrics ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
@@ -561,6 +875,18 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                             />
                         </div>
 
+                        {/* K: static baseline→refined displacement arrows on the canvas */}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
+                            <Tooltip title="Draw arrows from each cluster member's pre-refine position to its current one — a static record of what refine moved.">
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Show displacement</span>
+                            </Tooltip>
+                            <Switch
+                                size="small"
+                                checked={showRefineTrails}
+                                onChange={(v) => setShowRefineTrails(v)}
+                            />
+                        </div>
+
                         {/* B3: undo — revert the refinement back to baseline */}
                         <Button
                             size="small"
@@ -575,6 +901,130 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                 ) : (
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '10px 0' }}>
                         Run Update Projection to see metrics
+                    </div>
+                )}
+            </FunctionalBlock>
+            <FunctionalBlock label="Distortion Lens">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <Tooltip title="Color every point by neighbor preservation (HD top-k ∩ LD top-k). Reveals where the projection is unfaithful, before you refine anything.">
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Show on canvas</span>
+                    </Tooltip>
+                    <Switch size="small" checked={distortionLensOn} onChange={setDistortionLensOn} />
+                </div>
+                {distortionLensOn && (
+                    <div style={{ display: 'flex', gap: 12, marginBottom: 10, fontSize: 10, color: 'var(--text-muted)' }}>
+                        <LensLegendDot color="#22c55e" label="≥25%" />
+                        <LensLegendDot color="#f59e0b" label="≥10%" />
+                        <LensLegendDot color="#ef4444" label="<10%" />
+                    </div>
+                )}
+                <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4 }}>
+                    Most Distorted
+                </div>
+                {mostDistortedPoints.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        {mostDistortedPoints.map((row) => (
+                            <div
+                                key={row.id}
+                                onClick={() => { setSelectedIndices([row.id]); }}
+                                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, padding: '3px 4px', borderRadius: 3, cursor: 'pointer', fontSize: 11 }}
+                            >
+                                <span style={{ color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    #{row.id}{row.label ? ` ${row.label}` : ''}
+                                </span>
+                                <span style={{ fontWeight: 600, color: row.np * 100 >= 10 ? 'var(--color-warning)' : 'var(--color-error)' }}>
+                                    {(row.np * 100).toFixed(0)}%
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                ) : (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '6px 0' }}>
+                        No neighbor data loaded yet.
+                    </div>
+                )}
+            </FunctionalBlock>
+            <FunctionalBlock label="History" defaultCollapsed={true}>
+                {refineSessions.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                        <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                            <Button size="small" style={{ flex: 1, fontSize: 10 }} onClick={handleExportSessionsJson}>
+                                Export JSON
+                            </Button>
+                            <Button size="small" style={{ flex: 1, fontSize: 10 }} onClick={handleCopySessionsMarkdown}>
+                                Copy Markdown
+                            </Button>
+                        </div>
+                        <div style={{ maxHeight: 200, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                            {[...refineSessions].reverse().map((r) => (
+                                <div
+                                    key={r.id + r.timestamp}
+                                    onClick={() => {
+                                        setValue('epoch', r.epoch);
+                                        setSelectedIndices(r.focusIds);
+                                    }}
+                                    style={{
+                                        display: 'flex', flexDirection: 'column', gap: 1,
+                                        padding: '4px 6px', borderRadius: 4, cursor: 'pointer',
+                                        border: '1px solid var(--layout-border-color)', fontSize: 11,
+                                    }}
+                                >
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+                                        <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                                            Ep {r.epoch} · #{r.focusIds[0]}{r.focusIds.length > 1 ? ` +${r.focusIds.length - 1}` : ''}
+                                        </span>
+                                        <span style={{ color: 'var(--text-muted)' }}>
+                                            {new Date(r.timestamp).toLocaleTimeString()}
+                                        </span>
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, color: 'var(--text-muted)' }}>
+                                        <span>
+                                            NP {fmtNp(r.npBefore)} → <b style={{
+                                                color: (r.npAfter ?? 0) >= (r.npBefore ?? 0) ? 'var(--color-success)' : 'var(--color-error)',
+                                            }}>{fmtNp(r.npAfter)}</b>
+                                        </span>
+                                        <span>{(r.durationMs / 1000).toFixed(0)}s · {sessionOutcome(r)}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                ) : (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '6px 0' }}>
+                        No refine runs yet this session.
+                    </div>
+                )}
+            </FunctionalBlock>
+            <FunctionalBlock label="Suspect Samples">
+                <div style={{ marginBottom: 8 }}>
+                    <Select
+                        size="small"
+                        style={{ width: '100%' }}
+                        value={effectiveSuspectSignal}
+                        onChange={(v) => setSuspectSignal(v)}
+                        options={suspectSignalOptions}
+                    />
+                </div>
+                {suspectRows.length > 0 ? (
+                    <div style={{ maxHeight: 220, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        {suspectRows.map((row) => (
+                            <div
+                                key={row.key}
+                                onClick={() => setSelectedIndices(row.ids)}
+                                style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', border: '1px solid var(--layout-border-color)', fontSize: 11 }}
+                            >
+                                <div style={{ color: 'var(--text-primary)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {row.title}
+                                </div>
+                                <div style={{ color: 'var(--text-muted)' }}>{row.detail}</div>
+                            </div>
+                        ))}
+                    </div>
+                ) : (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: '6px 0' }}>
+                        {isAlignmentTask && alignment.length === 0
+                            ? 'No alignment data found (dataset/align.json missing).'
+                            : 'No suspects found for this lens yet.'}
                     </div>
                 )}
             </FunctionalBlock>
@@ -700,42 +1150,6 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                     { label: 'Original', value: 'original' },
                                     { label: 'Projection', value: 'projection' },
                                     { label: 'Both', value: 'both' },
-                                ]}
-                            />
-                        </div>
-
-                        {/* C3: neighborhood size (top-k) the refine objective preserves */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <Tooltip title="Number of nearest neighbors refine tries to align (HD top-k = LD top-k). Range 3–20.">
-                                <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine top-k</span>
-                            </Tooltip>
-                            <InputNumber
-                                size="small" style={{ flex: 1 }}
-                                min={3} max={20} step={1} precision={0}
-                                value={refineTopK}
-                                onChange={(v) => {
-                                    if (typeof v === 'number' && !Number.isNaN(v)) {
-                                        setRefineTopK(Math.max(3, Math.min(20, Math.round(v))));
-                                    }
-                                }}
-                            />
-                        </div>
-
-                        {/* B1: accuracy ↔ layout tradeoff */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <Tooltip title="Preserve layout: keep the current arrangement (may accept <100% neighbor accuracy). Max accuracy: pull neighbors in aggressively, allowing more layout distortion.">
-                                <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine goal</span>
-                            </Tooltip>
-                            <Select
-                                size="small" style={{ flex: 1 }}
-                                value={refinePriority <= 0.3 ? 'layout' : refinePriority >= 0.7 ? 'accuracy' : 'balanced'}
-                                onChange={(v) => {
-                                    setRefinePriority(v === 'layout' ? 0.15 : v === 'accuracy' ? 0.9 : 0.5);
-                                }}
-                                options={[
-                                    { label: 'Preserve layout', value: 'layout' },
-                                    { label: 'Balanced', value: 'balanced' },
-                                    { label: 'Max accuracy', value: 'accuracy' },
                                 ]}
                             />
                         </div>

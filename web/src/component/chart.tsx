@@ -2,7 +2,18 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { EmbeddingView, type EmbeddingViewProps, type DataPoint, type ViewportState } from 'embedding-atlas/react';
 import { useDefaultStore } from "../state/state.unified";
 import { transferArray2Color } from './utils';
-import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition } from '../utils/neighborDiagnostics';
+import { computeProjectionNeighborPositionsForPoint, convertNeighborPositionsToRawIndices, rawIndexToProjectionPosition, computeAllPointsNeighborPreservation } from '../utils/neighborDiagnostics';
+
+// A: distortion lens palette — mirrors the Refine Quality panel's NP thresholds
+// (>=25% success / >=10% warning / else error) so the same color always means
+// the same thing everywhere in the tool. Missing neighbor data gets its own
+// neutral bucket rather than silently reading as "well preserved".
+const LENS_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#9ca3af'];
+const LENS_BUCKET_UNKNOWN = 3;
+function lensBucket(np: number | undefined): number {
+    if (np === undefined) return LENS_BUCKET_UNKNOWN;
+    return np * 100 >= 25 ? 0 : np * 100 >= 10 ? 1 : 2;
+}
 
 // ---------------------------------------------------------------------------
 // RefineStatusBadge — glass pill overlay on top-right of the canvas.
@@ -57,6 +68,61 @@ function RefineStatusBadge() {
                     <span>Refining{stepsLabel}</span>
                 </>
             )}
+        </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ViewStateBar — persistent glass pill on top-left of the canvas answering
+// "what am I looking at right now": epoch, refined/baseline, focus, top-k.
+// ---------------------------------------------------------------------------
+function ViewStateBar() {
+    const { epoch, refinedEpochs, showPreRefine, selectedIndices, refineTopK } =
+        useDefaultStore(['epoch', 'refinedEpochs', 'showPreRefine', 'selectedIndices', 'refineTopK']);
+
+    const isRefinedEpoch = refinedEpochs.includes(epoch);
+    const projectionLabel = showPreRefine ? 'Baseline (before)' : (isRefinedEpoch ? 'Refined' : 'Baseline');
+    const projectionColor = showPreRefine
+        ? 'var(--color-warning, #f59e0b)'
+        : (isRefinedEpoch ? 'var(--color-success, #22c55e)' : 'var(--text-muted, #888)');
+    const focusLabel = selectedIndices.length === 0
+        ? 'No selection'
+        : selectedIndices.length === 1
+            ? `Focus #${selectedIndices[0]}`
+            : `${selectedIndices.length} points`;
+
+    const dotStyle: React.CSSProperties = { opacity: 0.35 };
+
+    return (
+        <div style={{
+            position: 'absolute',
+            top: 10,
+            left: 12,
+            zIndex: 200,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 10px',
+            borderRadius: 20,
+            background: 'rgba(255,255,255,0.18)',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            border: '1px solid var(--layout-border-color, rgba(0,0,0,0.12))',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+            fontSize: 11,
+            fontWeight: 600,
+            color: 'var(--text-primary, #333)',
+            pointerEvents: 'none',
+            userSelect: 'none',
+            whiteSpace: 'nowrap',
+        }}>
+            <span>Epoch {epoch}</span>
+            <span style={dotStyle}>·</span>
+            <span style={{ color: projectionColor }}>{projectionLabel}</span>
+            <span style={dotStyle}>·</span>
+            <span>{focusLabel}</span>
+            <span style={dotStyle}>·</span>
+            <span>k={refineTopK}</span>
         </div>
     );
 }
@@ -131,7 +197,6 @@ class NeighborOverlay {
     private props: any;
     private proxy: any;
     private handleClickBound: (e: MouseEvent) => void;
-    private defs: SVGDefsElement | null = null;
 
     constructor(target: HTMLDivElement, props: any) {
         this.el = target;
@@ -149,25 +214,6 @@ class NeighborOverlay {
         this.svg.style.display = 'block';
         this.el.appendChild(this.svg);
         this.svg.addEventListener('click', this.handleClickBound);
-        this.defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-        const makeMarker = (id: string, color: string) => {
-            const m = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-            m.setAttribute('id', id);
-            m.setAttribute('viewBox', '0 0 10 10');
-            m.setAttribute('markerUnits', 'userSpaceOnUse');
-            m.setAttribute('markerWidth', '9');
-            m.setAttribute('markerHeight', '9');
-            m.setAttribute('refX', '8');
-            m.setAttribute('refY', '5');
-            m.setAttribute('orient', 'auto');
-            const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            p.setAttribute('d', 'M0,0 L10,5 L0,10 Z');
-            p.setAttribute('fill', color);
-            m.appendChild(p);
-            return m;
-        };
-        this.defs.appendChild(makeMarker('trail-arrow', '#7F8C8D'));
-        this.svg.appendChild(this.defs);
         this.render();
     }
 
@@ -175,9 +221,7 @@ class NeighborOverlay {
         if (this.svg) {
             const children = Array.from(this.svg.childNodes);
             for (const child of children) {
-                if ((child as Element).nodeName.toLowerCase() !== 'defs') {
-                    this.svg.removeChild(child);
-                }
+                this.svg.removeChild(child);
             }
         }
     }
@@ -199,6 +243,21 @@ class NeighborOverlay {
         }
         if (minIdx >= 0 && minD2 <= 100) return this.props.idsByPos[minIdx] as number;
         return null;
+    }
+
+    // Draws a small filled triangle at the MIDPOINT of a line segment, oriented
+    // along its direction — used instead of an SVG end-marker so the arrowhead
+    // never overlaps the destination point's selection ring/halo.
+    private drawMidpointArrow(parent: SVGGElement, x1: number, y1: number, x2: number, y2: number, color: string, size: number = 5) {
+        const mx = (x1 + x2) / 2;
+        const my = (y1 + y2) / 2;
+        const angleDeg = Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI;
+        const half = size * 0.6;
+        const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        arrow.setAttribute('d', `M ${-half},${-half} L ${size},0 L ${-half},${half} Z`);
+        arrow.setAttribute('fill', color);
+        arrow.setAttribute('transform', `translate(${mx},${my}) rotate(${angleDeg})`);
+        parent.appendChild(arrow);
     }
 
     handleClick(e: MouseEvent) {
@@ -347,12 +406,62 @@ class NeighborOverlay {
                         l.setAttribute('stroke-dasharray', '6 3');
                         l.setAttribute('stroke-linecap', 'round');
                         l.setAttribute('stroke-opacity', '0.9');
-                        l.setAttribute('marker-end', 'url(#trail-arrow)');
                         trailGroup.appendChild(l);
+                        this.drawMidpointArrow(trailGroup, points[i - 1].x, points[i - 1].y, points[i].x, points[i].y, '#7F8C8D', 6);
                     }
                 }
                 this.svg.appendChild(trailGroup);
             }
+        }
+
+        // K: static displacement trails (baseline → current position) for the
+        // refine cluster, so one screenshot shows what refine moved and where.
+        // Independent of the neighbor-ring toggles; zero-length when the
+        // before-view is on (projection === baseline), so nothing draws there.
+        if (this.props.showRefineTrails && this.props.baselineProjection && groups.length > 0) {
+            const dispGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            const seen = new Set<number>();
+            const drawDisplacement = (nid: number) => {
+                if (typeof nid !== 'number' || seen.has(nid)) return;
+                seen.add(nid);
+                const pos = rawIndexToProjectionPosition(nid, this.props.indexList);
+                const before = this.props.baselineProjection?.[pos];
+                if (!before) return;
+                let cx: number, cy: number;
+                const renderedPos = this.props.posMap?.get(nid);
+                if (renderedPos != null) {
+                    cx = dataX[renderedPos];
+                    cy = dataY[renderedPos];
+                } else {
+                    const cur = this.props.fullProjection?.[pos];
+                    if (!cur) return;
+                    cx = cur[0];
+                    cy = cur[1];
+                }
+                const a = this.proxy.location(before[0], before[1]);
+                const b = this.proxy.location(cx, cy);
+                const dx = b.x - a.x, dy = b.y - a.y;
+                if (dx * dx + dy * dy < 16) return; // skip < 4px screen movement
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', String(a.x));
+                line.setAttribute('y1', String(a.y));
+                line.setAttribute('x2', String(b.x));
+                line.setAttribute('y2', String(b.y));
+                line.setAttribute('stroke', '#0d9488');
+                line.setAttribute('stroke-width', '1');
+                line.setAttribute('stroke-dasharray', '4 3');
+                line.setAttribute('stroke-linecap', 'round');
+                line.setAttribute('stroke-opacity', '0.7');
+                dispGroup.appendChild(line);
+                this.drawMidpointArrow(dispGroup, a.x, a.y, b.x, b.y, '#0d9488', 5);
+            };
+            for (const group of groups) {
+                drawDisplacement(group.center?.identifier as number);
+                group.hdOnly.forEach(drawDisplacement);
+                group.ldOnly.forEach(drawDisplacement);
+                group.overlap.forEach(drawDisplacement);
+            }
+            this.svg.appendChild(dispGroup);
         }
 
         // Secondary boxes (tiered mode): draw union polygon outline
@@ -507,7 +616,6 @@ class NeighborOverlay {
     destroy() {
         if (this.svg && this.el) this.el.removeChild(this.svg);
         if (this.svg) this.svg.removeEventListener('click', this.handleClickBound);
-        this.defs = null;
         this.svg = null;
         this.el = null;
     }
@@ -576,6 +684,11 @@ export const ChartComponent = memo(() => {
         useDefaultStore(["boxSelectActive", "refineFocusType", "secondaryIndices", "setSecondaryIndices", "secondaryBoxes", "setSecondaryBoxes"]);
     const { neighborDisplayIndices } = useDefaultStore(["neighborDisplayIndices"]);
     const { showPreRefine } = useDefaultStore(["showPreRefine"]);
+    // Neighbor rings follow the refine top-k setting. HD neighbor lists are
+    // loaded from the backend at k=10, so the HD side caps at the stored length.
+    const { refineTopK } = useDefaultStore(["refineTopK"]);
+    const { distortionLensOn } = useDefaultStore(["distortionLensOn"]);
+    const { showRefineTrails } = useDefaultStore(["showRefineTrails"]);
 
     // B3: non-destructive before/after toggle — when showPreRefine is on, render
     // the pre-refine baseline (originalProjection) as the projection so every
@@ -678,7 +791,7 @@ export const ChartComponent = memo(() => {
         const activePointPos = rawIndexToProjectionPosition(activePointId, epochData.indexList);
         const hdIds = revealOriginalNeighbors
             ? convertNeighborPositionsToRawIndices(
-                epochData.originalNeighbors?.[activePointPos] ?? [],
+                (epochData.originalNeighbors?.[activePointPos] ?? []).slice(0, refineTopK),
                 epochData.indexList
               )
             : [];
@@ -686,7 +799,7 @@ export const ChartComponent = memo(() => {
             activePointId,
             epochData.originalProjection ?? epochData.projection,
             epochData.indexList,
-            10
+            refineTopK
         );
         const ldIds = revealProjectionNeighbors
             ? convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList)
@@ -704,6 +817,7 @@ export const ChartComponent = memo(() => {
         selectedIndices,
         revealOriginalNeighbors,
         revealProjectionNeighbors,
+        refineTopK,
     ]);
 
     // filter dataIndices
@@ -770,6 +884,73 @@ export const ChartComponent = memo(() => {
         return s;
     }, [epochData, highlightData, inherentLabelData, allEpochData, epoch]);
 
+    // ---- object-constancy transition: smoothly interpolate point positions on
+    // discrete view jumps (epoch switch, before/after toggle) instead of a hard
+    // cut. Live refine polling updates the same epoch/showPreRefine combo, so it
+    // is untouched by this — only these two discrete jumps trigger a blend. ----
+    const targetPosByRaw = useMemo(() => {
+        const m = new Map<number, [number, number]>();
+        if (!epochData) return m;
+        filteredIndices.forEach((rawIndex) => {
+            const projectionPos = rawIndexToProjectionPosition(rawIndex, epochData.indexList);
+            const coord = epochData.projection[projectionPos];
+            if (coord) m.set(rawIndex, [coord[0], coord[1]]);
+        });
+        return m;
+    }, [epochData, filteredIndices]);
+
+    const transitionKey = `${epoch}::${showPreRefine ? 'pre' : 'post'}`;
+    const prevTransitionKeyRef = useRef<string>(transitionKey);
+    const prevPosByRawRef = useRef<Map<number, [number, number]>>(targetPosByRaw);
+    const [blendFrom, setBlendFrom] = useState<Map<number, [number, number]> | null>(null);
+    const [blendProgress, setBlendProgress] = useState(1);
+    const blendRafRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        if (prevTransitionKeyRef.current !== transitionKey) {
+            prevTransitionKeyRef.current = transitionKey;
+            const fromMap = prevPosByRawRef.current;
+            if (fromMap.size > 0) {
+                if (blendRafRef.current) cancelAnimationFrame(blendRafRef.current);
+                setBlendFrom(fromMap);
+                setBlendProgress(0);
+                const duration = 450;
+                const start = performance.now();
+                const step = (now: number) => {
+                    const t = Math.min(1, (now - start) / duration);
+                    const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+                    setBlendProgress(eased);
+                    if (t < 1) {
+                        blendRafRef.current = requestAnimationFrame(step);
+                    } else {
+                        blendRafRef.current = null;
+                        setBlendFrom(null);
+                    }
+                };
+                blendRafRef.current = requestAnimationFrame(step);
+            }
+        }
+        // Keep the "last settled" snapshot fresh so the *next* discrete jump
+        // animates from wherever points currently sit (e.g. post-refine layout).
+        if (!blendRafRef.current) prevPosByRawRef.current = targetPosByRaw;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [transitionKey, targetPosByRaw]);
+
+    useEffect(() => () => {
+        if (blendRafRef.current) cancelAnimationFrame(blendRafRef.current);
+    }, []);
+
+    // A: per-point neighbor preservation, only computed while the lens is on.
+    const pointNpByRaw = useMemo(() => {
+        if (!distortionLensOn || !epochData) return new Map<number, number>();
+        return computeAllPointsNeighborPreservation(
+            epochData.originalNeighbors,
+            epochData.projectionNeighbors,
+            epochData.indexList,
+            refineTopK,
+        );
+    }, [distortionLensOn, epochData, refineTopK]);
+
     // convert data for embedding view
     const prepared = useMemo<PreparedEmbedding | null>(() => {
         if (!epochData || filteredIndices.length === 0) {
@@ -786,21 +967,30 @@ export const ChartComponent = memo(() => {
         // so highlighted points always render red regardless of their class.
         const HIGHLIGHT_COLOR = '#ff2222';
         const HIGHLIGHT_CATEGORY_IDX = 0;
-        const hasHighlights = highlightedSet.size > 0;
-        if (hasHighlights) {
+        const hasHighlights = !distortionLensOn && highlightedSet.size > 0;
+        if (distortionLensOn) {
+            categoryColorList.push(...LENS_COLORS); // slots 0/1/2/3 = good/warning/distorted/unknown
+        } else if (hasHighlights) {
             categoryColorList.push(HIGHLIGHT_COLOR); // slot 0
         }
 
         let dataPoints : DataPoint[] = []
 
         filteredIndices.forEach((rawIndex, position) => {
-            const projectionPos = rawIndexToProjectionPosition(rawIndex, epochData.indexList);
-            const [px, py] = epochData.projection[projectionPos] ?? [0, 0];
+            const target = targetPosByRaw.get(rawIndex) ?? [0, 0];
+            const from = blendFrom?.get(rawIndex);
+            const px = from ? from[0] + (target[0] - from[0]) * blendProgress : target[0];
+            const py = from ? from[1] + (target[1] - from[1]) * blendProgress : target[1];
             x[position] = px;
             y[position] = py;
 
-            // Highlighted points always use slot 0 (red); normal points use their label colour.
-            if (hasHighlights && highlightedSet.has(rawIndex)) {
+            const np = distortionLensOn ? pointNpByRaw.get(rawIndex) : undefined;
+
+            // Distortion lens takes priority; otherwise highlights (bright red);
+            // otherwise each point uses its label colour.
+            if (distortionLensOn) {
+                category[position] = lensBucket(np);
+            } else if (hasHighlights && highlightedSet.has(rawIndex)) {
                 category[position] = HIGHLIGHT_CATEGORY_IDX;
             } else {
                 const label = inherentLabelData[rawIndex] ?? 0;
@@ -817,11 +1007,14 @@ export const ChartComponent = memo(() => {
             }
 
             const label = inherentLabelData[rawIndex] ?? 0;
+            const text = np !== undefined
+                ? `Index: ${rawIndex}\nLabel: ${label}\nNP: ${(np * 100).toFixed(0)}%`
+                : `Index: ${rawIndex}\nLabel: ${label}`;
             dataPoints.push({
                 x: px,
                 y: py,
                 category: label,
-                text: `Index: ${rawIndex}\nLabel: ${label}`,
+                text,
                 identifier: rawIndex,
                 fields: {}
             })
@@ -838,7 +1031,7 @@ export const ChartComponent = memo(() => {
             dataPoints,
             categoryColors: categoryColorList.length > 0 ? categoryColorList : null,
         };
-    }, [colorDict, epochData, filteredIndices, inherentLabelData, highlightedSet]);
+    }, [colorDict, epochData, filteredIndices, inherentLabelData, highlightedSet, targetPosByRaw, blendFrom, blendProgress, distortionLensOn, pointNpByRaw]);
 
     const posMap = useMemo(() => {
         const m = new Map<number, number>();
@@ -888,6 +1081,7 @@ export const ChartComponent = memo(() => {
             showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState,
             showTrail, availableEpochs, allEpochData, currentEpoch: epoch,
             setSelectedIndices, selectedIndices, secondaryIndices, setSecondaryIndices, secondaryBoxes,
+            showRefineTrails, baselineProjection: epochData?.originalProjection,
         };
         if (!prepared || !epochData) return { ...baseProps, center: null, multiCenterGroups: [] } as any;
 
@@ -908,10 +1102,10 @@ export const ChartComponent = memo(() => {
         for (const fid of focusIds) {
             const focusPos = rawIndexToProjectionPosition(fid, epochData.indexList);
 
-            const hdPositions: number[] = epochData.originalNeighbors?.[focusPos] ?? [];
+            const hdPositions: number[] = (epochData.originalNeighbors?.[focusPos] ?? []).slice(0, refineTopK);
             const hdAll = convertNeighborPositionsToRawIndices(hdPositions, epochData.indexList);
 
-            const ldPositions = computeProjectionNeighborPositionsForPoint(fid, ldProjection, epochData.indexList, 10);
+            const ldPositions = computeProjectionNeighborPositionsForPoint(fid, ldProjection, epochData.indexList, refineTopK);
             const ldAll = convertNeighborPositionsToRawIndices(ldPositions, epochData.indexList);
 
             const hdSet = new Set<number>(hdAll);
@@ -940,7 +1134,7 @@ export const ChartComponent = memo(() => {
             overlap: primaryGroup?.overlap ?? [],
             multiCenterGroups,
         };
-    }, [prepared, epochData, activePointId, selectedIndices, neighborDisplayIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
+    }, [prepared, epochData, activePointId, selectedIndices, neighborDisplayIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, refineTopK, showRefineTrails, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
 
     // ---- box select overlay state & handlers ----
     const [boxDrag, setBoxDrag] = useState<{ startX: number; startY: number; curX: number; curY: number } | null>(null);
@@ -1077,6 +1271,7 @@ export const ChartComponent = memo(() => {
             <div style={{ position: 'relative', flex: 1 }}>
                 <style>{`@keyframes ttav-pulse{0%,100%{opacity:1}50%{opacity:0.35}}`}</style>
                 {content ?? <div style={{ width: '100%', height: '100%' }} />}
+                <ViewStateBar />
                 <RefineStatusBadge />
                 {boxSelectActive && (
                     <div

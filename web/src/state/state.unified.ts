@@ -15,6 +15,25 @@ export type ViewportBBox = {
     yMin: number;
     yMax: number;
 };
+// C: one completed refine run, recorded for the History panel and export.
+export type RefineSessionRecord = {
+    id: string;
+    timestamp: number;
+    epoch: number;
+    focusIds: number[];
+    secondaryCount: number;
+    topK: number;
+    priority: number;
+    npBefore: number | null;   // fraction 0-1
+    npAfter: number | null;    // fraction 0-1
+    focusDisplacement: number | null;
+    globalDrift: number | null;
+    durationMs: number;
+    exitReason: string | null;
+    converged: boolean | null;
+    stoppedByUser: boolean;
+};
+
 // Types from plotView
 export type EpochData = {
     projection: number[][];
@@ -142,6 +161,22 @@ export type BaseMutableGlobalStore = {
 
     // C2: epochs that currently have a refined projection (for timeline marking).
     refinedEpochs: number[];
+
+    // D: session id of the currently-running refine, so the UI can offer a
+    // "stop & keep current result" action instead of waiting out the full budget.
+    activeRefineSessionId: string | null;
+
+    // A: distortion lens — color every point by neighbor preservation (HD
+    // top-k ∩ LD top-k) instead of by class, to surface where the projection
+    // is unfaithful.
+    distortionLensOn: boolean;
+
+    // K: draw static baseline→refined displacement arrows for the refine
+    // cluster, so a single screenshot shows what refine did.
+    showRefineTrails: boolean;
+
+    // C: completed refine sessions (in-memory for this page session only).
+    refineSessions: RefineSessionRecord[];
 };
 
 export let initMutableGlobalStore: BaseMutableGlobalStore = {
@@ -228,6 +263,10 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     refinePriority: 0.5,
     showPreRefine: false,
     refinedEpochs: [],
+    activeRefineSessionId: null,
+    distortionLensOn: false,
+    showRefineTrails: false,
+    refineSessions: [],
 };
 
 type SetFunction<T> = (setState: (state: T) => T | Partial<T>) => void;

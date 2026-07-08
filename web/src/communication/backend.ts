@@ -180,6 +180,17 @@ export function getRefineSessionProgress(
     }, options);
 }
 
+// D: request a running refine session to stop early and keep its current
+// (intermediate) result, instead of waiting out the full 90s/300s budget.
+export function stopRefineSession(
+    sessionId: string,
+    options?: NetworkOptions
+) {
+    return basicPostWithJsonResponse('/stopRefineSession', {
+        "session_id": sessionId,
+    }, options);
+}
+
 export async function syncSession(config: any): Promise<any> {
     // 这里的路由名需要和 Python server 中的 @app.route('/syncSession') 对应
     return basicPostWithJsonResponse('/syncSession', config);
@@ -221,7 +232,7 @@ export function triggerStartVisualizing(
 }
 
 export function fetchTrainingProcessInfo(contentPath: string, options?: NetworkOptions) {
-    return basicGetWithJsonResponse(`/getTrainingProcessInfo?content_path=${contentPath}`, options);
+    return basicGetWithJsonResponse(`/getTrainingProcessInfo?content_path=${encodeURIComponent(contentPath)}`, options);
 }
 
 export async function fetchEpochProjection(

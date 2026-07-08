@@ -6,7 +6,9 @@ import { TrainingEventPanel } from '../component/training-event-panel';
 import InfluenceAnalysisPanel from '../component/influence-panel';
 import { TokenPanel } from '../component/token-panel';
 import { useDefaultStore,useGlobalStore } from '../state/state.unified';
+import type { RefineSessionRecord } from '../state/state.unified';
 import * as BackendAPI from '../communication/backend';
+import { computeAllPointsNeighborPreservation } from '../utils/neighborDiagnostics';
 
 import "../index.css";
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
@@ -584,7 +586,21 @@ function MessageHandler() {
             
             const epochs = staticCtx.processInfo.available_epochs || [];
             setAvailableEpochs(epochs);
-           
+
+            // Code-Retrieval / Alignment: ground-truth alignment clusters
+            // (union-find groups over dataset/align.json), used by the
+            // alignment suspect signals. Accepts both the extension's enum
+            // value and the string real EIF-jump sessions actually send.
+            // Non-critical — an empty/missing align.json just yields [].
+            if (taskType === 'Code-Retrieval' || taskType === 'Alignment') {
+                try {
+                    const alignmentResp = await BackendAPI.getAlignment(contentPath);
+                    setValue('alignment', (alignmentResp as any)?.alignment ?? []);
+                } catch (e) {
+                    console.error('[TTAV] Failed to load alignment data:', e);
+                }
+            }
+
             for (const epochNum of epochs) {
                 await refreshEpochData(epochNum, { contentPath, vis_method: visualizationMethod, visID:visualizationID, taskType },true);
                 
@@ -822,7 +838,6 @@ export function AppCombinedView() {
         epoch: targetEpoch,
         vis_method,
         taskType,
-        setValue,
         focusMode,
         currentViewportBBox,
         setHoveredIndex,
@@ -837,7 +852,6 @@ export function AppCombinedView() {
         'epoch',
         'vis_method',
         'taskType',
-        'setValue',
         'focusMode',
         'currentViewportBBox',
         'setHoveredIndex',
@@ -846,52 +860,7 @@ export function AppCombinedView() {
         'refineTopK',
         'refinePriority',
     ]);
-// 用于 Canvas 实时绘制的坐标（这是真正传给 Canvas 组件的数据）
-    const [currentDrawingCoords, setCurrentDrawingCoords] = useState<number[][] | null>(null);
-    const animationRef = useRef<number>();
-
-    // 平滑平移函数
-    const animateTransition = (startCoords: number[][], endCoords: number[][]) => {
-        const duration = 800; // 动画持续 800ms
-        const startTime = performance.now();
-
-        const step = (currentTime: number) => {
-            const elapsed = currentTime - startTime;
-            const progress = Math.min(elapsed / duration, 1);
-
-            // 缓动函数 (EaseInOutQuad)
-            const ease = progress < 0.5
-                ? 2 * progress * progress
-                : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-
-            // 计算每一帧的插值坐标
-            const interpolated = startCoords.map((start, i) => {
-                const end = endCoords[i];
-                return [
-                    start[0] + (end[0] - start[0]) * ease,
-                    start[1] + (end[1] - start[1]) * ease
-                ];
-            });
-
-            // 更新绘制用的 State
-            setCurrentDrawingCoords(interpolated);
-
-            if (progress < 1) {
-                animationRef.current = requestAnimationFrame(step);
-            } else {
-                // 动画结束，正式同步到 Store
-                setValue('refinedProjection', endCoords);
-            }
-        };
-
-        if (animationRef.current) cancelAnimationFrame(animationRef.current);
-        animationRef.current = requestAnimationFrame(step);
-        };
-
-         
-
     const isRefining = useRef(false);
-    const [, setActiveRefineSessionId] = useState<string | null>(null);
     const REFINE_MSG_KEY = 'ttav_refine_loading';
 
     const handleUpdate = async () => {
@@ -914,6 +883,24 @@ export function AppCombinedView() {
 
         try {
             const oldEpochData = useGlobalStore.getState().allEpochData[epoch];
+
+            // C: session record — capture the pre-refine NP of the selected
+            // points now, so the History row can show before → after.
+            const sessionStartMs = Date.now();
+            const npBeforeMap = computeAllPointsNeighborPreservation(
+                oldEpochData?.originalNeighbors,
+                oldEpochData?.projectionNeighbors,
+                oldEpochData?.indexList,
+                refineTopK,
+            );
+            const npBeforeVals = selectedIndices
+                .map((i) => npBeforeMap.get(i))
+                .filter((v): v is number => v != null);
+            const npBefore = npBeforeVals.length > 0
+                ? npBeforeVals.reduce((a, b) => a + b, 0) / npBeforeVals.length
+                : null;
+            let sawStopRequested = false;
+
             const startResponse = await BackendAPI.startRefineSession(
                 contentPath,
                 selectedIndices,
@@ -938,7 +925,7 @@ export function AppCombinedView() {
                 let finalProgress: any = null;
                 let latestSampledMetrics: any = null;
                 let resolvedBehavior: any = (startResponse as any).resolved_refine_behavior ?? null;
-                setActiveRefineSessionId(sessionId);
+                useGlobalStore.getState().setValue('activeRefineSessionId', sessionId);
 
                 // blendBaseline is the pre-refine projection used as the LD anchor for
                 // neighbor-set computation during animation (avoids co-location collapse).
@@ -983,6 +970,9 @@ export function AppCombinedView() {
                     }
                     if ((progress as any).resolved_refine_behavior) {
                         resolvedBehavior = (progress as any).resolved_refine_behavior;
+                    }
+                    if ((progress as any).stop_requested) {
+                        sawStopRequested = true;
                     }
                     const progressMetrics = normalizeStructuralMetrics(
                         (progress as any).sampled_metrics
@@ -1048,7 +1038,7 @@ export function AppCombinedView() {
                 }
 
                 console.log(`[TTAV] Refine success. Fetching updated projection + low-D neighbors...`);
-                setActiveRefineSessionId(null);
+                useGlobalStore.getState().setValue('activeRefineSessionId', null);
 
                 const projResp = await BackendAPI.fetchEpochProjection(contentPath, vis_method, currentVisID, targetEpoch, true);
                 const refinedProjection = projResp.projection || oldEpochData.projection;
@@ -1115,6 +1105,34 @@ export function AppCombinedView() {
                     }
                 }, 3000);
 
+                // C: append this run to the session history.
+                // K: light up the displacement trails for the fresh result.
+                {
+                    const finalMetrics = useGlobalStore.getState().refineMetrics;
+                    const record: RefineSessionRecord = {
+                        id: sessionId,
+                        timestamp: sessionStartMs,
+                        epoch: targetEpoch,
+                        focusIds: [...selectedIndices],
+                        secondaryCount: secondaryIndices?.length ?? 0,
+                        topK: refineTopK,
+                        priority: refinePriority,
+                        npBefore,
+                        npAfter: refineStatus && typeof refineStatus.final_np === 'number'
+                            ? refineStatus.final_np / 100
+                            : (finalMetrics?.neighborPreservation ?? null),
+                        focusDisplacement: finalMetrics?.focusDisplacement ?? null,
+                        globalDrift: finalMetrics?.globalDrift ?? null,
+                        durationMs: Date.now() - sessionStartMs,
+                        exitReason: refineStatus?.reason ?? null,
+                        converged: refineStatus?.converged ?? null,
+                        stoppedByUser: sawStopRequested,
+                    };
+                    const st = useGlobalStore.getState();
+                    st.setValue('refineSessions', [...st.refineSessions, record]);
+                    st.setValue('showRefineTrails', true);
+                }
+
                 // C2: refresh which epochs are refined (current epoch now; the rest
                 // fill in as the background patch_other_epochs completes — re-poll).
                 const refreshRefinedEpochs = async () => {
@@ -1139,6 +1157,7 @@ export function AppCombinedView() {
             if (useGlobalStore.getState().refineStatus === 'running') {
                 useGlobalStore.getState().setValue('refineStatus', 'idle');
             }
+            useGlobalStore.getState().setValue('activeRefineSessionId', null);
         }
     };
     // 1. 监听全局选点，确保 selectedIndices 响应

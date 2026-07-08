@@ -100,6 +100,43 @@ export function computeProjectionNeighborPositionsForPoint(
     return best.map((item) => item.pos);
 }
 
+// Per-point neighbor preservation (HD top-k ∩ LD top-k / k) for every point in
+// an epoch, keyed by raw dataset index. Both neighbor lists are pre-computed
+// server-side and already loaded, so this is O(N·k) — no brute-force per-point
+// re-projection needed (unlike computeProjectionNeighborPositionsForPoint).
+export function computeAllPointsNeighborPreservation(
+    originalNeighbors: number[][] | undefined | null,
+    projectionNeighbors: number[][] | undefined | null,
+    indexList: number[] | undefined | null,
+    k: number,
+): Map<number, number> {
+    const result = new Map<number, number>();
+    if (!Array.isArray(originalNeighbors) || !Array.isArray(projectionNeighbors)) {
+        return result;
+    }
+    const indices = Array.isArray(indexList) ? indexList : [];
+
+    for (let pos = 0; pos < originalNeighbors.length; pos += 1) {
+        const hdList = originalNeighbors[pos];
+        const ldList = projectionNeighbors[pos];
+        if (!Array.isArray(hdList) || !Array.isArray(ldList) || hdList.length === 0) continue;
+
+        const effectiveK = Math.min(k, hdList.length, ldList.length);
+        if (effectiveK === 0) continue;
+
+        const hdSet = new Set(hdList.slice(0, effectiveK));
+        let overlap = 0;
+        for (let i = 0; i < effectiveK; i += 1) {
+            if (hdSet.has(ldList[i])) overlap += 1;
+        }
+
+        const rawIdx = indices.length > 0 ? indices[pos] : pos;
+        result.set(rawIdx, overlap / effectiveK);
+    }
+
+    return result;
+}
+
 export function classifyNeighborDiagnostics(
     originalNeighbors: number[] | undefined | null,
     projectionNeighbors: number[] | undefined | null,
