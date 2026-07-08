@@ -9,10 +9,11 @@ import { useDefaultStore,useGlobalStore } from '../state/state.unified';
 import type { RefineSessionRecord } from '../state/state.unified';
 import * as BackendAPI from '../communication/backend';
 import { computeAllPointsNeighborPreservation } from '../utils/neighborDiagnostics';
+import { logInteraction } from '../utils/interactionLog';
 
 import "../index.css";
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { REFINE_DEFAULTS } from '../config/refine';
+import { REFINE_DEFAULTS, REFINE_TOP_K_MAX } from '../config/refine';
 
 const LOG_PREFIX = '[TTVisualizer]';
 
@@ -102,7 +103,7 @@ interface FunctionViewPanelsProps {
         const [projection, originalNeighbors, projectionNeighbors, predictionResponse, background] =
             await Promise.all([
                 BackendAPI.fetchEpochProjection(contentPath, method, visID, epochNum, refineFlag),
-                BackendAPI.getOriginalNeighbors(contentPath, epochNum),
+                BackendAPI.getOriginalNeighbors(contentPath, epochNum, REFINE_TOP_K_MAX),
                 BackendAPI.getProjectionNeighbors(contentPath, method, visID, epochNum, refineFlag),
                 isClassification
                     ? BackendAPI.getAttributeResource(contentPath, epochNum, 'prediction')
@@ -862,6 +863,49 @@ export function AppCombinedView() {
     ]);
     const isRefining = useRef(false);
     const REFINE_MSG_KEY = 'ttav_refine_loading';
+
+    // I: interaction telemetry. Wire once at mount via the store's
+    // subscribeWithSelector middleware so instrumentation stays out of the
+    // individual action call sites. Local-only; see utils/interactionLog.ts.
+    useEffect(() => {
+        const unsubs = [
+            useGlobalStore.subscribe(
+                (s) => s.epoch,
+                (epoch) => logInteraction('epoch_change', { epoch }),
+            ),
+            useGlobalStore.subscribe(
+                (s) => s.selectedIndices,
+                (sel) => logInteraction('selection', { count: sel.length, ids: sel.slice(0, 20) }),
+            ),
+            useGlobalStore.subscribe(
+                (s) => s.refineTopK,
+                (k) => logInteraction('refine_topk_change', { k }),
+            ),
+            useGlobalStore.subscribe(
+                (s) => s.distortionLensOn,
+                (on) => logInteraction('lens_toggle', { on }),
+            ),
+            useGlobalStore.subscribe(
+                (s) => s.refineSessions,
+                (sessions, prev) => {
+                    if (sessions.length > prev.length) {
+                        const r = sessions[sessions.length - 1];
+                        logInteraction('refine_complete', {
+                            epoch: r.epoch,
+                            focusIds: r.focusIds,
+                            topK: r.topK,
+                            npBefore: r.npBefore,
+                            npAfter: r.npAfter,
+                            durationMs: r.durationMs,
+                            stoppedByUser: r.stoppedByUser,
+                        });
+                    }
+                },
+            ),
+        ];
+        logInteraction('session_start', {});
+        return () => unsubs.forEach((u) => u());
+    }, []);
 
     const handleUpdate = async () => {
         if (eifSessionInfo?.isEifBundle && !eifSessionInfo.refineReady) {

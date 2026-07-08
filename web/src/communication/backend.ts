@@ -281,10 +281,11 @@ export function getAttributeResource(
     return basicPostWithJsonResponse('/getAttributes', data, options);
 }
 
-export function getOriginalNeighbors(contentPath: string, epoch: number, options?: NetworkOptions) {
+export function getOriginalNeighbors(contentPath: string, epoch: number, topK: number = 10, options?: NetworkOptions) {
     const data = {
         "content_path": contentPath,
-        "epoch": epoch
+        "epoch": epoch,
+        "top_k": topK
     };
     return basicPostWithJsonResponse('/getOriginalNeighbors', data, options);
 }

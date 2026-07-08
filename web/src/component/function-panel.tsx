@@ -11,6 +11,8 @@ import {
     computeConfidentlyWrong, computeOscillation, computeHdImpurity, computeCartography,
     computePartnerRankIssues, computePairDistanceTrend, computeAlignmentNeighborhoodImpurity,
 } from '../utils/suspectSignals';
+import { REFINE_TOP_K_MIN, REFINE_TOP_K_MAX } from '../config/refine';
+import { exportInteractionLog, clearInteractionLog, interactionLogSize } from '../utils/interactionLog';
 
 const CLASSIFICATION_SUSPECT_OPTIONS = [
     { value: 'confidently_wrong', label: 'Confidently wrong' },
@@ -358,8 +360,11 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
             for (let j = i + 1; j < selectedItems.length; j++) {
                 const left = selectedItems[i];
                 const right = selectedItems[j];
-                const leftHd = epochData.originalNeighbors?.[left.num]?.includes(right.num) ?? false;
-                const rightHd = epochData.originalNeighbors?.[right.num]?.includes(left.num) ?? false;
+                // Slice to refineTopK so the pair HD-neighbor test uses the same
+                // neighborhood size everywhere; the fetched HD pool is deeper (REFINE_TOP_K_MAX)
+                // and must not silently widen this test beyond the active k.
+                const leftHd = epochData.originalNeighbors?.[left.num]?.slice(0, refineTopK).includes(right.num) ?? false;
+                const rightHd = epochData.originalNeighbors?.[right.num]?.slice(0, refineTopK).includes(left.num) ?? false;
                 const leftLd = epochData.projectionNeighbors?.[left.num]?.includes(right.num) ?? false;
                 const rightLd = epochData.projectionNeighbors?.[right.num]?.includes(left.num) ?? false;
 
@@ -701,16 +706,16 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
             {/* C3: neighborhood size (top-k) the refine objective preserves */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Tooltip title="Number of nearest neighbors refine tries to align (HD top-k = LD top-k). Range 3–20.">
+                <Tooltip title={`Number of nearest neighbors refine tries to align (HD top-k = LD top-k). Range ${REFINE_TOP_K_MIN}–${REFINE_TOP_K_MAX}.`}>
                     <span style={{ minWidth: 80, fontSize: 11, color: 'var(--text-muted)' }}>Refine top-k</span>
                 </Tooltip>
                 <InputNumber
                     size="small" style={{ flex: 1 }}
-                    min={3} max={20} step={1} precision={0}
+                    min={REFINE_TOP_K_MIN} max={REFINE_TOP_K_MAX} step={1} precision={0}
                     value={refineTopK}
                     onChange={(v) => {
                         if (typeof v === 'number' && !Number.isNaN(v)) {
-                            setRefineTopK(Math.max(3, Math.min(20, Math.round(v))));
+                            setRefineTopK(Math.max(REFINE_TOP_K_MIN, Math.min(REFINE_TOP_K_MAX, Math.round(v))));
                         }
                     }}
                 />
@@ -994,6 +999,22 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                         No refine runs yet this session.
                     </div>
                 )}
+                {/* I: local-only interaction telemetry export, independent of refine runs. */}
+                <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center' }}>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', flex: 1 }}>
+                        Interaction log ({interactionLogSize()} events)
+                    </span>
+                    <Button size="small" style={{ fontSize: 10 }} onClick={exportInteractionLog}>
+                        Export
+                    </Button>
+                    <Button
+                        size="small"
+                        style={{ fontSize: 10 }}
+                        onClick={() => { clearInteractionLog(); message.success('Interaction log cleared.'); }}
+                    >
+                        Clear
+                    </Button>
+                </div>
             </FunctionalBlock>
             <FunctionalBlock label="Suspect Samples">
                 <div style={{ marginBottom: 8 }}>

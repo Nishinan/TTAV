@@ -1635,9 +1635,10 @@ def get_original_neighbors():
     req = request.get_json()
     content_path = req['content_path']
     epoch = int(req['epoch'])
-    
+    top_k = int(req.get('top_k', 10))
+
     try:
-        neighbors = calculate_high_dimensional_neighbors(content_path, epoch)
+        neighbors = calculate_high_dimensional_neighbors(content_path, epoch, max_neighbors=top_k)
         result = jsonify({
             'neighbors': neighbors,
         })
