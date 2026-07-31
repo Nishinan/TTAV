@@ -414,6 +414,47 @@ class NeighborOverlay {
             }
         }
 
+        // Train↔test attribution pair links. Drawn independently of the neighbor
+        // toggles: these say "the report matched these two tokens", which is a
+        // different claim from "these points are neighbours", and a probe is
+        // opened precisely to inspect them.
+        const probeLinks = this.props.probeLinks;
+        if (Array.isArray(probeLinks) && probeLinks.length > 0) {
+            const pairGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+            const locatePoint = (pid: number): { x: number; y: number } | null => {
+                const renderedPos = this.props.posMap?.get(pid);
+                if (renderedPos != null) return this.proxy.location(dataX[renderedPos], dataY[renderedPos]);
+                const projectionPos = rawIndexToProjectionPosition(pid, this.props.indexList);
+                const coord = this.props.fullProjection?.[projectionPos];
+                return coord ? this.proxy.location(coord[0], coord[1]) : null;
+            };
+
+            for (const link of probeLinks) {
+                const from = locatePoint(link.fromPoint);
+                const to = locatePoint(link.toPoint);
+                if (!from || !to) continue;
+
+                // Cosine runs low-but-positive in practice (~0.1–0.3), so map it
+                // across that band rather than the full [0,1] — a linear map on
+                // [0,1] would render every real pair at the same hairline width.
+                const cos = typeof link.cosine === 'number' ? link.cosine : 0;
+                const strength = Math.max(0, Math.min(1, (cos - 0.05) / 0.35));
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', String(from.x));
+                line.setAttribute('y1', String(from.y));
+                line.setAttribute('x2', String(to.x));
+                line.setAttribute('y2', String(to.y));
+                line.setAttribute('stroke', link.role === 'target' ? '#8E44AD' : '#16A085');
+                line.setAttribute('stroke-width', String(1.2 + strength * 3.3));
+                line.setAttribute('stroke-opacity', String(0.45 + strength * 0.5));
+                line.setAttribute('stroke-linecap', 'round');
+                if (link.role === 'source') line.setAttribute('stroke-dasharray', '7 4');
+                pairGroup.appendChild(line);
+            }
+            this.svg.appendChild(pairGroup);
+        }
+
         // K: static displacement trails (baseline → current position) for the
         // refine cluster, so one screenshot shows what refine moved and where.
         // Independent of the neighbor-ring toggles; zero-length when the
@@ -689,6 +730,26 @@ export const ChartComponent = memo(() => {
     const { refineTopK } = useDefaultStore(["refineTopK"]);
     const { distortionLensOn } = useDefaultStore(["distortionLensOn"]);
     const { showRefineTrails } = useDefaultStore(["showRefineTrails"]);
+    const { probeData, probeVisiblePairIds } = useDefaultStore(["probeData", "probeVisiblePairIds"]);
+
+    // One pair yields up to two links: source↔source and target↔target. An empty
+    // probeVisiblePairIds means "show all" rather than "show none" — a probe is
+    // opened to look at its pairs, so hiding them by default would be backwards.
+    const probeLinks = useMemo(() => {
+        if (!probeData) return [];
+        const visible = probeVisiblePairIds.length > 0 ? new Set(probeVisiblePairIds) : null;
+        const links: { fromPoint: number; toPoint: number; cosine: number | null; role: 'source' | 'target'; pairId: string }[] = [];
+        for (const pair of probeData.pairs) {
+            if (visible && !visible.has(pair.pairId)) continue;
+            if (pair.trainSourcePoint !== null && pair.testSourcePoint !== null) {
+                links.push({ fromPoint: pair.trainSourcePoint, toPoint: pair.testSourcePoint, cosine: pair.sourceCosine, role: 'source', pairId: pair.pairId });
+            }
+            if (pair.trainTargetPoint !== null && pair.testTargetPoint !== null) {
+                links.push({ fromPoint: pair.trainTargetPoint, toPoint: pair.testTargetPoint, cosine: pair.targetCosine, role: 'target', pairId: pair.pairId });
+            }
+        }
+        return links;
+    }, [probeData, probeVisiblePairIds]);
 
     // B3: non-destructive before/after toggle — when showPreRefine is on, render
     // the pre-refine baseline (originalProjection) as the projection so every
@@ -1074,6 +1135,7 @@ export const ChartComponent = memo(() => {
             dataY: prepared?.simpleData?.y as Float32Array ?? new Float32Array(0),
             fullProjection: epochData?.projection,
             indexList: epochData?.indexList,
+            probeLinks,
             pointSize,
             revealOriginalNeighbors,
             revealProjectionNeighbors,
@@ -1134,7 +1196,7 @@ export const ChartComponent = memo(() => {
             overlap: primaryGroup?.overlap ?? [],
             multiCenterGroups,
         };
-    }, [prepared, epochData, activePointId, selectedIndices, neighborDisplayIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, refineTopK, showRefineTrails, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes]);
+    }, [prepared, epochData, activePointId, selectedIndices, neighborDisplayIndices, posMap, pointSize, revealOriginalNeighbors, revealProjectionNeighbors, refineTopK, showRefineTrails, showLabel, showIndex, labelDict, textData, inherentLabelData, viewportState, showTrail, availableEpochs, allEpochData, epoch, trailRefresh, secondaryIndices, setSecondaryIndices, secondaryBoxes, probeLinks]);
 
     // ---- box select overlay state & handlers ----
     const [boxDrag, setBoxDrag] = useState<{ startX: number; startY: number; curX: number; curY: number } | null>(null);

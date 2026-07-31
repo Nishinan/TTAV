@@ -142,6 +142,26 @@ export type BaseMutableGlobalStore = {
         updatedAt: number;
     } | null;
 
+    // Train-probe bundles only: which points form each attribution pair, and how
+    // similar the pair is in the original high-dimensional space. Null for
+    // regular bundles, which is what makes it a usable "is this a probe" test.
+    probeData: {
+        pairs: {
+            pairId: string;
+            trainSourcePoint: number | null;
+            testSourcePoint: number | null;
+            sourceCosine: number | null;
+            trainTargetPoint: number | null;
+            testTargetPoint: number | null;
+            targetCosine: number | null;
+        }[];
+        selectedIndices: number[];
+    } | null;
+
+    // Which probe pairs are drawn. Empty means all of them — the default, since
+    // a probe is opened precisely to look at its pairs.
+    probeVisiblePairIds: string[];
+
     // Refine status for LIVE badge
     refineStatus: 'idle' | 'running' | 'done';
     refineProgress: { completed: number; total: number };
@@ -255,6 +275,8 @@ export let initMutableGlobalStore: BaseMutableGlobalStore = {
     refineMetrics: null,
 
     eifSessionInfo: null,
+    probeData: null,
+    probeVisiblePairIds: [],
 
     refineStatus: 'idle',
     refineProgress: { completed: 0, total: 0 },

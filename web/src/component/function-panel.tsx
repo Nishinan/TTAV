@@ -150,6 +150,8 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
         useDefaultStore(['boxSelectActive', 'setBoxSelectActive', 'refineFocusType', 'setRefineFocusType', 'secondaryIndices', 'setSecondaryIndices', 'setSecondaryBoxes']);
     const { neighborDisplayIndices, setNeighborDisplayIndices } =
         useDefaultStore(['neighborDisplayIndices', 'setNeighborDisplayIndices']);
+    const { probeData, probeVisiblePairIds } =
+        useDefaultStore(['probeData', 'probeVisiblePairIds']);
     const { refineTopK, setRefineTopK } =
         useDefaultStore(['refineTopK', 'setRefineTopK']);
     const { refinePriority, setRefinePriority } =
@@ -1174,6 +1176,61 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                 ]}
                             />
                         </div>
+
+                        {/* Attribution pair links — probe bundles only. Selects which
+                            of the current bundle's pairs to draw; switching to a
+                            different train sample means a different point set and a
+                            different projection, so that stays in the EIF report UI. */}
+                        {probeData && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Pair links</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => setValue('probeVisiblePairIds', [])}
+                                        style={{
+                                            fontSize: 10, padding: '1px 6px', cursor: 'pointer',
+                                            border: '1px solid var(--layout-border-color)',
+                                            background: 'transparent', color: 'var(--text-muted)', borderRadius: 3,
+                                        }}
+                                    >
+                                        Show all
+                                    </button>
+                                </div>
+                                <div style={{ maxHeight: 150, overflowY: 'auto', paddingLeft: 4 }}>
+                                    {probeData.pairs.map((pair) => {
+                                        // Empty list means "all visible", so an unfiltered
+                                        // panel shows every box ticked.
+                                        const allVisible = probeVisiblePairIds.length === 0;
+                                        const checked = allVisible || probeVisiblePairIds.includes(pair.pairId);
+                                        const cos = pair.targetCosine ?? pair.sourceCosine;
+                                        return (
+                                            <label key={pair.pairId} style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={checked}
+                                                    onChange={(e) => {
+                                                        const current = allVisible
+                                                            ? probeData.pairs.map((p) => p.pairId)
+                                                            : probeVisiblePairIds;
+                                                        const next = e.target.checked
+                                                            ? [...current, pair.pairId]
+                                                            : current.filter((id) => id !== pair.pairId);
+                                                        // Unticking the last box would read as
+                                                        // "show all" again, so keep it explicit.
+                                                        setValue('probeVisiblePairIds', next.length === 0 ? ['__none__'] : next);
+                                                    }}
+                                                    style={{ width: 12, height: 12, accentColor: 'var(--accent-blue, #3278F0)', cursor: 'pointer' }}
+                                                />
+                                                <span style={{ fontSize: 10, color: 'var(--primary-text)', fontFamily: 'monospace' }}>
+                                                    {pair.pairId}{cos != null ? ` (${cos.toFixed(3)})` : ''}
+                                                </span>
+                                            </label>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
 
                         {/* Show-neighbor checklist — only when multiple points selected */}
                         {selectedIndices.length > 1 && (revealOriginalNeighbors || revealProjectionNeighbors) && (

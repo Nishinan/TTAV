@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { message, Tabs } from 'antd';
 import { MainBlock } from '../component/main-block';
 import { FunctionPanel } from '../component/function-panel';
@@ -79,6 +79,52 @@ function normalizeEIFSessionInfo(response: any) {
             : (typeof info.message === 'string' ? info.message : 'Adaptive refine session is still preparing.'),
         updatedAt: typeof info.updated_at === 'number' ? info.updated_at : Date.now(),
     };
+}
+
+// Turn the backend's probe payload into pair→point-index links the plot can draw.
+//
+// crossPairCosine speaks in *token* indices (position within the train/test
+// sequence) while the plot addresses *point* indices (position in the merged
+// 225-point bundle). point_records is what bridges the two, so a pair only
+// becomes drawable once both of its endpoints resolve to real points.
+function normalizeProbeData(response: any) {
+    const probe = response?.probeData;
+    if (!probe || typeof probe !== 'object') return null;
+
+    const records = probe.probe_metadata?.point_records;
+    const crossPairs = probe.comparison_summary?.crossPairCosine;
+    if (!Array.isArray(records) || !Array.isArray(crossPairs)) return null;
+
+    const trainPointByToken = new Map<number, number>();
+    const testPointByToken = new Map<number, number>();
+    records.forEach((rec: any) => {
+        if (!rec || typeof rec !== 'object') return;
+        const target = rec.side === 'train' ? trainPointByToken
+            : rec.side === 'test' ? testPointByToken
+            : null;
+        if (target && Number.isInteger(rec.token_index) && Number.isInteger(rec.point_index)) {
+            target.set(rec.token_index, rec.point_index);
+        }
+    });
+
+    const resolve = (map: Map<number, number>, tokenIndex: unknown) =>
+        Number.isInteger(tokenIndex) ? map.get(tokenIndex as number) ?? null : null;
+
+    const pairs = crossPairs.map((entry: any, i: number) => ({
+        pairId: typeof entry?.pairId === 'string' ? entry.pairId : `pair-${i}`,
+        trainSourcePoint: resolve(trainPointByToken, entry?.trainSourceIndex),
+        testSourcePoint: resolve(testPointByToken, entry?.testSourceIndex),
+        sourceCosine: typeof entry?.sourceCosine === 'number' ? entry.sourceCosine : null,
+        trainTargetPoint: resolve(trainPointByToken, entry?.trainTargetIndex),
+        testTargetPoint: resolve(testPointByToken, entry?.testTargetIndex),
+        targetCosine: typeof entry?.targetCosine === 'number' ? entry.targetCosine : null,
+    })).filter(p =>
+        (p.trainSourcePoint !== null && p.testSourcePoint !== null)
+        || (p.trainTargetPoint !== null && p.testTargetPoint !== null)
+    );
+
+    if (pairs.length === 0) return null;
+    return { pairs, selectedIndices: normalizeSelectedIndices(probe.selected_indices) };
 }
 
 // // 1. 定义接口，明确告诉 TypeScript 这个组件接受什么属性
@@ -496,6 +542,22 @@ function MessageHandler() {
         'setColorDict', 'setLabelDict', 'setProgress', 'setValue', 'setSelectedIndices', 'setHoveredIndex'
     ]);
 
+    // Probe bundles get the pair links turned on and the neighbor lines turned
+    // off. Both kinds of line are plain straight segments, so leaving neighbors
+    // on would put two unrelated meanings in the same visual channel — and the
+    // neighbor reading ("these points are near in HD space") is exactly the
+    // claim a probe pair line is supposed to make on its own terms.
+    const applyProbeData = useCallback((response: any) => {
+        const probe = normalizeProbeData(response);
+        setValue('probeData', probe);
+        setValue('probeVisiblePairIds', []);
+        if (probe) {
+            setValue('revealOriginalNeighbors', false);
+            setValue('revealProjectionNeighbors', false);
+            if (probe.selectedIndices.length > 0) setSelectedIndices(probe.selectedIndices);
+        }
+    }, [setValue, setSelectedIndices]);
+
     // Start visualizing process
     const handleStartVisualizing = async (
         contentPath: string,
@@ -546,6 +608,7 @@ function MessageHandler() {
             message.success({ content: 'Backend Session Resumed!', key: 'sync_task' });
             const normalizedEIFSessionInfo = normalizeEIFSessionInfo(response);
             setValue('eifSessionInfo', normalizedEIFSessionInfo);
+            applyProbeData(response);
             // 更新当前路径等基础状态，确保后续 Update 正常
             setContentPath(contentPath);
             setDataType(dataType as 'Text' | 'Image');
@@ -615,6 +678,7 @@ function MessageHandler() {
                 data_type: dataType, task_type: taskType, vis_config: visConfig
             });
             setValue('eifSessionInfo', normalizeEIFSessionInfo(syncResponse));
+            applyProbeData(syncResponse);
 
             // 5. 更新 store，确保后续 handleUpdate 能拿到正确的 vis_method / visID
             setContentPath(contentPath);

@@ -107,6 +107,30 @@ def _normalize_eif_session_status(payload, *, content_path=None, sample_id=None,
     return normalized
 
 
+def normalize_selected_indices(value):
+    """Keep only non-negative ints, deduplicated and sorted."""
+    if not isinstance(value, list):
+        return []
+    cleaned = {
+        int(idx) for idx in value
+        if isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0
+    }
+    return sorted(cleaned)
+
+
+def _read_probe_metadata(content_path):
+    """Probe pair data saved at registration time, or None for regular bundles."""
+    probe_path = Path(content_path) / "dataset" / "probe_metadata.json"
+    if not probe_path.exists():
+        return None
+    try:
+        with open(probe_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[probe] ignoring unreadable {probe_path}: {exc}", flush=True)
+        return None
+
+
 def _read_eif_session_status(content_path, *, sample_id=None, vis_method=None, vis_id=None):
     status_path = _status_path_for_content(content_path)
     if status_path.exists():
@@ -471,6 +495,7 @@ def sync_session():
                     "trainableSessionStatus": eif_session_info["trainable_session_status"],
                     "refineReady": True,
                     "eifSessionInfo": eif_session_info,
+                    "probeData": _read_probe_metadata(req["content_path"]),
                 })
 
             active_session.update({
@@ -489,6 +514,7 @@ def sync_session():
                 "trainableSessionStatus": eif_session_info["trainable_session_status"],
                 "refineReady": False,
                 "eifSessionInfo": eif_session_info,
+                "probeData": _read_probe_metadata(req["content_path"]),
             })
 
         config = initialize_config(
@@ -1365,6 +1391,21 @@ def register_eif_bundle():
     if align is not None:
         with open(dataset_dir / "align.json", "w", encoding="utf-8") as f:
             json.dump(align, f, indent=2, ensure_ascii=False)
+
+    # Train-probe bundles carry which points form each attribution pair and how
+    # similar those pairs are in the original high-dimensional space. None of it
+    # is reconstructible from labels/embeddings, so persist it verbatim —
+    # otherwise the pair links can't be drawn once the bundle is registered.
+    probe_metadata = bundle.get("probe_metadata")
+    if isinstance(probe_metadata, dict):
+        probe_payload = {
+            "probe_metadata": probe_metadata,
+            "comparison_summary": req.get("comparison_summary"),
+            "selected_indices": normalize_selected_indices(req.get("selected_indices")),
+            "target_index": req.get("target_index"),
+        }
+        with open(dataset_dir / "probe_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(probe_payload, f, ensure_ascii=False)
 
     predictions = bundle.get("predictions")
     if predictions is not None:
