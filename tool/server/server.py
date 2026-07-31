@@ -311,15 +311,25 @@ def _fit_fast_trainable_session(content_path, sample_id, vis_method, vis_id, vis
         model.load_state_dict(best_state)
     model.eval()
 
+    # Only fit projections for epochs that don't already have one. The bundle
+    # ships an authoritative projection (UMAP, computed alongside the embeddings)
+    # and that is what the user expects to see on open — overwriting it with this
+    # autoencoder's output silently replaced the real layout with an approximation
+    # of it. The encoder is still trained and saved below because refine() needs a
+    # model to fine-tune; it just no longer clobbers projections it didn't produce.
     with torch.no_grad():
         for epoch in available_epochs:
+            epoch_projection_dir = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "epochs" / f"epoch_{epoch}"
+            epoch_projection_path = epoch_projection_dir / "projection.npy"
+            if epoch_projection_path.exists():
+                continue
             epoch_embedding_path = Path(content_path) / "epochs" / f"epoch_{epoch}" / "embeddings.npy"
             epoch_embeddings = np.load(epoch_embedding_path).astype(np.float32)
             epoch_t = torch.from_numpy(epoch_embeddings).to(dtype=torch.float32, device=device)
             fitted_projection = model.encoder(epoch_t).cpu().numpy().astype(np.float32)
-            epoch_projection_dir = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "epochs" / f"epoch_{epoch}"
             epoch_projection_dir.mkdir(parents=True, exist_ok=True)
-            np.save(epoch_projection_dir / "projection.npy", fitted_projection)
+            np.save(epoch_projection_path, fitted_projection)
+            print(f"[EIF-FastFit] sample={sample_id} epoch={epoch} projection fitted (no bundled projection found)", flush=True)
 
     model_save_path = Path(content_path) / "visualize" / f"{vis_method}_{vis_id}" / "vis_model.pth"
     torch.save({
