@@ -113,6 +113,18 @@ function normalizeProbeData(response: any) {
     const resolve = (map: Map<number, number>, tokenIndex: unknown) =>
         Number.isInteger(tokenIndex) ? map.get(tokenIndex as number) ?? null : null;
 
+    // The report's gradient verdict per pair. Newer bundles carry it in
+    // pair_signature; older ones don't, and there an EIF jump fills it in later.
+    const cosSimById = new Map<string, number>();
+    const signature = probe.probe_metadata?.pair_signature;
+    if (Array.isArray(signature)) {
+        signature.forEach((entry: any) => {
+            if (entry && typeof entry.id === 'string' && typeof entry.cos_sim === 'number') {
+                cosSimById.set(entry.id, entry.cos_sim);
+            }
+        });
+    }
+
     // A pair is drawable once at least one of its two edges has both endpoints.
     const pairs = crossPairs.map((entry: any, i: number) => ({
         pairId: typeof entry?.pairId === 'string' ? entry.pairId : `pair-${i}`,
@@ -122,7 +134,9 @@ function normalizeProbeData(response: any) {
         testTargetPoint: resolve(testPointByToken, entry?.testTargetIndex),
         sourceCosine: typeof entry?.sourceCosine === 'number' ? entry.sourceCosine : null,
         targetCosine: typeof entry?.targetCosine === 'number' ? entry.targetCosine : null,
-        cosSim: null as number | null,
+        cosSim: (typeof entry?.pairId === 'string' && cosSimById.has(entry.pairId)
+            ? cosSimById.get(entry.pairId)!
+            : null) as number | null,
     })).filter(p =>
         (p.trainSourcePoint !== null && p.trainTargetPoint !== null)
         || (p.testSourcePoint !== null && p.testTargetPoint !== null)
