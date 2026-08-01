@@ -435,22 +435,32 @@ class NeighborOverlay {
                 const to = locatePoint(link.toPoint);
                 if (!from || !to) continue;
 
-                // Cosine runs low-but-positive in practice (~0.1–0.3), so map it
-                // across that band rather than the full [0,1] — a linear map on
-                // [0,1] would render every real pair at the same hairline width.
-                const cos = typeof link.cosine === 'number' ? link.cosine : 0;
-                const strength = Math.max(0, Math.min(1, (cos - 0.05) / 0.35));
+                // cos_sim is signed and roughly spans ±0.35 in practice, with
+                // ~39% of pairs negative — so the sign picks the colour (warm =
+                // the two dependencies agree, cool = they oppose) and only the
+                // magnitude drives width. Grading width on the signed value would
+                // render a strong negative match as a hairline, hiding it.
+                const cos = typeof link.cosSim === 'number' ? link.cosSim : null;
+                const strength = cos === null ? 0.35 : Math.min(1, Math.abs(cos) / 0.35);
+                const colour = cos === null ? '#7F8C8D' : (cos >= 0 ? '#D35400' : '#2471A3');
+
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
                 line.setAttribute('x1', String(from.x));
                 line.setAttribute('y1', String(from.y));
                 line.setAttribute('x2', String(to.x));
                 line.setAttribute('y2', String(to.y));
-                line.setAttribute('stroke', link.role === 'target' ? '#8E44AD' : '#16A085');
+                line.setAttribute('stroke', colour);
                 line.setAttribute('stroke-width', String(1.2 + strength * 3.3));
-                line.setAttribute('stroke-opacity', String(0.45 + strength * 0.5));
+                line.setAttribute('stroke-opacity', String(0.5 + strength * 0.45));
                 line.setAttribute('stroke-linecap', 'round');
-                if (link.role === 'source') line.setAttribute('stroke-dasharray', '7 4');
+                // Dashed marks the test-sample edge, so the two edges of a pair
+                // stay tellable apart when they share a colour and width.
+                if (link.side === 'test') line.setAttribute('stroke-dasharray', '7 4');
                 pairGroup.appendChild(line);
+
+                // Edges are directed (source → target); without an arrow the
+                // reader can't tell which token influences which.
+                this.drawMidpointArrow(pairGroup, from.x, from.y, to.x, to.y, colour, 7);
             }
             this.svg.appendChild(pairGroup);
         }
@@ -732,20 +742,27 @@ export const ChartComponent = memo(() => {
     const { showRefineTrails } = useDefaultStore(["showRefineTrails"]);
     const { probeData, probeVisiblePairIds } = useDefaultStore(["probeData", "probeVisiblePairIds"]);
 
-    // One pair yields up to two links: source↔source and target↔target. An empty
-    // probeVisiblePairIds means "show all" rather than "show none" — a probe is
-    // opened to look at its pairs, so hiding them by default would be backwards.
+    // Each pair draws its two *edges* — source→target within the train sample and
+    // source→target within the test sample — because that is what the report
+    // actually asserts: these two dependencies behave alike. Linking train-source
+    // to test-source instead would draw a claim the report never makes.
+    //
+    // Both edges of a pair share one colour and width, taken from cos_sim, since
+    // that number describes the pair as a whole rather than either edge.
+    //
+    // An empty probeVisiblePairIds means "show all" rather than "show none" — a
+    // probe is opened to look at its pairs, so hiding them by default is backwards.
     const probeLinks = useMemo(() => {
         if (!probeData) return [];
         const visible = probeVisiblePairIds.length > 0 ? new Set(probeVisiblePairIds) : null;
-        const links: { fromPoint: number; toPoint: number; cosine: number | null; role: 'source' | 'target'; pairId: string }[] = [];
+        const links: { fromPoint: number; toPoint: number; cosSim: number | null; side: 'train' | 'test'; pairId: string }[] = [];
         for (const pair of probeData.pairs) {
             if (visible && !visible.has(pair.pairId)) continue;
-            if (pair.trainSourcePoint !== null && pair.testSourcePoint !== null) {
-                links.push({ fromPoint: pair.trainSourcePoint, toPoint: pair.testSourcePoint, cosine: pair.sourceCosine, role: 'source', pairId: pair.pairId });
+            if (pair.trainSourcePoint !== null && pair.trainTargetPoint !== null) {
+                links.push({ fromPoint: pair.trainSourcePoint, toPoint: pair.trainTargetPoint, cosSim: pair.cosSim, side: 'train', pairId: pair.pairId });
             }
-            if (pair.trainTargetPoint !== null && pair.testTargetPoint !== null) {
-                links.push({ fromPoint: pair.trainTargetPoint, toPoint: pair.testTargetPoint, cosine: pair.targetCosine, role: 'target', pairId: pair.pairId });
+            if (pair.testSourcePoint !== null && pair.testTargetPoint !== null) {
+                links.push({ fromPoint: pair.testSourcePoint, toPoint: pair.testTargetPoint, cosSim: pair.cosSim, side: 'test', pairId: pair.pairId });
             }
         }
         return links;

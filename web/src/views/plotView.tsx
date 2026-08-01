@@ -113,17 +113,19 @@ function normalizeProbeData(response: any) {
     const resolve = (map: Map<number, number>, tokenIndex: unknown) =>
         Number.isInteger(tokenIndex) ? map.get(tokenIndex as number) ?? null : null;
 
+    // A pair is drawable once at least one of its two edges has both endpoints.
     const pairs = crossPairs.map((entry: any, i: number) => ({
         pairId: typeof entry?.pairId === 'string' ? entry.pairId : `pair-${i}`,
         trainSourcePoint: resolve(trainPointByToken, entry?.trainSourceIndex),
-        testSourcePoint: resolve(testPointByToken, entry?.testSourceIndex),
-        sourceCosine: typeof entry?.sourceCosine === 'number' ? entry.sourceCosine : null,
         trainTargetPoint: resolve(trainPointByToken, entry?.trainTargetIndex),
+        testSourcePoint: resolve(testPointByToken, entry?.testSourceIndex),
         testTargetPoint: resolve(testPointByToken, entry?.testTargetIndex),
+        sourceCosine: typeof entry?.sourceCosine === 'number' ? entry.sourceCosine : null,
         targetCosine: typeof entry?.targetCosine === 'number' ? entry.targetCosine : null,
+        cosSim: null as number | null,
     })).filter(p =>
-        (p.trainSourcePoint !== null && p.testSourcePoint !== null)
-        || (p.trainTargetPoint !== null && p.testTargetPoint !== null)
+        (p.trainSourcePoint !== null && p.trainTargetPoint !== null)
+        || (p.testSourcePoint !== null && p.testTargetPoint !== null)
     );
 
     if (pairs.length === 0) return null;
@@ -707,7 +709,26 @@ function MessageHandler() {
         const pairIds = Array.isArray(payload.visiblePairIds)
             ? payload.visiblePairIds.filter((id): id is string => typeof id === 'string')
             : [];
-        const probe = useGlobalStore.getState().probeData;
+        let probe = useGlobalStore.getState().probeData;
+
+        // cos_sim lives in the report, not the bundle, so fold it in here.
+        if (probe && Array.isArray(payload.probeEdges)) {
+            const cosSimById = new Map<string, number>();
+            payload.probeEdges.forEach(edge => {
+                if (edge && typeof edge.pairId === 'string' && typeof edge.cosSim === 'number') {
+                    cosSimById.set(edge.pairId, edge.cosSim);
+                }
+            });
+            probe = {
+                ...probe,
+                pairs: probe.pairs.map(pair => ({
+                    ...pair,
+                    cosSim: cosSimById.has(pair.pairId) ? cosSimById.get(pair.pairId)! : pair.cosSim,
+                })),
+            };
+            setValue('probeData', probe);
+        }
+
         const narrowed = pairIds.length > 0 && probe
             ? probe.pairs.filter(pair => pairIds.includes(pair.pairId))
             : [];

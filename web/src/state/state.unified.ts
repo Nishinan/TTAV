@@ -142,18 +142,26 @@ export type BaseMutableGlobalStore = {
         updatedAt: number;
     } | null;
 
-    // Train-probe bundles only: which points form each attribution pair, and how
-    // similar the pair is in the original high-dimensional space. Null for
+    // Train-probe bundles only: which points form each attribution pair. Null for
     // regular bundles, which is what makes it a usable "is this a probe" test.
+    //
+    // A matched pair is two *edges* — source→target inside the train sample and
+    // source→target inside the test sample — and one number saying how alike the
+    // report found them. The endpoint cosines are a different measurement (how
+    // close the tokens sit in embedding space) and are kept only as detail.
     probeData: {
         pairs: {
             pairId: string;
             trainSourcePoint: number | null;
-            testSourcePoint: number | null;
-            sourceCosine: number | null;
             trainTargetPoint: number | null;
+            testSourcePoint: number | null;
             testTargetPoint: number | null;
+            sourceCosine: number | null;
             targetCosine: number | null;
+            // The report's gradient-level verdict on the match; negative for
+            // ~39% of pairs, so sign carries meaning. Absent until an EIF jump
+            // supplies it — the bundle doesn't carry it.
+            cosSim: number | null;
         }[];
         selectedIndices: number[];
     } | null;

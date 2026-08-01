@@ -1203,7 +1203,10 @@ export function FunctionPanel({ onUpdateProjection, refineReady = true, refineSt
                                         // panel shows every box ticked.
                                         const allVisible = probeVisiblePairIds.length === 0;
                                         const checked = allVisible || probeVisiblePairIds.includes(pair.pairId);
-                                        const cos = pair.targetCosine ?? pair.sourceCosine;
+                                        // Show the report's own verdict when the
+                                        // jump supplied it; endpoint cosines are a
+                                        // different measurement, so don't blend them.
+                                        const cos = pair.cosSim;
                                         return (
                                             <label key={pair.pairId} style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
                                                 <input
