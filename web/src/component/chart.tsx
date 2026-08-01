@@ -440,6 +440,10 @@ class NeighborOverlay {
                 // the two dependencies agree, cool = they oppose) and only the
                 // magnitude drives width. Grading width on the signed value would
                 // render a strong negative match as a hairline, hiding it.
+                //
+                // Test edges carry no cos_sim by design (the number describes a
+                // train-vs-test comparison, not the test edge alone), so they
+                // land in the neutral grey branch below.
                 const cos = typeof link.cosSim === 'number' ? link.cosSim : null;
                 const strength = cos === null ? 0.35 : Math.min(1, Math.abs(cos) / 0.35);
                 const colour = cos === null ? '#7F8C8D' : (cos >= 0 ? '#D35400' : '#2471A3');
@@ -756,13 +760,25 @@ export const ChartComponent = memo(() => {
         if (!probeData) return [];
         const visible = probeVisiblePairIds.length > 0 ? new Set(probeVisiblePairIds) : null;
         const links: { fromPoint: number; toPoint: number; cosSim: number | null; side: 'train' | 'test'; pairId: string }[] = [];
+
+        // A probe is anchored on one test token group, so every pair in it shares
+        // the same test edge — drawing it per pair would stack N identical
+        // segments and make an arbitrary one of them decide the visible colour.
+        // Draw it once, uncoloured, as the fixed reference the train edges are
+        // being compared against.
+        const seenTestEdges = new Set<string>();
+
         for (const pair of probeData.pairs) {
             if (visible && !visible.has(pair.pairId)) continue;
             if (pair.trainSourcePoint !== null && pair.trainTargetPoint !== null) {
                 links.push({ fromPoint: pair.trainSourcePoint, toPoint: pair.trainTargetPoint, cosSim: pair.cosSim, side: 'train', pairId: pair.pairId });
             }
             if (pair.testSourcePoint !== null && pair.testTargetPoint !== null) {
-                links.push({ fromPoint: pair.testSourcePoint, toPoint: pair.testTargetPoint, cosSim: pair.cosSim, side: 'test', pairId: pair.pairId });
+                const edgeKey = `${pair.testSourcePoint}->${pair.testTargetPoint}`;
+                if (!seenTestEdges.has(edgeKey)) {
+                    seenTestEdges.add(edgeKey);
+                    links.push({ fromPoint: pair.testSourcePoint, toPoint: pair.testTargetPoint, cosSim: null, side: 'test', pairId: pair.pairId });
+                }
             }
         }
         return links;
