@@ -32,6 +32,9 @@ interface EIFJumpPayload {
     selectedIndices?: number[];
     targetIndex?: number;
     selectedSourceIndex?: number;
+    // Probe launches: the pairs ticked in the EIF report. The bundle holds the
+    // whole group either way, so this only picks what gets drawn.
+    visiblePairIds?: string[];
 }
 
 function parseEIFJumpPayloadFromLocation(): EIFJumpPayload | null {
@@ -697,8 +700,30 @@ function MessageHandler() {
     };
 
     const applyEIFHighlightUpdate = (payload: EIFJumpPayload) => {
-        const selected = normalizeSelectedIndices(payload.selectedIndices);
-        setSelectedIndices(selected);
+        // A probe launch may name the pairs ticked in the EIF report. The bundle
+        // always holds the whole group, so narrow the drawn links here — and with
+        // them the ringed points, otherwise the plot would ring endpoints of
+        // pairs whose links aren't shown.
+        const pairIds = Array.isArray(payload.visiblePairIds)
+            ? payload.visiblePairIds.filter((id): id is string => typeof id === 'string')
+            : [];
+        const probe = useGlobalStore.getState().probeData;
+        const narrowed = pairIds.length > 0 && probe
+            ? probe.pairs.filter(pair => pairIds.includes(pair.pairId))
+            : [];
+
+        if (narrowed.length > 0) {
+            setValue('probeVisiblePairIds', narrowed.map(pair => pair.pairId));
+            const endpoints = narrowed.flatMap(pair => [
+                pair.trainSourcePoint, pair.testSourcePoint,
+                pair.trainTargetPoint, pair.testTargetPoint,
+            ]);
+            setSelectedIndices(normalizeSelectedIndices(
+                endpoints.filter((p): p is number => p !== null)
+            ));
+        } else {
+            setSelectedIndices(normalizeSelectedIndices(payload.selectedIndices));
+        }
         setHoveredIndex(typeof payload.targetIndex === 'number' ? payload.targetIndex : undefined);
     };
 
